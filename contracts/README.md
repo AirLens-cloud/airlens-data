@@ -4,7 +4,7 @@
 같은 레포에 있어야 발행 직전 검사에서 빠지는 계약이 생기지 않는다. 고칠 일이 있으면 여기서 고친다.
 
 - [`EVIDENCE_CONTRACT.md`](EVIDENCE_CONTRACT.md): 사용자에게 보이는 값이 지켜야 할 규칙. 아래 스키마 대부분이 이 문서의 절을 구현한다.
-- [`validate.py`](validate.py): 표준 라이브러리만 쓰는 검증기. 수집 격자 계약 2종을 검사하며 지원하지 않는 스키마 키워드가 있으면 검증을 시작하기 전에 실패한다.
+- [`validate.py`](validate.py): 표준 라이브러리만 쓰는 검증기. 수집 격자 계약 2종과 ML 산출물 계약 5종을 검사하며 지원하지 않는 스키마 키워드가 있으면 검증을 시작하기 전에 실패한다.
   나머지 계약은 `jsonschema`로 검사한다(아래 표의 '검사' 열).
 
 ## 스키마
@@ -13,14 +13,21 @@
 |---|---|---|---|---|
 | `current-aq-grid.v1` | `aq-data/current-{pm25,pm10}-grid.json` | `scripts/etl/collect_noaa_aq.py` (`data-collect-hourly.yml`) | `validate.py` (`hf_publish.py --schema`) | — |
 | `web-aq-grid.v1` | `mac-data/data/web/v1/current-{pm25,pm10}-grid.json` | `scripts/etl/build_web_aq_grid.py` (`mac-data-publish.yml`) | `validate.py` (`hf_publish.py --schema`) | — |
+| `grid_latest.v1` | `aq-data/predictions/grid_latest.json`, `aq-data/predictions/history/grid_<YYYYMMDDHH>.json` | ML 파이프라인(비공개) | `validate.py` (`hf_publish.py --schema auto`) | — |
+| `data_quality.v1` | `aq-data/data_quality.json`, `aq-data/quality-history/quality_<YYYYMMDDHH>.json` | ML 파이프라인(비공개) | `validate.py` (`hf_publish.py --schema auto`) | — |
+| `data_quality_withheld.v1` | `aq-data/data_quality.json` (DQSS 게이트 실패 때 대신 발행) | ML 파이프라인(비공개) | `validate.py` (`hf_publish.py --schema auto`) | — |
+| `shadow_stations.v1` | `aq-data/quality-history/shadow_<YYYYMMDDHH>.json` | ML 파이프라인(비공개) | `validate.py` (`hf_publish.py --schema auto`) | — |
+| `w3-band-v1` | `aq-data/forecast-band/latest.json` | ML 파이프라인(비공개) | `validate.py` (`hf_publish.py --schema auto`) | — |
 | `data-product-manifest.v1` | `meta/product_manifest.json` | `scripts/publish_contracts.py` (`contracts-publish.yml`) | `jsonschema` (`publish_contracts.py`) | §5-1 |
 | `source-registry.v1` | `meta/source_registry.json` | 위와 같음 | 위와 같음 | §5-4 |
 | `product-health.v1` | `meta/product_health.json` | 위와 같음 | 위와 같음 | §5-5 |
 | `evidence-envelope.v1` | 사용자에게 보이는 값 하나의 최소 단위 | 아직 발행물 없음 (테스트에서만 사용) | `jsonschema` (테스트) | §2 |
 
+ML 산출물 계약 5종은 아직 이 레포가 발행하지 않는다. ML 추론 잡을 이 레포로 옮길 때 `hf_publish.py --schema auto`로 발행 직전 검사를 붙인다.
+
 `current-aq-grid.v1`과 `web-aq-grid.v1`은 파일 이름이 같지만 다른 계약이다. 앞의 것은 조밀 격자이고 뒤의 것은 웹용으로 줄인 희소 격자다.
 
-ML 예측 산출물의 스키마(`grid_latest.v1`, `data_quality.v1` 등)는 아직 ML 파이프라인(비공개) 쪽에 있다. 이 폴더로 옮겨 올 예정이다.
+ML 산출물 계약(`grid_latest.v1`, `data_quality.v1` 등 5종)의 정본도 이 폴더다. ML 파이프라인(비공개)의 사본은 이 폴더를 따르고 반대 방향으로 고치지 않는다. 태그를 기준으로 한 동기화는 다음 단계에서 붙인다.
 
 ## 검증
 
@@ -29,7 +36,7 @@ python3 contracts/validate.py <payload.json> --schema current-aq-grid.v1 # 계�
 python3 contracts/validate.py <payload.json>                             # 기본값 --schema auto
 ```
 
-`--schema auto`는 payload의 `schema_version`(계약 이름)으로 계약을 고른다. 이 필드는 ML 산출물이 싣고, 그 계약은 아직 이 폴더에 없다.
+`--schema auto`는 payload의 `schema_version`(계약 이름)으로 계약을 고른다. 이 필드는 ML 산출물이 싣고, 그 계약 5종은 위 표에 있다.
 이 폴더의 수집 산출물은 `schemaVersion`에 `"1.0"` 같은 숫자 버전을 싣기 때문에 계약 이름을 직접 줘야 한다. 발행할 때는
 `hf_publish.py --schema …`가 업로드 직전에 같은 검증을 하고, `meta/*.json` 계약 3종은 `publish_contracts.py`가 발행 전에 `jsonschema`로 검사한다.
 

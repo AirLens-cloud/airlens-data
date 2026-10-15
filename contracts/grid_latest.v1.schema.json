@@ -1,0 +1,148 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "grid_latest.v1",
+  "title": "AirLens 예측 격자 발행물 v1",
+  "description": "aq-data/predictions/grid_latest.json 과 predictions/history/grid_*.json 의 계약. required 에 있는 필드는 소비자가 의존하는 표면이며, 삭제하려면 v2 를 신설해야 한다. 추가는 자유(additive) — additionalProperties 를 닫지 않는 이유다.",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "generated_at",
+    "model_version",
+    "model_sha",
+    "model_available",
+    "observation_source",
+    "observation_slot",
+    "count",
+    "predictions",
+    "metadata"
+  ],
+  "properties": {
+    "schema_version": { "const": "grid_latest.v1" },
+    "generated_at": { "type": "string", "format": "date-time" },
+    "model_version": {
+      "type": "string",
+      "description": "사람이 붙인 라벨. 재학습해도 안 움직일 수 있으므로 식별자로 쓰지 말 것 — 식별자는 model_sha 다."
+    },
+    "model_sha": {
+      "type": ["string", "null"],
+      "description": "이 발행물을 만든 가중치의 sha256. 폴백 경로/구 아티팩트는 null."
+    },
+    "model_available": { "type": "boolean" },
+    "observation_source": { "type": ["string", "null"] },
+    "observation_slot": { "type": ["string", "null"] },
+    "count": { "type": "integer", "minimum": 0 },
+    "predictions": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": [
+          "name",
+          "lat",
+          "lon",
+          "timestamp",
+          "predicted_p10",
+          "predicted_p50",
+          "predicted_p90",
+          "model_version",
+          "source"
+        ],
+        "properties": {
+          "name": { "type": "string" },
+          "lat": { "type": "number", "minimum": -90, "maximum": 90 },
+          "lon": { "type": "number", "minimum": -180, "maximum": 180 },
+          "timestamp": { "type": "string", "format": "date-time" },
+          "predicted_p10": { "type": "number", "minimum": 0 },
+          "predicted_p50": { "type": "number", "minimum": 0 },
+          "predicted_p90": { "type": "number", "minimum": 0 },
+          "uncertainty": { "type": ["number", "null"] },
+          "epistemic_std": { "type": ["number", "null"] },
+          "uncertainty_normalized": { "type": ["number", "null"] },
+          "observed_pm25": { "type": ["number", "null"] },
+          "model_version": { "type": "string" },
+          "source": { "type": "string" },
+          "input_source": { "type": ["string", "null"] },
+          "input_updated_at": { "type": ["string", "null"] },
+          "quantile_reordered": { "type": ["boolean", "null"] },
+          "band_calibrated": { "type": ["boolean", "null"] },
+          "confidence_grade": {
+            "type": ["string", "null"],
+            "enum": ["A", "B", "C", "D", "E", "F", null],
+            "description": "폴백(±20% 합성 밴드)은 신뢰도 개념 자체가 부적용 → null."
+          },
+          "aod_source": { "type": ["string", "null"] },
+          "feature_regime": { "type": ["string", "null"] }
+        }
+      }
+    },
+    "metadata": {
+      "type": "object",
+      "required": [
+        "quantiles",
+        "unit",
+        "note",
+        "epistemic_uncertainty",
+        "band_calibration_applied",
+        "aod_provenance",
+        "train_aod_provenance",
+        "observation_staleness"
+      ],
+      "properties": {
+        "quantiles": { "type": "array", "minItems": 1, "items": { "type": "number", "minimum": 0, "maximum": 1 } },
+        "unit": { "type": "string" },
+        "note": { "type": "string" },
+        "epistemic_uncertainty": { "type": "boolean" },
+        "band_calibration_applied": { "type": "boolean" },
+        "aod_provenance": {
+          "type": "object",
+          "description": "이 발행물에 위성 AOD 신호가 실제로 얼마나 들어갔는가. 행별 aod_source 의 전수 집계.",
+          "required": ["counts", "n_rows", "n_source_known", "n_source_unknown", "signal_share"],
+          "properties": {
+            "counts": { "type": "object" },
+            "n_rows": { "type": "integer", "minimum": 0 },
+            "n_source_known": { "type": "integer", "minimum": 0 },
+            "n_source_unknown": { "type": "integer", "minimum": 0 },
+            "signal_share": {
+              "type": ["number", "null"],
+              "minimum": 0,
+              "maximum": 1,
+              "description": "출처를 아는 행이 0이면 null(미측정)이지 0.0(위성 없음)이 아니다."
+            }
+          }
+        },
+        "train_aod_provenance": {
+          "type": ["object", "string"],
+          "description": "서빙 모델이 학습 때 AOD 를 어디서 받았는가. 배포 아티팩트에 기록이 없으면 문자열 \"unrecorded\"."
+        },
+        "observation_staleness": {
+          "type": ["object", "null"],
+          "description": "관측 나이 때문에 이번 사이클에서 제외된 지점. null 은 '제외 0건' 이 아니라 '이 원천은 레코드 나이를 노출하지 않는다'(구 supabase 경로) 는 뜻이다 — 둘을 같은 값으로 표현하면 커버리지 감소의 이유가 사라진다.",
+          "required": ["max_age_hours", "n_published", "n_dropped_stale", "dropped"],
+          "properties": {
+            "max_age_hours": { "type": "number", "minimum": 0 },
+            "n_published": {
+              "type": "integer",
+              "minimum": 0,
+              "description": "나이 필터 이후 국가·물리상한까지 통과한 최종 발행 지점 수. n_dropped_stale 과 더해도 나이 검사를 받은 모수가 되지 않으므로, 둘로 제외율을 계산하지 말 것."
+            },
+            "n_dropped_stale": { "type": "integer", "minimum": 0 },
+            "dropped": {
+              "type": "array",
+              "description": "제외된 지점 전수. 요약 수치만 실으면 '어느 지점이 죽었나' 를 소비자가 알 수 없다.",
+              "items": {
+                "type": "object",
+                "required": ["station_id", "last_seen", "age_hours"],
+                "properties": {
+                  "station_id": { "type": "string" },
+                  "lat": { "type": ["number", "null"], "minimum": -90, "maximum": 90 },
+                  "lon": { "type": ["number", "null"], "minimum": -180, "maximum": 180 },
+                  "last_seen": { "type": "string" },
+                  "age_hours": { "type": "number", "minimum": 0 }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}

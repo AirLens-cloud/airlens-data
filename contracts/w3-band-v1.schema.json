@@ -1,0 +1,69 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "w3-band-v1",
+  "title": "AirLens 자체 PM2.5 밴드 예보 발행물 v1",
+  "description": "aq-data/forecast-band/latest.json 의 계약. 서빙 지평은 band-forecast-gate 가 베이스라인(B0/B1) 대비 검증한 h1/h6/h24 만 — h48 은 C축 교집합 0(CAMS 아카이브 리드 상한)이라 발행에서 제외한다. required 필드는 소비자 표면이며 삭제는 v2 신설로만. 추가는 자유(additive) — additionalProperties 를 닫지 않는 이유다.",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "generated_at",
+    "model",
+    "issue_time",
+    "cities",
+    "uncertainty",
+    "dqss"
+  ],
+  "properties": {
+    "schema_version": { "const": "w3-band-v1" },
+    "generated_at": { "type": "string", "format": "date-time" },
+    "model": { "type": "string" },
+    "issue_time": { "type": "string", "format": "date-time" },
+    "cities": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "required": ["name", "horizons"],
+        "properties": {
+          "name": { "type": "string" },
+          "horizons": {
+            "type": "array",
+            "minItems": 1,
+            "items": {
+              "type": "object",
+              "required": ["lead_hours", "valid_time", "p10", "p50", "p90"],
+              "properties": {
+                "lead_hours": { "type": "integer", "minimum": 1, "maximum": 24 },
+                "valid_time": { "type": "string", "format": "date-time" },
+                "p10": { "type": "number", "minimum": 0 },
+                "p50": { "type": "number", "minimum": 0 },
+                "p90": { "type": "number", "minimum": 0 }
+              }
+            }
+          }
+        }
+      }
+    },
+    "uncertainty": {
+      "type": "object",
+      "required": ["method", "picp80_claim_by_horizon", "provisional_horizons"],
+      "properties": {
+        "method": { "type": "string" },
+        "picp80_claim_by_horizon": {
+          "type": "object",
+          "description": "지평(문자열 키)별 {picp80_holdout, n_holdout, status(ok|provisional|no_holdout_claim)} — 생산자(ML 파이프라인)가 holdout 표본 하한으로 3분기한다."
+        },
+        "provisional_horizons": { "type": "array", "items": { "type": "integer" } }
+      }
+    },
+    "dqss": {
+      "type": "object",
+      "required": ["grade", "status"],
+      "properties": {
+        "grade": { "type": ["string", "null"] },
+        "status": { "type": "string" },
+        "reason": { "type": "string" }
+      }
+    }
+  }
+}

@@ -1,0 +1,128 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "data_quality.v1",
+  "title": "AirLens DQSS 품질 발행물 v1",
+  "description": "aq-data/data_quality.json 과 quality-history/quality_*.json 의 계약. 이 계약의 요점은 '측정하지 않은 것을 측정으로 위장하지 않는다' 를 구조로 강제하는 것이다 — 성분은 null 이 될 수 있고, null 인 이유는 reasons 에 남아야 한다.",
+  "type": "object",
+  "required": ["schema_version", "meta", "generated_at", "stations"],
+  "properties": {
+    "schema_version": { "const": "data_quality.v1" },
+    "generated_at": { "type": "string", "format": "date-time" },
+    "meta": {
+      "type": "object",
+      "required": [
+        "source",
+        "generated_at",
+        "engine",
+        "inputs",
+        "measured_weight_range",
+        "graded_stations",
+        "total_stations",
+        "cutoff_basis",
+        "note"
+      ],
+      "properties": {
+        "source": {
+          "type": "string",
+          "enum": ["measured", "partial"],
+          "description": "5성분 전부 실측일 때만 measured. 라벨을 바꾸려면 계약을 바꿔라 — 조용한 승격 금지."
+        },
+        "generated_at": { "type": "string", "format": "date-time" },
+        "engine": { "type": "string" },
+        "inputs": {
+          "type": "object",
+          "description": "성분별로 '측정됐다' 인지 '왜 못 했다' 인지. 값이 measured 가 아니면 그 사유 문자열이 그대로 남는다.",
+          "required": ["freshness", "completeness", "consistency", "stability", "residual"],
+          "properties": {
+            "freshness": { "type": "string" },
+            "completeness": { "type": "string" },
+            "consistency": { "type": "string" },
+            "stability": { "type": "string" },
+            "residual": { "type": "string" }
+          }
+        },
+        "measured_weight_range": {
+          "type": ["array", "null"],
+          "minItems": 2,
+          "items": { "type": "number", "minimum": 0, "maximum": 100 }
+        },
+        "graded_stations": { "type": "integer", "minimum": 0 },
+        "total_stations": { "type": "integer", "minimum": 0 },
+        "cutoff_basis": {
+          "type": "string",
+          "description": "배지 컷오프의 근거. 외부 앵커가 없으면 없다고 적는다(P1-4 가 이 값을 실증 근거로 교체한다)."
+        },
+        "cutoff_basis_by_component": {
+          "type": "object",
+          "description": "P1-4 W1: cutoff_basis 를 성분별로 분해한다(completeness/consistency/freshness/stability/residual/grade_cuts). cutoff_basis 문자열을 대체하지 않는 additive 필드다."
+        },
+        "nominal_weights": {
+          "type": "object",
+          "description": "P1-4 W1: 이번 런의 공칭(설계상) 성분 가중치. optimize_weights() 로 재학습되지 않았으면 20×5 균등이다."
+        },
+        "effective_weights": {
+          "type": "object",
+          "description": "P1-4 W1 (decision 5): 이번 런에서 한 번이라도 실측된 성분만으로 100 재정규화한 실효 가중치. 런 전체에서 전면 결측인 성분(예: consistency)은 키 자체가 빠진다. 런 단위 공개값이며 station별 실제 재정규화는 각 station 의 measured_weight 가 담당한다. 합은 부동소수 반올림(소수 4자리)으로 100 에서 미세 이탈할 수 있다."
+        },
+        "weight_sensitivity": {
+          "type": "object",
+          "description": "P1-4 W3: 가중 ±25% 섭동 10 시나리오(perturb_pm25pct) + LOCO 5 시나리오(loco) 의 등급 flip 비율. flip 이 크면 배지를 final_score 와 함께 읽어야 한다는 뜻이다."
+        },
+        "anomaly_check": {
+          "type": "string",
+          "description": "5성분과 별개인 LSTM-AE 이상탐지 전역 페널티가 이번 런에 실제로 돌았는지. 'measured' 가 아니면 그 사유 문자열(예: unavailable-no-checkpoint)이 남는다 — station별 anomaly_detected=false 만으로는 '이상 없음'과 '애초에 검사 안 함'을 구분할 수 없어서다. 값이 없던 이전 발행물과의 호환을 위해 required 는 아니다(additive)."
+        },
+        "note": { "type": "string" }
+      }
+    },
+    "stations": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": [
+          "station_id",
+          "measured_weight",
+          "final_score",
+          "badge",
+          "reasons",
+          "computed_at"
+        ],
+        "properties": {
+          "station_id": { "type": "string" },
+          "freshness": { "type": ["number", "null"] },
+          "completeness": { "type": ["number", "null"] },
+          "consistency": { "type": ["number", "null"] },
+          "stability": { "type": ["number", "null"] },
+          "model_residual": { "type": ["number", "null"] },
+          "measured_weight": {
+            "type": "number",
+            "minimum": 0,
+            "maximum": 100,
+            "description": "final_score 는 측정된 성분만으로 재정규화된 값이라 이 값과 함께 읽어야 한다."
+          },
+          "reasons": {
+            "type": "object",
+            "description": "측정 못 한 성분의 사유. 중간값으로 채우는 대신 여기에 남긴다."
+          },
+          "reliability_score": { "type": ["number", "null"] },
+          "sensor_type_bonus": { "type": ["number", "null"] },
+          "final_score": {
+            "type": ["number", "null"],
+            "minimum": 0,
+            "maximum": 100,
+            "description": "측정된 성분이 하나도 없으면(measured_weight=0) null 이고 reasons.grade 에 no_computable_components 가 남는다. null 을 0점으로 바꾸면 '못 쟀다' 가 '나쁘다' 로 둔갑한다."
+          },
+          "badge": {
+            "type": ["string", "null"],
+            "description": "measured_weight >= 60 일 때만 등급이 붙는다. 아니면 null."
+          },
+          "badge_color": { "type": ["string", "null"] },
+          "computed_at": { "type": "string", "format": "date-time" },
+          "weights_rationale": { "type": ["string", "null"] },
+          "lat": { "type": ["number", "null"], "minimum": -90, "maximum": 90 },
+          "lon": { "type": ["number", "null"], "minimum": -180, "maximum": 180 }
+        }
+      }
+    }
+  }
+}
