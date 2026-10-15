@@ -1,0 +1,30 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "data_quality_withheld.v1",
+  "title": "AirLens DQSS 발행 보류 문서 v1",
+  "description": "정보량 게이트(ML 파이프라인의 DQSS 정보량 검사)가 FAIL 했을 때 data_quality.json 자리에 대신 발행되는 문서. 점수 문서와 같은 계약으로 뭉개면 둘 다 느슨해지므로 분리한다 — 보류는 '점수가 비어 있는 점수 문서' 가 아니라 다른 종류의 문서다. 소비자는 schema_version 으로 둘을 구분하고, 이 문서를 받으면 점수를 렌더하지 않고 보류 사유를 보여줘야 한다.",
+  "type": "object",
+  "required": ["schema_version", "meta", "generated_at", "stations"],
+  "properties": {
+    "schema_version": { "const": "data_quality_withheld.v1" },
+    "generated_at": { "type": "string", "format": "date-time" },
+    "meta": {
+      "type": "object",
+      "required": ["source", "reason", "failed_rules", "generated_at"],
+      "properties": {
+        "source": { "const": "withheld" },
+        "reason": { "type": "string" },
+        "failed_rules": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "어떤 규칙이 깨져서 보류했는지. 비워두면 '왜 보류인지' 를 아무도 모른다."
+        },
+        "generated_at": { "type": "string", "format": "date-time" }
+      }
+    },
+    "stations": {
+      "const": [],
+      "description": "보류 문서에는 지점이 없다. 하나라도 실리면 그건 부분 발행이지 보류가 아니다."
+    }
+  }
+}

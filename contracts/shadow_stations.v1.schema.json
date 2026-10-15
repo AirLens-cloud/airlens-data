@@ -1,0 +1,69 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "shadow_stations.v1",
+  "title": "AirLens 섀도우 집계 원자료 v1",
+  "description": "aq-data/quality-history/shadow_*.json 의 계약. data_quality.v1 이 '점수'라면 이쪽은 그 점수가 나온 '원자료'다 — DQSS 의 completeness/stability 성분이 어떤 관측 밀도·변동성에서 계산됐는지 사후에 되짚기 위한 것. 값을 채우지 않는다: 표본이 얇아 계산할 수 없었던 rolling_std_48h 는 null 로 남고, 그 null 자체가 정보다.",
+  "type": "object",
+  "required": ["schema_version", "generated_at", "meta", "stations"],
+  "properties": {
+    "schema_version": { "const": "shadow_stations.v1" },
+    "generated_at": { "type": "string", "format": "date-time" },
+    "meta": {
+      "type": "object",
+      "required": ["source", "window_hours", "readings_window_hours", "min_std_samples", "station_count", "note"],
+      "properties": {
+        "source": {
+          "type": "string",
+          "const": "openaq-shadow",
+          "description": "집계 원천 슬롯 피드. 다른 피드를 섞으려면 계약을 바꿔라."
+        },
+        "window_hours": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "rolling_std_48h 를 계산한 윈도우. 상수가 아니라 실제 사용값을 싣는다 — 나중에 창을 바꾸면 옛 스냅샷과 구분돼야 한다."
+        },
+        "readings_window_hours": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "readings_24h 의 실제 창."
+        },
+        "min_std_samples": {
+          "type": "integer",
+          "minimum": 2,
+          "description": "이 표본 수 미만이면 rolling_std_48h 는 null. 얇은 표본을 '안정적'으로 위장하지 않기 위한 하한."
+        },
+        "station_count": { "type": "integer", "minimum": 0 },
+        "note": { "type": "string" }
+      }
+    },
+    "stations": {
+      "type": "array",
+      "description": "지점당 한 행. 집계가 커버하지 못한 지점은 여기 없다 — 0 으로 채워 넣지 않는다.",
+      "items": {
+        "type": "object",
+        "required": ["station_id", "last_update", "readings_24h", "rolling_std_48h"],
+        "properties": {
+          "station_id": {
+            "type": "string",
+            "description": "openaq-{locations_id}. predict_grid 예측 행의 name 과 같은 규약이라 별도 크로스워크 없이 조인된다."
+          },
+          "last_update": {
+            "type": "string",
+            "format": "date-time",
+            "description": "distinct 관측 시각(시 단위 절삭) 중 최댓값. 슬롯 등장 시각이 아니다 — openaq-shadow 는 미갱신 지점을 매시 그대로 반복 노출(echo)한다."
+          },
+          "readings_24h": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "최근 readings_window_hours 이내 distinct 관측 시각 개수."
+          },
+          "rolling_std_48h": {
+            "type": ["number", "null"],
+            "minimum": 0,
+            "description": "시간별 대표값의 표준편차. 표본이 min_std_samples 미만이면 null — 0 이 아니다. 0 은 '변동이 없었다'이고 null 은 '잴 수 없었다'다."
+          }
+        }
+      }
+    }
+  }
+}
