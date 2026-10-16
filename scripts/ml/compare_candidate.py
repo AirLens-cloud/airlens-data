@@ -1,0 +1,516 @@
+#!/usr/bin/env python3
+"""후보(`aq-data/_candidate/`)와 운영 발행물을 같은 STAMP 끼리 짝지어 비교한다 (stdlib 전용).
+
+지금은 predictions(grid + DQSS)만 다룬다. 입력은 공개 저장소(토큰 불요) 또는 `--local DIR`(저장소 트리를
+그대로 미러한 디렉터리 — 오프라인·시험용)이다. 비교 판정은 네트워크 없는 순수 함수라 단위 시험으로 고정한다.
+
+**엄격 짝** = 같은 STAMP + `observation_slot` + `model_sha` + `model_version` 이 모두 같은 쌍. 입력이 같으니
+출력도 같아야 한다 — 추론 경로에 난수가 없다(난수는 학습 부트스트랩에만 있다). 다만 run 사이에 바뀌는 것이
+있다: 현재 시각, 실시간 Open-Meteo, DQSS 신선도(경과 시간), shadow 통계. 그래서 허용오차가 있다.
+행 키는 (name, lat, lon). "행 입력 동일" = `observed_pm25` 와 `input_updated_at` 이 같음.
+`model_sha` 는 양쪽 모두 값이 있어야 같다고 본다 — null 은 폴백 경로·구 아티팩트라 null == null 이 같은 모델이라는 뜻이
+아니다. 후보가 폴백으로 돌았으면(`model_available` 이 true 가 아니거나 `model_sha` 가 null) 비교하지 않고 FAIL 이다.
+
+  grid (엄격 짝, 입력 같은 행 기준)
+    · 행 키 집합·count 동일, 키 중복 없음, 입력 같은 행 ≥ 99%
+    · predicted_p10/p50/p90 |Δ| ≤ 0.1 인 행 ≥ 99%, 최대 |Δ| ≤ 1.0   (값은 0.1 단위로 반올림돼 나온다)
+    · confidence_grade · aod_source · feature_regime 일치 ≥ 99% (필드별)
+  DQSS (엄격 짝)
+    · station_id 집합 동일, |Δfinal_score| ≤ 1 인 지점 ≥ 95%, badge 일치 ≥ 95%
+  엄격 짝이 아닌 쌍(INPUT-DIFF)은 계약 통과와 키 겹침(≥ 95%)만 **보고**한다. 계약 위반은 FAIL 이다.
+
+판정: PASS / FAIL / INPUT-DIFF(입력이 달라 엄격 비교 불가) / UNPAIRED(한쪽에 파일 없음).
+종료 코드: 0 = FAIL 없음 + 엄격 PASS ≥ 최소(기본 3) / 1 = FAIL 있음 / 2 = 엄격 PASS 부족 또는 읽기 실패.
+
+사용:
+    python3 scripts/ml/compare_candidate.py                    # 공개 저장소의 후보 전부
+    python3 scripts/ml/compare_candidate.py --since 2026-10-16 --json
+    python3 scripts/ml/compare_candidate.py --local DIR --min-strict-pairs 1
+"""
+from __future__ import annotations
+
+import argparse
+import http.client
+import importlib.util
+import json
+import math
+import os
+import re
+import sys
+import time
+import urllib.error
+import urllib.request
+from collections.abc import Callable
+from dataclasses import asdict, dataclass, field
+from pathlib import Path
+from typing import Protocol
+
+DATASET = "Robeedau/airlens-live"  # 공개 dataset
+RESOLVE_BASE = f"https://huggingface.co/datasets/{DATASET}/resolve/main"
+TREE_BASE = f"https://huggingface.co/api/datasets/{DATASET}/tree/main"
+
+PROD_GRID_DIR = "aq-data/predictions/history"
+CAND_GRID_DIR = "aq-data/_candidate/predictions/history"
+PROD_QUALITY_DIR = "aq-data/quality-history"
+CAND_QUALITY_DIR = "aq-data/_candidate/quality-history"
+
+# ── 판정 기준 ────────────────────────────────────────────────────────────────
+STRICT_ID_FIELDS = ("observation_slot", "model_sha", "model_version")
+QUANTILES = ("predicted_p10", "predicted_p50", "predicted_p90")
+CATEGORICAL = ("confidence_grade", "aod_source", "feature_regime")
+Q_TOL = 0.1  # 0.1 단위 반올림 값이라 한 칸 차이까지 허용
+Q_TOL_FRACTION = 0.99
+Q_MAX = 1.0
+CATEGORICAL_FRACTION = 0.99
+SAME_INPUT_FRACTION = 0.99
+DQSS_TOL = 1.0
+DQSS_SCORE_FRACTION = 0.95
+DQSS_BADGE_FRACTION = 0.95
+OVERLAP_FRACTION = 0.95  # 엄격 짝이 아닐 때 보고하는 키 겹침 기준
+MIN_STRICT_PAIRS = 3
+EPS = 1e-9  # 0.1 의 부동소수 오차
+
+WORST_ROWS = 10
+STAMP_RE = re.compile(r"\d{10}")
+FETCH_TIMEOUT_S = 60
+FETCH_RETRIES = 3
+
+PASS, FAIL, INPUT_DIFF, UNPAIRED = "PASS", "FAIL", "INPUT-DIFF", "UNPAIRED"
+
+
+@dataclass
+class Check:
+    name: str
+    detail: str
+    ok: bool | None  # None = 보고만(판정에 안 쓴다)
+
+
+@dataclass
+class PairResult:
+    stamp: str
+    verdict: str
+    strict: bool
+    reasons: list[str] = field(default_factory=list)
+    checks: list[Check] = field(default_factory=list)
+    max_delta: dict[str, float] = field(default_factory=dict)
+    worst_rows: list[dict] = field(default_factory=list)
+
+
+class SourceError(Exception):
+    """파일을 읽지 못함(없는 것과 다르다 — 없으면 None)."""
+
+
+class Source(Protocol):
+    def list_stamps(self, rel_dir: str, prefix: str) -> list[str]: ...
+    def read_json(self, rel_path: str) -> dict | None: ...
+
+
+def _json_object(data: object, rel_path: str) -> dict:
+    """발행물은 JSON 객체다. 배열·문자열·null 은 '없음'(None)이 아니라 읽기 실패다."""
+    if not isinstance(data, dict):
+        raise SourceError(f"{rel_path}: JSON 객체 아님")
+    return data
+
+
+# ── 순수 판정 함수 ───────────────────────────────────────────────────────────
+def _num(value: object) -> float | None:
+    """유한한 숫자만 돌려준다. bool·문자열·NaN·inf 는 None — NaN 과의 비교는 늘 False 라 허용오차 판정을 조용히 통과한다."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    number = float(value)
+    return number if math.isfinite(number) else None
+
+
+def _shown(value: object) -> object:
+    """실패 행 표에 내보낼 값. NaN·inf 는 JSON 이 못 쓰는 토큰이라 문자열로 바꾼다."""
+    if isinstance(value, float) and not math.isfinite(value):
+        return str(value)
+    return value
+
+
+def _index(rows: list[dict], key: Callable[[dict], object]) -> tuple[dict, int]:
+    """키 → 행. 두 번째 값은 중복으로 덮인 행 수."""
+    out: dict = {}
+    for row in rows:
+        out[key(row)] = row
+    return out, len(rows) - len(out)
+
+
+def _row_key(row: dict) -> tuple:
+    return (row.get("name"), row.get("lat"), row.get("lon"))
+
+
+def _fraction(hit: int, total: int) -> float:
+    return hit / total if total else 0.0
+
+
+def _pct(value: float) -> str:
+    return f"{value * 100:.1f}%"
+
+
+def strict_mismatches(prod: dict, cand: dict) -> list[str]:
+    """엄격 짝 조건 중 서로 다른 필드 이름들. 비면 엄격 짝. `model_sha` 는 null 이면(양쪽이 null 이어도) 다른 것으로 센다."""
+    return [f for f in STRICT_ID_FIELDS
+            if prod.get(f) != cand.get(f) or (f == "model_sha" and prod.get(f) is None)]
+
+
+def compare_grid(prod: dict, cand: dict) -> tuple[list[Check], dict[str, float], list[dict]]:
+    """엄격 짝의 grid 비교. (checks, 필드별 최대 |Δ|, 실패 행 상위)."""
+    checks: list[Check] = []
+    p_rows, p_dups = _index(prod.get("predictions") or [], _row_key)
+    c_rows, c_dups = _index(cand.get("predictions") or [], _row_key)
+
+    only_prod, only_cand = set(p_rows) - set(c_rows), set(c_rows) - set(p_rows)  # 개수만 쓴다(키에 None·str 이 섞여도 정렬하지 않는다)
+    checks.append(Check("행 키 집합", f"운영 {len(p_rows)} / 후보 {len(c_rows)} (운영만 {len(only_prod)}, 후보만 {len(only_cand)})",
+                        not only_prod and not only_cand))
+    checks.append(Check("count", f"운영 {prod.get('count')} / 후보 {cand.get('count')}", prod.get("count") == cand.get("count")))
+    checks.append(Check("키 중복", f"운영 {p_dups} / 후보 {c_dups}", p_dups == 0 and c_dups == 0))
+
+    common = sorted(set(p_rows) & set(c_rows), key=repr)
+    if not common:
+        checks.append(Check("비교할 행", "공통 행 없음", False))
+        return checks, {}, []
+
+    same_input = [k for k in common
+                  if p_rows[k].get("observed_pm25") == c_rows[k].get("observed_pm25")
+                  and p_rows[k].get("input_updated_at") == c_rows[k].get("input_updated_at")]
+    ratio = _fraction(len(same_input), len(common))
+    checks.append(Check("입력 같은 행", f"{len(same_input)}/{len(common)} ({_pct(ratio)})", ratio >= SAME_INPUT_FRACTION))
+    if not same_input:
+        return checks, {}, []
+
+    deltas: dict[str, list[float | None]] = {q: [] for q in QUANTILES}
+    worst: list[dict] = []
+    within = 0
+    for k in same_input:
+        row_ok = True
+        row_worst: tuple[float, str, object, object] | None = None
+        for q in QUANTILES:
+            a, b = _num(p_rows[k].get(q)), _num(c_rows[k].get(q))
+            if a is None or b is None:
+                deltas[q].append(None)
+                row_ok = False
+                row_worst = (float("inf"), q, _shown(p_rows[k].get(q)), _shown(c_rows[k].get(q)))
+                continue
+            d = abs(a - b)
+            deltas[q].append(d)
+            if d > Q_TOL + EPS:
+                row_ok = False
+            if row_worst is None or d > row_worst[0]:
+                row_worst = (d, q, a, b)
+        within += row_ok
+        if not row_ok and row_worst is not None:
+            worst.append({"name": k[0], "field": row_worst[1], "prod": row_worst[2], "cand": row_worst[3],
+                          "abs_delta": None if row_worst[0] == float("inf") else round(row_worst[0], 4)})
+    frac = _fraction(within, len(same_input))
+    checks.append(Check(f"p10/p50/p90 |Δ|≤{Q_TOL}", f"{within}/{len(same_input)} ({_pct(frac)})", frac >= Q_TOL_FRACTION))
+
+    max_delta: dict[str, float] = {}
+    for q in QUANTILES:
+        finite = [d for d in deltas[q] if d is not None]
+        max_delta[q] = round(max(finite), 4) if finite else 0.0
+    unreadable = sum(d is None for q in QUANTILES for d in deltas[q])
+    over = max(max_delta.values()) > Q_MAX + EPS or unreadable > 0
+    checks.append(Check(f"최대 |Δ|≤{Q_MAX}", ", ".join(f"{q.removeprefix('predicted_')} {max_delta[q]}" for q in QUANTILES)
+                        + (f" (숫자 아님 {unreadable})" if unreadable else ""), not over))
+
+    for f in CATEGORICAL:
+        match = sum(p_rows[k].get(f) == c_rows[k].get(f) for k in same_input)
+        frac = _fraction(match, len(same_input))
+        checks.append(Check(f"{f} 일치", f"{match}/{len(same_input)} ({_pct(frac)})", frac >= CATEGORICAL_FRACTION))
+
+    worst.sort(key=lambda r: (r["abs_delta"] is not None, -(r["abs_delta"] or 0)))
+    return checks, max_delta, worst[:WORST_ROWS]
+
+
+def compare_quality(prod: dict, cand: dict) -> list[Check]:
+    """엄격 짝의 DQSS 비교."""
+    p_rows, p_dups = _index(prod.get("stations") or [], lambda r: r.get("station_id"))
+    c_rows, c_dups = _index(cand.get("stations") or [], lambda r: r.get("station_id"))
+    only_prod, only_cand = set(p_rows) - set(c_rows), set(c_rows) - set(p_rows)
+    checks = [
+        Check("DQSS 계약 이름", f"운영 {prod.get('schema_version')} / 후보 {cand.get('schema_version')}",
+              prod.get("schema_version") == cand.get("schema_version")),
+        Check("DQSS station_id 집합", f"운영 {len(p_rows)} / 후보 {len(c_rows)} (운영만 {len(only_prod)}, 후보만 {len(only_cand)})",
+              not only_prod and not only_cand and p_dups == 0 and c_dups == 0),
+    ]
+    common = sorted(set(p_rows) & set(c_rows), key=repr)
+    if not common:
+        return checks  # 둘 다 withheld(빈 stations) 면 집합 일치만 본다
+    score_hit = badge_hit = 0
+    for k in common:
+        a, b = p_rows[k].get("final_score"), c_rows[k].get("final_score")
+        if a is None or b is None:
+            score_hit += a is None and b is None
+        else:
+            na, nb = _num(a), _num(b)
+            score_hit += na is not None and nb is not None and abs(na - nb) <= DQSS_TOL + EPS
+        badge_hit += p_rows[k].get("badge") == c_rows[k].get("badge")
+    frac = _fraction(score_hit, len(common))
+    checks.append(Check(f"DQSS |Δfinal_score|≤{DQSS_TOL:g}", f"{score_hit}/{len(common)} ({_pct(frac)})", frac >= DQSS_SCORE_FRACTION))
+    frac = _fraction(badge_hit, len(common))
+    checks.append(Check("DQSS badge 일치", f"{badge_hit}/{len(common)} ({_pct(frac)})", frac >= DQSS_BADGE_FRACTION))
+    return checks
+
+
+def classify_pair(
+    stamp: str,
+    prod: dict | None,
+    cand: dict | None,
+    prod_q: dict | None,
+    cand_q: dict | None,
+    validate: Callable[[dict], str | None],
+) -> PairResult:
+    """한 STAMP 의 운영·후보 payload 로 판정한다. validate(payload) 는 계약 위반 설명 또는 None."""
+    if prod is None or cand is None:
+        side = "운영" if prod is None else "후보"
+        return PairResult(stamp, UNPAIRED, False, [f"{side} 쪽 grid 파일이 없다"])
+
+    if cand.get("model_available") is not True or cand.get("model_sha") is None:
+        # 가중치를 못 쓰고 폴백 경로로 돌았다면 운영과 값이 같든 말든 컷오버 근거가 아니다(값 대신 있고 없음만 적는다).
+        detail = (f"model_available={cand.get('model_available')!r}, "
+                  f"model_sha {'null' if cand.get('model_sha') is None else '있음'}")
+        return PairResult(stamp, FAIL, False, ["후보가 폴백 경로로 돌았다"], [Check("후보 모델 사용", detail, False)])
+
+    diff = strict_mismatches(prod, cand)
+    if diff:
+        result = PairResult(stamp, INPUT_DIFF, False,
+                            [f"입력이 다르다({', '.join(diff)}) — 엄격 비교 불가"])
+        p_keys = {_row_key(r) for r in prod.get("predictions") or []}
+        c_keys = {_row_key(r) for r in cand.get("predictions") or []}
+        overlap = _fraction(len(p_keys & c_keys), max(len(p_keys), len(c_keys)))
+        error = validate(cand)
+        low = f" — {_pct(OVERLAP_FRACTION)} 미만" if overlap < OVERLAP_FRACTION else ""
+        result.checks = [
+            Check("후보 계약", error or "통과", error is None),
+            Check("키 겹침(보고)", _pct(overlap) + low, None),
+        ]
+        if error:
+            result.verdict, result.reasons = FAIL, [f"후보가 계약을 어겼다: {error}"]
+        return result
+
+    checks, max_delta, worst = compare_grid(prod, cand)
+    if prod_q is not None or cand_q is not None:
+        if cand_q is None:
+            checks.append(Check("DQSS 파일", "후보 없음(운영은 있음)", False))
+        elif prod_q is None:
+            checks.append(Check("DQSS 파일", "운영 없음 — 미비교", None))
+        else:
+            checks.extend(compare_quality(prod_q, cand_q))
+    else:
+        checks.append(Check("DQSS 파일", "양쪽 없음 — 미비교", None))
+    error = validate(cand)
+    checks.append(Check("후보 계약", error or "통과", error is None))
+    reasons = [f"{c.name}: {c.detail}" for c in checks if c.ok is False]
+    return PairResult(stamp, FAIL if reasons else PASS, True, reasons, checks, max_delta, worst)
+
+
+def parse_since(value: str) -> str:
+    """`YYYYMMDDHH` · `YYYYMMDD` · `YYYY-MM-DD` → 10자리 스탬프(이 시각 이후만 비교)."""
+    digits = value.replace("-", "")
+    if not digits.isdigit() or len(digits) not in (8, 10):
+        raise ValueError(f"--since 는 YYYYMMDDHH, YYYYMMDD, YYYY-MM-DD 중 하나여야 한다: {value!r}")
+    return digits if len(digits) == 10 else digits + "00"
+
+
+def summarize(results: list[PairResult], prod_only: int, min_strict: int) -> dict:
+    counts = {v: sum(r.verdict == v for r in results) for v in (PASS, FAIL, INPUT_DIFF, UNPAIRED)}
+    strict_pass = sum(r.verdict == PASS and r.strict for r in results)
+    max_delta = {q: max((r.max_delta.get(q, 0.0) for r in results if r.strict), default=0.0) for q in QUANTILES}
+    code = 1 if counts[FAIL] else (2 if strict_pass < min_strict else 0)
+    return {"pairs": len(results), "counts": counts, "strict_pass": strict_pass, "min_strict_pairs": min_strict,
+            "prod_only_stamps": prod_only, "max_delta": max_delta, "exit_code": code}
+
+
+def _cell(value: object) -> str:
+    """Markdown 표 셀 값. `|` 는 열 구분자라 이스케이프하고 줄바꿈은 공백으로 바꾼다(표가 깨지지 않게)."""
+    return str(value).replace("|", "\\|").replace("\n", " ")
+
+
+def render_markdown(results: list[PairResult], summary: dict) -> str:
+    c = summary["counts"]
+    lines = [
+        "## 후보 ↔ 운영 비교 (predictions)",
+        "",
+        f"짝 {summary['pairs']}개 — PASS {c[PASS]} · FAIL {c[FAIL]} · INPUT-DIFF {c[INPUT_DIFF]} · UNPAIRED {c[UNPAIRED]}"
+        f" (후보 시간대의 운영 STAMP 중 후보 없음 {summary['prod_only_stamps']})",
+        f"엄격 PASS {summary['strict_pass']} (필요 ≥ {summary['min_strict_pairs']}) · "
+        "최대 |Δ| " + ", ".join(f"{q.removeprefix('predicted_')} {v}" for q, v in summary["max_delta"].items()),
+        "",
+        "| STAMP | 판정 | 엄격 | 사유 |",
+        "|---|---|---|---|",
+    ]
+    for r in results:
+        lines.append(f"| {r.stamp} | {r.verdict} | {'예' if r.strict else '아니오'} | {_cell('; '.join(r.reasons) or '—')} |")
+    for r in results:
+        if not r.checks or not (r.strict or r.verdict == FAIL):
+            continue  # INPUT-DIFF 는 위 표의 사유 한 줄이면 충분하다
+        lines += ["", f"### {r.stamp} — {r.verdict}", "", "| 검사 | 값 | 결과 |", "|---|---|---|"]
+        for ch in r.checks:
+            mark = "—" if ch.ok is None else ("OK" if ch.ok else "FAIL")
+            lines.append(f"| {_cell(ch.name)} | {_cell(ch.detail)} | {mark} |")
+        if r.worst_rows:
+            lines += ["", f"실패 행 상위 {len(r.worst_rows)}:", "", "| name | 필드 | 운영 | 후보 | \\|Δ\\| |", "|---|---|---|---|---|"]
+            lines += [f"| {_cell(w['name'])} | {_cell(w['field'])} | {w['prod']} | {w['cand']} | {w['abs_delta']} |" for w in r.worst_rows]
+    return "\n".join(lines) + "\n"
+
+
+# ── 입력 원천 ────────────────────────────────────────────────────────────────
+class LocalSource:
+    """저장소 트리를 미러한 디렉터리 (`DIR/aq-data/...`)."""
+
+    def __init__(self, root: Path) -> None:
+        self.root = root
+
+    def list_stamps(self, rel_dir: str, prefix: str) -> list[str]:
+        directory = self.root / rel_dir
+        if not directory.is_dir():
+            return []
+        stamps = []
+        for path in directory.glob(f"{prefix}_*.json"):
+            m = re.fullmatch(rf"{re.escape(prefix)}_(\d{{10}})\.json", path.name)
+            if m:
+                stamps.append(m.group(1))
+        return sorted(stamps)
+
+    def read_json(self, rel_path: str) -> dict | None:
+        path = self.root / rel_path
+        if not path.is_file():
+            return None
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as exc:
+            raise SourceError(f"{rel_path}: {type(exc).__name__}") from None
+        return _json_object(data, rel_path)
+
+
+class HttpSource:
+    """공개 저장소. 토큰을 보내지 않는다."""
+
+    def __init__(self, sleep: Callable[[float], None] = time.sleep) -> None:
+        self.sleep = sleep
+
+    def _open(self, url: str):
+        req = urllib.request.Request(url, headers={"User-Agent": "airlens-data-compare-candidate"})
+        return urllib.request.urlopen(req, timeout=FETCH_TIMEOUT_S)  # noqa: S310 — 고정 https 호스트
+
+    def _get(self, url: str, what: str):
+        """(본문 bytes, Link 헤더). 404 는 (None, '')."""
+        for attempt in range(1, FETCH_RETRIES + 1):
+            try:
+                with self._open(url) as resp:
+                    return resp.read(), resp.headers.get("Link") or ""
+            except urllib.error.HTTPError as exc:
+                if exc.code == 404:
+                    return None, ""
+                if exc.code not in (429, 500, 502, 503, 504) or attempt == FETCH_RETRIES:
+                    raise SourceError(f"{what}: HTTPError status={exc.code}") from None
+            except (OSError, http.client.HTTPException) as exc:  # URLError·타임아웃·SSLError·IncompleteRead(resp.read 도중) 포함
+                if attempt == FETCH_RETRIES:
+                    raise SourceError(f"{what}: {type(exc).__name__}") from None
+            self.sleep(2.0 * attempt)
+        raise AssertionError("unreachable")
+
+    def list_stamps(self, rel_dir: str, prefix: str) -> list[str]:
+        stamps: list[str] = []
+        url: str | None = f"{TREE_BASE}/{rel_dir}"
+        while url:
+            body, link = self._get(url, f"{rel_dir} 목록")
+            if body is None:
+                return stamps
+            try:
+                entries = json.loads(body)
+            except ValueError:
+                raise SourceError(f"{rel_dir} 목록: JSON 아님") from None
+            if not isinstance(entries, list) or not all(isinstance(e, dict) for e in entries):
+                raise SourceError(f"{rel_dir} 목록: 객체 배열이 아님")
+            for entry in entries:
+                m = re.fullmatch(rf".*/{re.escape(prefix)}_(\d{{10}})\.json", str(entry.get("path", "")))
+                if m:
+                    stamps.append(m.group(1))
+            nxt = re.search(r'<([^>]+)>;\s*rel="next"', link)
+            url = nxt.group(1) if nxt else None
+        return sorted(stamps)
+
+    def read_json(self, rel_path: str) -> dict | None:
+        body, _ = self._get(f"{RESOLVE_BASE}/{rel_path}", rel_path)
+        if body is None:
+            return None
+        try:
+            data = json.loads(body)
+        except ValueError:
+            raise SourceError(f"{rel_path}: JSON 아님") from None
+        return _json_object(data, rel_path)
+
+
+def _contract_validator() -> Callable[[dict], str | None]:
+    """contracts/validate.py 를 파일 경로로 적재한다(hf_publish 와 같은 방식 — 전역 import 경로를 건드리지 않는다)."""
+    path = Path(__file__).resolve().parents[2] / "contracts" / "validate.py"
+    spec = importlib.util.spec_from_file_location("_airlens_contract_validate", path)
+    if spec is None or spec.loader is None:
+        raise SourceError("contracts/validate.py 를 적재할 수 없다")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    def validate(payload: dict) -> str | None:
+        try:
+            module.validate_payload(payload, module.resolve_schema(payload))
+        except module.ContractError as exc:
+            return str(exc)
+        return None
+
+    return validate
+
+
+def run(source: Source, validate: Callable[[dict], str | None], since: str | None, min_strict: int) -> tuple[list[PairResult], dict]:
+    cand_stamps = [s for s in source.list_stamps(CAND_GRID_DIR, "grid") if since is None or s >= since]
+    results: list[PairResult] = []
+    for stamp in cand_stamps:
+        prod = source.read_json(f"{PROD_GRID_DIR}/grid_{stamp}.json")
+        cand = source.read_json(f"{CAND_GRID_DIR}/grid_{stamp}.json")
+        prod_q = cand_q = None
+        if prod is not None and cand is not None and not strict_mismatches(prod, cand):
+            prod_q = source.read_json(f"{PROD_QUALITY_DIR}/quality_{stamp}.json")
+            cand_q = source.read_json(f"{CAND_QUALITY_DIR}/quality_{stamp}.json")
+        results.append(classify_pair(stamp, prod, cand, prod_q, cand_q, validate))
+
+    # 후보가 돈 시간대(첫 후보 STAMP 이후)에 운영만 있는 STAMP — 후보가 건너뛴 슬롯
+    prod_only = 0
+    if cand_stamps:
+        first, seen = cand_stamps[0], set(cand_stamps)
+        prod_only = len([s for s in source.list_stamps(PROD_GRID_DIR, "grid") if s >= first and s not in seen])
+    return results, summarize(results, prod_only, min_strict)
+
+
+def main(argv: list[str] | None = None, validate: Callable[[dict], str | None] | None = None) -> int:
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--product", default="predictions", choices=["predictions"])
+    parser.add_argument("--local", type=Path, help="저장소 트리를 미러한 디렉터리 (없으면 공개 저장소를 읽는다)")
+    parser.add_argument("--since", help="이 시각 이후 STAMP 만 (YYYYMMDDHH · YYYYMMDD · YYYY-MM-DD)")
+    parser.add_argument("--min-strict-pairs", type=int, default=MIN_STRICT_PAIRS, help="엄격 PASS 최소 수 (기본 %(default)s)")
+    parser.add_argument("--json", action="store_true", help="Markdown 대신 JSON 을 stdout 으로")
+    args = parser.parse_args(argv)
+
+    try:
+        since = parse_since(args.since) if args.since else None
+        source: Source = LocalSource(args.local) if args.local else HttpSource()
+        results, summary = run(source, validate or _contract_validator(), since, args.min_strict_pairs)
+    except (ValueError, SourceError) as exc:
+        print(f"compare_candidate: {exc}", file=sys.stderr)
+        return 2
+
+    if args.json:
+        print(json.dumps({"product": args.product, "summary": summary, "pairs": [asdict(r) for r in results]},
+                         ensure_ascii=False, indent=2))
+    else:
+        report = render_markdown(results, summary)
+        print(report)
+        path = os.environ.get("GITHUB_STEP_SUMMARY")
+        if path:
+            with open(path, "a", encoding="utf-8") as f:
+                f.write(report)
+    return summary["exit_code"]
+
+
+if __name__ == "__main__":
+    sys.exit(main())

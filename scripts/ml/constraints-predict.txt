@@ -1,0 +1,29 @@
+# 추론 wheel(airlens-inference) 설치 환경 고정 — 설치되는 패키지 전부(직접 + 전이)의 정확한 버전.
+#
+# 근거: 운영 추론 job 의 실제 설치 목록(2026-10-15 run, CPython 3.12.3, x86_64 Linux) 19개.
+# 운영과 같은 버전을 깔아야 같은 수치가 나온다. numpy 2.5.1 · scipy 1.18.0 은 Python>=3.12
+# 필수라 3.11 로는 다른 스택이 깔린다 — 그래서 infer job 은 3.12 를 쓴다.
+# 점검(2026-10-15, PyPI): 전부 출시 7일 이상 경과(가장 최근 pandas 3.0.5 = 2026-07-22),
+# 전부 CPython 3.12 / manylinux x86_64 wheel 이 있다(sdist 빌드 불필요).
+#
+# 해시 고정본은 requirements-predict.lock.txt 다(이 파일에서 생성). 버전이 서로 어긋나지 않는지는
+# test_ml_workflow_safety.py 가 대조한다. 올릴 때는 이 파일 → lock 재생성 순서로 고친다.
+certifi==2026.7.22
+charset-normalizer==3.4.9
+idna==3.18
+joblib==1.5.3
+lightgbm==4.7.0
+narwhals==2.24.0
+numpy==2.5.1
+nvidia-nccl-cu12==2.30.7
+pandas==3.0.5
+python-dateutil==2.9.0.post0
+python-dotenv==1.2.2
+pyyaml==6.0.3
+requests==2.34.2
+scikit-learn==1.9.0
+scipy==1.18.0
+six==1.17.0
+threadpoolctl==3.6.0
+urllib3==2.7.0
+xgboost==3.2.0

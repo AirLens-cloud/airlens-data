@@ -1,0 +1,310 @@
+name: ML Predict → HF
+
+# AOD→PM2.5 관측 지점 예측(+DQSS)을 3시간마다 만들어 HF 에 발행한다. 추론 코드는 비공개 ML 레포가 만든
+# `airlens-inference` wheel 로 들어오고, 이 레포는 그것을 받아 실행만 한다(소스를 복사하지 않는다).
+#
+# ── 발행 모드 (`PUBLISH_MODE`) ──────────────────────────────────────────────────
+#   candidate   `aq-data/_candidate/` 아래 타임스탬프 파일만 쓴다. 운영 경로(latest 포함)는 건드리지 않는다.
+#               운영 발행물과 같은 STAMP 끼리 `scripts/ml/compare_candidate.py` 로 비교한다.
+#   production  운영 경로로 발행(latest + history + DQSS, 30일 prune).
+# 컷오버 = 아래 env 의 이 줄 하나를 바꾸는 PR(main 에 머지된 값만 쓰인다). dispatch 입력으로 받지 않는다 — 운영 경로에
+# 쓰는 주체가 두 곳이 되는 사고를 막으려는 것이다. 경로 매핑은 `scripts/ml/publish_targets.py` 가 한 곳에서 정한다.
+#
+# ── 두 잡으로 나눈 이유 ─────────────────────────────────────────────────────────
+# infer 잡은 PyPI 의존성 수십 개와 비공개 wheel 을 실행한다. 같은 러너에 HF 쓰기 토큰이 있으면 오염된 패키지가
+# 이후 스텝의 토큰을 가로챌 수 있다. 그래서 쓰기 토큰은 publish 잡의 발행 스텝에만 있고(wheel 은 없다),
+# infer 잡에는 wheel 을 받는 스텝의 읽기 전용 토큰뿐이다. 둘 사이에는 JSON 산출물만 artifact 로 건넨다.
+# 쓰기 토큰이 있는 publish 잡도 발행기 의존성(huggingface_hub)을 범위 지정으로 깔지 않는다 —
+# `scripts/etl/requirements-publish.lock.txt`(해시 고정)로만 설치한다.
+#
+# ── 공개 레포라서 ───────────────────────────────────────────────────────────────
+# · pull_request 트리거 없음(비공개 wheel 접근 토큰이 PR 코드에 닿지 않게). 시크릿은 쓰는 스텝의 env 에만.
+# · 두 잡은 main 에서만 돈다(`github.ref` 가드). workflow_dispatch 는 임의의 브랜치를 고를 수 있어서, 브랜치에서
+#   `PUBLISH_MODE`·핀을 바꾼 사본이 읽기·쓰기 토큰을 쓰지 못하게 막는다. 스케줄은 원래 기본 브랜치에서만 돈다.
+# · wheel·venv·pip 캐시를 어떤 캐시에도 넣지 않는다 — PR run 이 기본 브랜치 캐시를 복원할 수 있어서다.
+#   setup-python 의 `cache:` 도 쓰지 않는다. artifact 에는 JSON 산출물만 올린다.
+# · 실패해도 비공개 코드 줄이 로그에 남지 않게 모든 airlens-* 명령은 `scripts/ml/run_entry.py` 로 돌린다
+#   (traceback 에서 프레임과 소스 줄을 뺀다). 줄 단위 재현은 같은 wheel 버전을 로컬에 설치해서 한다.
+# · 이 워크플로에서 `HF_LIVE_REPO` 를 설정하지 않는다(발행·가중치 조달·관측 읽기의 대상 저장소가 함께 바뀐다).
+#
+# wheel 은 버전 + sha256 핀으로 받는다(`latest` 를 따라가지 않는다). 배포 = 아래 두 핀을 바꾸는 PR.
+# 설치는 `requirements-predict.lock.txt`(해시 고정) → wheel(`--no-deps`) → `pip check` 순서다.
+# 가드: `scripts/ml/test_ml_workflow_safety.py`.
+
+on:
+  workflow_dispatch:
+    inputs:
+      max_age_hours:
+        description: 'OpenAQ 슬롯 조회 윈도우 (시간). 이보다 오래된 지점은 예측 입력에서 제외 (슬롯 자체의 fail-loud 신선도 게이트는 4h 고정, 별도)'
+        type: string
+        default: '24'
+  schedule:
+    - cron: '45 */3 * * *'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ml-predict
+  cancel-in-progress: false
+
+env:
+  PUBLISH_MODE: candidate  # candidate | production — 컷오버는 이 줄을 바꾸는 PR
+  MODEL_VERSION: v2  # 공개 HF 의 가중치 버전
+  INFERENCE_VERSION: '0.1.0'  # wheel 버전 핀
+  INFERENCE_WHEEL_SHA256: 'ca279f3703abbb1d98b27eb7f30636027a62cca6d90ca9e478135770f650ca3c'  # 위 버전 wheel 의 sha256 핀
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  infer:
+    name: Infer (wheel, no write token)
+    if: github.repository == 'AirLens-cloud/airlens-data' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    env:
+      # 프로세스 풀 worker 의 traceback 은 소스 줄이 든 문자열로 예외에 실려 tracebacklimit 이 닿지 않는다 — 풀을 막는다.
+      JOBLIB_MULTIPROCESSING: '0'
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
+        with:
+          python-version: '3.12'  # numpy 2.5.1 · scipy 1.18.0 이 3.12 이상을 요구한다 (constraints-predict.txt 참조)
+
+      - name: Prepare directories
+        run: |
+          set -euo pipefail
+          {
+            echo "WORK=$RUNNER_TEMP/work"
+            echo "VENV=$RUNNER_TEMP/venv"
+            echo "WHEEL_DIR=$RUNNER_TEMP/wheel"
+            echo "STAGE=$RUNNER_TEMP/stage"
+          } >> "$GITHUB_ENV"
+          mkdir -p "$RUNNER_TEMP/work" "$RUNNER_TEMP/stage"
+
+      # 읽기 전용 토큰과 저장소 id 는 이 스텝에만 있다. 토큰은 같은 origin(허브 안) 리다이렉트에만 따라가고 CDN 에는 가지 않는다.
+      - name: Fetch inference wheel (pinned, sha256 verified)
+        id: wheel
+        env:
+          HF_MODELS_READ: ${{ secrets.HF_MODELS_READ }}
+          HF_MODELS_REPO: ${{ secrets.HF_MODELS_REPO }}
+        run: |
+          set -euo pipefail
+          python3 scripts/ml/fetch_inference_wheel.py \
+            --version "$INFERENCE_VERSION" --sha256 "$INFERENCE_WHEEL_SHA256" --dest "$WHEEL_DIR"
+
+      - name: Install pinned environment
+        env:
+          WHEEL: ${{ steps.wheel.outputs.wheel }}
+          PIP_DISABLE_PIP_VERSION_CHECK: '1'
+        run: |
+          set -euo pipefail
+          python3 -m venv "$VENV"
+          # 서드파티는 해시까지 고정하고 sdist 빌드를 막는다. wheel 은 받을 때 sha256 핀으로 이미 검증했다.
+          "$VENV/bin/python" -m pip install --no-cache-dir --require-hashes --no-deps --only-binary :all: \
+            -r scripts/ml/requirements-predict.lock.txt
+          "$VENV/bin/python" -m pip install --no-cache-dir --no-deps "$WHEEL"
+          "$VENV/bin/python" -m pip check
+          "$VENV/bin/python" -m pip list --format=freeze
+
+      # 가중치는 공개 HF 에서 토큰 없이 받는다. 대상 디렉터리는 작업 폴더 밑 ci-artifacts/ 다.
+      - name: Fetch model weights (public HF)
+        run: |
+          set -euo pipefail
+          cd "$WORK"
+          "$VENV/bin/python" -I -u "$GITHUB_WORKSPACE/scripts/ml/run_entry.py" \
+            airlens-fetch-model fetch --dest ci-artifacts/aod --version "$MODEL_VERSION"
+
+      # 관측 read 는 공개 GET(토큰 불요)이다. OpenAQ 슬롯 신선도 게이트(4h)에 걸리면 predict 가 fail-loud 로
+      # non-zero 종료한다(무음 실패 없음). `--dqss` 는 같은 프로세스에서 data_quality.json 과 shadow_stations.json
+      # 을 작업 폴더 루트에 쓴다. 로그는 tee 로 남겨 아래 스텝이 met 실패 수를 뽑는다(artifact 에는 올리지 않는다).
+      - name: Predict observed stations (OpenAQ shadow feed)
+        env:
+          MAX_AGE_HOURS: ${{ inputs.max_age_hours || '24' }}
+        run: |
+          set -euo pipefail
+          cd "$WORK"
+          "$VENV/bin/python" -I -u "$GITHUB_WORKSPACE/scripts/ml/run_entry.py" \
+            airlens-predict-grid \
+            --source observed --obs-source openaq \
+            --max-age-hours "$MAX_AGE_HOURS" \
+            --model-dir ci-artifacts/aod --output output/grid_latest.json \
+            --dqss 2>&1 | tee predict.log
+
+      # 실시간 기상(Open-Meteo) 조회가 실패한 지점은 상수 기상으로 대체되고, 그 규모는 로그 한 줄뿐이다.
+      # 이 레포는 hosted 공유 IP 라 throttle 이 올 수 있어 run 마다 눈에 보이게 올린다.
+      - name: Summarize Open-Meteo fallbacks
+        run: python3 scripts/ml/summarize_predict_log.py "$WORK/predict.log"
+
+      # 정보량 게이트: data_quality.json 을 6규칙(상수 성분 / 자기참조 / 중간값 위장 / 등급 쏠림 / 커버리지
+      # 리포트 / n=0≠pass)으로 점검한다. FAIL 이면 --withhold-on-fail 이 파일을 "withheld"(stations:[])로
+      # 다시 쓰고 exit 0 — 뒤의 발행은 그 정직한 결측 payload 를 올린다. 스크립트 크래시(JSON 파싱 실패·파일
+      # 부재)는 nonzero 로 전파돼 이 스텝이 실패하고, 검증 안 된 payload 는 발행 잡으로 넘어가지 않는다.
+      - name: DQSS information gate
+        run: |
+          set -euo pipefail
+          cd "$WORK"
+          "$VENV/bin/python" -I -u "$GITHUB_WORKSPACE/scripts/ml/run_entry.py" \
+            airlens-dqss-check \
+            --dqss data_quality.json --predictions output/grid_latest.json --withhold-on-fail
+
+      # 후행 드리프트 모니터(advisory): 드리프트·스크립트 실패 모두 ::warning:: 만 — 발행을 막지 않는다.
+      # 이 스텝은 어떤 경우에도 0 으로 끝난다: continue-on-error 에 더해 스크립트가 `set -e` 를 켜지 않는다
+      # (기본 셸이 -e 로 시작하므로 맨 앞에서 `set +e`). 리포트 전문(보정 상수·모델 sha·기준 지표)은 공개 로그·
+      # 요약·artifact 어디에도 싣지 않는다 — 불리언 두 개와 경고만 남기고, 리포트 파일은 러너에만 있다.
+      - name: Drift monitor (advisory)
+        id: drift  # continue-on-error 스텝은 id 가 있어야 실패가 남는다(scripts/etl/test_build_mac_index.py 가 요구)
+        continue-on-error: true
+        run: |
+          set +e
+          cd "$WORK" || { echo "::warning::drift monitor 작업 폴더 없음 (advisory)"; exit 0; }
+          "$VENV/bin/python" -I -u "$GITHUB_WORKSPACE/scripts/ml/run_entry.py" \
+            airlens-drift-monitor \
+            --predictions-json output/grid_latest.json --model-dir ci-artifacts/aod \
+            --output output/drift_report.json
+          RC=$?
+          if [ "$RC" -ne 0 ]; then
+            echo "::warning::drift monitor 실행 실패 (advisory — rc=$RC)"
+            exit 0
+          fi
+          # 불리언이 아니면 값을 옮기지 않는다(리포트의 임의 값이 로그로 새지 않게).
+          DRIFT=$(python3 -I -c "import json;v=json.load(open('output/drift_report.json')).get('overall_drift');print(v if isinstance(v,bool) else 'unknown')" 2>/dev/null || echo unknown)
+          DUAL=$(python3 -I -c "import json;v=json.load(open('output/drift_report.json')).get('predictions_drift',{}).get('dual_metrics_present');print(v if isinstance(v,bool) else 'unknown')" 2>/dev/null || echo unknown)
+          echo "drift summary: overall_drift=$DRIFT dual_metrics_present=$DUAL"
+          {
+            echo '### Drift monitor (advisory)'
+            echo
+            echo "- overall_drift: \`$DRIFT\`"
+            echo "- dual_metrics_present: \`$DUAL\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+          if [ "$DRIFT" = "True" ]; then
+            echo "::warning::AOD 예측 잔차 드리프트 감지 — 재학습 검토"
+          fi
+          if [ "$DUAL" = "False" ]; then
+            echo "::warning::배포 아티팩트에 이원 지표(r2_full/r2_no_lag) 부재 — 정직성 게이트 이전 학습본"
+          fi
+          exit 0
+
+      # 발행 잡으로 넘기는 것은 JSON 산출물뿐이다 (wheel·venv·로그는 올리지 않는다).
+      - name: Stage JSON outputs
+        run: |
+          set -euo pipefail
+          cp "$WORK/output/grid_latest.json" "$WORK/data_quality.json" "$STAGE/"
+          if [ -f "$WORK/shadow_stations.json" ]; then
+            cp "$WORK/shadow_stations.json" "$STAGE/"
+          else
+            echo "::warning::shadow_stations.json 이 없다 — 섀도우 원자료 보존이 이번 실행에서 누락된다"
+          fi
+          ls -l "$STAGE"
+
+      - name: Upload JSON outputs
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        with:
+          name: ml-predict-output
+          path: ${{ runner.temp }}/stage
+          retention-days: 7
+          if-no-files-found: error
+
+  publish:
+    name: Publish to HF (no wheel)
+    needs: infer
+    if: github.repository == 'AirLens-cloud/airlens-data' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      # 발행기(hf_publish.py)와 계약 검증기(contracts/)가 체크아웃에 있다. wheel 은 이 잡에 없다.
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
+        with:
+          python-version: '3.11'
+
+      # 이 잡은 HF 쓰기 토큰을 받는 스텝이 있다. 발행기 의존성은 해시까지 고정하고 sdist 빌드를 막는다.
+      - name: Install pinned huggingface_hub (hash-locked)
+        env:
+          PIP_DISABLE_PIP_VERSION_CHECK: '1'
+        run: |
+          set -euo pipefail
+          python3 -m pip install --no-cache-dir --require-hashes --no-deps --only-binary :all: \
+            -r scripts/etl/requirements-publish.lock.txt
+          python3 -m pip check
+
+      - name: Download JSON outputs
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c  # v8.0.1
+        with:
+          name: ml-predict-output
+          path: ${{ runner.temp }}/pub
+
+      # 발행 순서와 의미는 기존 운영 경로와 같다: grid → DQSS 는 필수(실패하면 run 실패), shadow 는 advisory.
+      # 계약 검증(`--schema auto`)은 원격 호출 전에 끝난다 — 위반이면 아무것도 올라가지 않는다.
+      - name: Publish grid
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: |
+          set -euo pipefail
+          PUB="$RUNNER_TEMP/pub"
+          echo "publish mode=$PUBLISH_MODE"
+          OUT=$(python3 scripts/ml/publish_targets.py maps --mode "$PUBLISH_MODE" --dir "$PUB" --group grid)
+          ARGS=()
+          while IFS= read -r m; do ARGS+=(--map "$m"); done <<< "$OUT"
+          python3 scripts/etl/hf_publish.py batch "${ARGS[@]}" --schema auto \
+            || { echo "::error::HF grid publish failed"; exit 1; }
+
+      # 정보량 게이트가 FAIL 이면 여기서 올라가는 것은 "withheld" 결측 payload 다(합성·상수 점수 발행 방지).
+      - name: Publish DQSS
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: |
+          set -euo pipefail
+          PUB="$RUNNER_TEMP/pub"
+          OUT=$(python3 scripts/ml/publish_targets.py maps --mode "$PUBLISH_MODE" --dir "$PUB" --group dqss)
+          ARGS=()
+          while IFS= read -r m; do ARGS+=(--map "$m"); done <<< "$OUT"
+          python3 scripts/etl/hf_publish.py batch "${ARGS[@]}" --schema auto \
+            || { echo "::error::HF DQSS publish failed"; exit 1; }
+
+      # 점수의 원자료(섀도우 집계 통계)를 같은 STAMP 로 남긴다. advisory — 실패해도 이미 올라간 점수를 되돌리지 않는다.
+      - name: Publish shadow snapshot (advisory)
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: |
+          set -euo pipefail
+          PUB="$RUNNER_TEMP/pub"
+          OUT=$(python3 scripts/ml/publish_targets.py maps --mode "$PUBLISH_MODE" --dir "$PUB" --group shadow)
+          if [ -z "$OUT" ]; then
+            echo "::warning::shadow_stations.json 이 없다 — 섀도우 원자료 보존이 이번 실행에서 누락됐다"
+            exit 0
+          fi
+          python3 scripts/etl/hf_publish.py batch --map "$OUT" --schema auto \
+            || echo "::warning::shadow snapshot upload failed — 점수는 이미 발행됨"
+
+      # 30일 초과 스냅샷 정리(production 만 — candidate 는 컷오버 뒤 한 번에 비운다). 실패해도 발행 체인은 막지 않는다.
+      - name: Prune history snapshots
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: |
+          set -euo pipefail
+          OUT=$(python3 scripts/ml/publish_targets.py prune --mode "$PUBLISH_MODE")
+          if [ -z "$OUT" ]; then
+            echo "prune: $PUBLISH_MODE 모드는 자동 정리가 없다"
+            exit 0
+          fi
+          while read -r prefix keep_days; do
+            python3 scripts/etl/hf_publish.py prune --prefix "$prefix" --keep-days "$keep_days" \
+              || echo "::warning::prune 실패 ($prefix) — 다음 실행에서 재시도"
+          done <<< "$OUT"
