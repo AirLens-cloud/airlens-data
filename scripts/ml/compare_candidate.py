@@ -101,7 +101,7 @@ WORST_ROWS = 10
 STAMP_RE = re.compile(r"\d{10}")
 FETCH_TIMEOUT_S = 60
 FETCH_RETRIES = 3
-MAX_RESPONSE_BYTES = 32 * 1024 * 1024  # 응답 한 건의 상한. 읽는 파일은 모두 1 MB 아래라 넉넉하고, 끝없이 보내는 응답에도 메모리가 차지 않는다
+MAX_RESPONSE_BYTES = 32 * 1024 * 1024  # 응답 한 건의 상한. 읽는 파일은 대개 1 MB 아래고 band_guard 가 읽는 관측 슬롯 gz 도 약 1.1 MB 라 넉넉하고, 끝없이 보내는 응답에도 메모리가 차지 않는다
 
 PASS, FAIL, INPUT_DIFF, UNPAIRED = "PASS", "FAIL", "INPUT-DIFF", "UNPAIRED"
 

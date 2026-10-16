@@ -9,8 +9,8 @@
   A. 전체 워크플로 공통 (PR 트리거 ↔ 비공개 시크릿, `pull_request_target`, 캐시 경로, SHA 고정 — `.yml`·`.yaml` 모두)
   B. ML 워크플로 공통 (트리거 형태, repo 가드, 시간 제한, 권한, 동시성, 발행 모드, 시크릿 위치)
   C. `ml-predict.yml` 전용 (2잡 분리, wheel·가중치 핀, run_entry 경유, 설치 플래그, artifact 내용)
-  C2. `band-forecast.yml` 전용 (건너뛰기 가드, 2잡 분리, 3단계 설치와 설치 검사, run_entry 경유와 경로 플래그,
-      artifact 내용, 워크플로 ↔ 스크립트 인자 계약)
+  C2. `band-forecast.yml` 전용 (건너뛰기 가드, 관측 슬롯 대기 잡, infer / publish 2잡 분리, 3단계 설치와 설치 검사,
+      run_entry 경유와 경로 플래그, artifact 내용, 워크플로 ↔ 스크립트 인자 계약)
   D. 환경 고정 파일 (constraints ↔ 해시 고정본, band 의 CPU torch · PyPI 두 갈래 고정본, publish 잡의 해시 고정본)
   E. 공개 위생 (로컬 경로·운영 환경 이름·내부 문서 번호·토큰 모양·IP 가 새 파일에 없고, 저장소 id 는 허용목록 안에 있다)
      + 그 검사기 자체의 시험
@@ -62,6 +62,9 @@ SHA_RE = re.compile(r"[0-9a-f]{40}")
 SHA256_RE = re.compile(r"[0-9a-f]{64}")
 VERSION_RE = re.compile(r"[0-9]+(\.[0-9]+)*")
 MAX_TIMEOUT_MIN = 45
+# 토큰 없이 공개 데이터만 읽는 band wait 잡 하나만 45분을 넘을 수 있다(다음 관측 슬롯을 기다린다). 그 잡의 좁음은
+# test_band_wait_job_only_polls_public_data_without_tokens_and_ends_before_its_timeout 이 고정한다.
+BAND_WAIT_TIMEOUT_MIN = 100
 PUBLISH_MODES = {"candidate", "production"}
 WHEEL_SECRET_PREFIX = "HF_MODELS_"
 WRITE_SECRET = "HF_TOKEN"
@@ -385,10 +388,11 @@ def test_every_ml_job_has_a_bounded_timeout(name):
     # Arrange
     doc = load(WORKFLOW_DIR / name)
 
-    # Act / Assert
+    # Act / Assert — band 의 wait 잡만 더 길다(위 BAND_WAIT_TIMEOUT_MIN). 나머지는 모두 같은 상한이다
     for job_id, job in jobs(doc).items():
+        limit = BAND_WAIT_TIMEOUT_MIN if (name, job_id) == (BAND_WORKFLOW, "wait") else MAX_TIMEOUT_MIN
         timeout = job.get("timeout-minutes")
-        assert isinstance(timeout, int) and 0 < timeout <= MAX_TIMEOUT_MIN, f"{name}:{job_id} timeout={timeout!r}"
+        assert isinstance(timeout, int) and 0 < timeout <= limit, f"{name}:{job_id} timeout={timeout!r}"
 
 
 @ml_params
@@ -1027,6 +1031,11 @@ def test_python_versions_follow_the_documented_split(predict):
 BAND_GUARD_SKIP = "steps.guard.outputs.skip != 'true'"
 BAND_PUBLISH_SKIP = "needs.infer.outputs.skip != 'true'"
 BAND_VERIFY_STEP = "Verify installed environment (CPU only)"
+BAND_WAIT_MARGIN_MIN = 5  # wait 잡의 체크아웃·파이썬 설치와 마지막 조회(재시도 포함)가 대기 상한 밖에서 쓰는 시간
+# infer 의 if 끝에만 상태 함수가 있다. wait 가 실패해도 기다림은 최적화일 뿐이라 infer 는 기다리지 않고 돌아야 해서 기본 조건
+# (`success()`)을 이것으로 대신한다. 워크플로 취소는 그대로 존중한다. wait·publish 에는 상태 함수가 없다(암묵적 success() — 앞 잡이
+# 실패하면 돌지 않는다). 아래 시험이 절 집합을 정확히 비교해서 그것을 지킨다.
+BAND_INFER_STATUS = "!cancelled()"
 # 명령별로 넘기는 플래그 전부와 값이 놓일 폴더. 경로 플래그를 하나라도 빼면 기본 경로에 기대게 된다.
 BAND_CLI_FLAGS = {
     "airlens-band-fresh-openaq": {"--cache-dir": "CACHE_DIR", "--out-dir": "OUT_DIR"},
@@ -1082,21 +1091,45 @@ def test_band_trigger_is_workflow_run_plus_backup_schedule_plus_dispatch_with_on
     assert inputs["force"]["type"] == "boolean" and inputs["force"]["default"] is False
 
 
-def test_band_has_separate_infer_and_publish_jobs_with_publish_after_infer(band):
-    # Act / Assert
-    assert set(jobs(band)) == {"infer", "publish"}
+def test_band_has_a_wait_job_then_separate_infer_and_publish_jobs_each_after_the_one_before(band):
+    # Act / Assert — wait(공개 읽기만) → infer(wheel) → publish(쓰기 토큰) 순서다. wait 가 실패해도 infer 는 기다리지 않고 돈다
+    # (BAND_INFER_STATUS). infer 가 실패하거나 건너뛰어지면 publish 는 돌지 않는다
+    assert set(jobs(band)) == {"wait", "infer", "publish"}
+    assert "needs" not in jobs(band)["wait"]
+    assert jobs(band)["infer"].get("needs") == "wait"
     assert jobs(band)["publish"].get("needs") == "infer"
 
 
 def test_band_jobs_run_only_after_a_successful_collection_and_publish_follows_the_skip_decision(band):
     # Arrange
-    infer, publish = guard_clauses(jobs(band)["infer"]), guard_clauses(jobs(band)["publish"])
+    wait, infer, publish = (guard_clauses(jobs(band)[job]) for job in ("wait", "infer", "publish"))
 
     # Act / Assert — 공통 가드(repo · main)에 더해, workflow_run 으로 시작됐다면 앞선 수집이 성공해야 한다(실패한 수집 뒤에 낡은
-    # 입력으로 밴드를 만들지 않는다). 발행 잡은 건너뛰기 판정을 따른다 — 건너뛴 run 에서는 발행 잡이 돌지 않는다.
-    assert sorted(infer) == sorted([REPO_GUARD, MAIN_REF_GUARD, WORKFLOW_RUN_GUARD])
+    # 입력으로 밴드를 만들지 않는다 — 그 run 에서는 기다리지도 않는다). infer 는 wait 의 결과를 묻지 않는다(BAND_INFER_STATUS). 발행 잡은
+    # 건너뛰기 판정을 따른다 — 건너뛴 run 에서는 발행 잡이 돌지 않는다.
+    assert sorted(wait) == sorted([REPO_GUARD, MAIN_REF_GUARD, WORKFLOW_RUN_GUARD])
+    assert sorted(infer) == sorted([REPO_GUARD, MAIN_REF_GUARD, WORKFLOW_RUN_GUARD, BAND_INFER_STATUS])
     assert sorted(publish) == sorted([BAND_PUBLISH_SKIP, REPO_GUARD, MAIN_REF_GUARD, WORKFLOW_RUN_GUARD])
     assert jobs(band)["infer"]["outputs"] == {"skip": "${{ steps.guard.outputs.skip }}"}
+
+
+def test_band_wait_job_only_polls_public_data_without_tokens_and_ends_before_its_timeout(band):
+    # Arrange
+    wait = jobs(band)["wait"]
+    *setup, run = steps(wait)
+
+    # Act / Assert — 토큰도 시크릿도 없이 공개 URL 만 읽는다. 45분을 넘길 수 있는 유일한 잡이라 키 집합까지 고정해서 다른 것을 얹지 못하게 한다
+    assert set(wait) == {"name", "if", "runs-on", "timeout-minutes", "permissions", "steps"}
+    assert wait["runs-on"] == "ubuntu-latest" and wait["permissions"] == {"contents": "read"}
+    assert secrets_in(wait) == set()
+    assert [str(s["uses"]).split("@")[0] for s in setup] == ["actions/checkout", "actions/setup-python"]
+    assert all(set(s) <= {"name", "uses", "with"} for s in setup)
+    assert set(run) == {"name", "run"}  # if · env · continue-on-error 가 없다
+    assert logical_lines(run["run"]) == ["set -euo pipefail", "python3 scripts/ml/band_guard.py wait-slot"]
+    # 스크립트가 러너의 timeout 보다 먼저 끝나야 한다 — 러너가 timeout 으로 끊으면 이 잡은 cancelled 로 끝나고, 그때 infer 가 도는지는
+    # infer 의 `!cancelled()` 조건이 보장하지 않는다. 스크립트는 대기 상한(MAX_WAIT)을 넘기지 않고 못 기다려도 0 으로 끝나므로, 상한에
+    # 체크아웃·설치와 마지막 조회 몫을 더한 값 이상이면 된다.
+    assert band_guard.MAX_WAIT.total_seconds() / 60 + BAND_WAIT_MARGIN_MIN <= wait["timeout-minutes"] <= BAND_WAIT_TIMEOUT_MIN
 
 
 def test_band_guard_step_comes_first_and_every_later_infer_step_follows_its_decision(band):
@@ -1395,8 +1428,9 @@ def test_band_checkouts_do_not_persist_credentials_and_never_check_out_an_event_
     # Arrange
     checkouts = [s for _j, _i, s in all_steps(band) if str(s.get("uses", "")).startswith("actions/checkout")]
 
-    # Act / Assert — `with` 가 이것뿐이라 ref·repository 를 바꿀 수 없다(workflow_run 이벤트의 브랜치·SHA 는 외부가 정할 수 있다)
-    assert len(checkouts) == 2
+    # Act / Assert — `with` 가 이것뿐이라 ref·repository 를 바꿀 수 없다(workflow_run 이벤트의 브랜치·SHA 는 외부가 정할 수 있다).
+    # 체크아웃은 wait · infer · publish 잡마다 하나다
+    assert len(checkouts) == 3
     assert all(s.get("with") == {"persist-credentials": False} for s in checkouts)
 
 
@@ -1413,8 +1447,8 @@ def test_band_python_versions_follow_the_documented_split(band):
     # Arrange
     versions = {j: str((s.get("with") or {}).get("python-version")) for j, _i, s in all_steps(band) if str(s.get("uses", "")).startswith("actions/setup-python")}
 
-    # Act / Assert — 추론은 3.12(고정본을 cp312 wheel 해시로 만들었다), 발행기는 기존 워크플로와 같은 3.11
-    assert versions == {"infer": "3.12", "publish": "3.11"}
+    # Act / Assert — 추론은 3.12(고정본을 cp312 wheel 해시로 만들었다), 대기는 infer 의 guard 스텝과 같은 3.12, 발행기는 기존 워크플로와 같은 3.11
+    assert versions == {"wait": "3.12", "infer": "3.12", "publish": "3.11"}
 
 
 def test_band_run_steps_fail_fast_and_nothing_is_allowed_to_fail_silently(band):
@@ -1461,6 +1495,7 @@ def test_band_workflow_arguments_are_accepted_by_the_scripts_they_call(band, mon
     # Arrange / Act — 스크립트의 진짜 파서로 읽는다. 플래그 오타·빠진 필수 인자는 그대로 두면 첫 hosted run 에서야 드러난다.
     check = parse_only(monkeypatch, band_guard.main, ["check", *workflow_args(band, "band_guard.py check")])
     snapshot = parse_only(monkeypatch, band_guard.main, ["snapshot", *workflow_args(band, "band_guard.py snapshot")])
+    wait = parse_only(monkeypatch, band_guard.main, ["wait-slot", *workflow_args(band, "band_guard.py wait-slot")])
     env_check = parse_only(monkeypatch, check_band_env.main, workflow_args(band, "check_band_env.py"))
     maps = parse_only(monkeypatch, publish_targets.main, ["maps", *workflow_args(band, "publish_targets.py maps")])
 
@@ -1469,6 +1504,7 @@ def test_band_workflow_arguments_are_accepted_by_the_scripts_they_call(band, mon
     assert (check.mode, check.force) == (mode, "false")
     assert (snapshot.mode, maps.mode, maps.group) == (mode, mode, "band")
     assert snapshot.dest == maps.prod_snapshot  # 내려받은 사본을 발행 매핑이 같은 파일로 읽는다
+    assert wait.cmd == "wait-slot"  # 인자 없이 받아들여진다(대기는 모드·force 와 무관하다)
     assert (env_check.project, env_check.version) == ("airlens-inference", band["env"]["INFERENCE_VERSION"])
     assert env_check.expect_missing == band["env"]["BAND_SKIPPED_BASE_DEPS"]
     assert check_band_env.parse_expect_missing(env_check.expect_missing)  # 비거나 빈 항목이 아니다

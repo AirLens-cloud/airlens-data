@@ -2,7 +2,8 @@ name: Band Forecast → HF
 
 # 예측 밴드(TimesFM + conformal, `w3-band-v1`)를 예보 수집 직후에 만들어 HF 에 발행한다. 추론 코드는 비공개 ML 레포가
 # 만든 `airlens-inference` wheel 로 들어오고, 이 레포는 그것을 받아 실행만 한다(소스를 복사하지 않는다).
-# 구조와 가드는 ml-predict.yml 과 같다(infer / publish 두 잡). 아래는 band 에서 다른 점만 적는다.
+# 구조와 가드는 ml-predict.yml 과 같다(infer / publish 두 잡). band 는 그 앞에 관측 슬롯을 기다리는 wait 잡이 하나 더 있다.
+# 아래는 band 에서 다른 점만 적는다.
 #
 # ── 발행 모드 (`PUBLISH_MODE`) ──────────────────────────────────────────────────
 #   candidate   `aq-data/_candidate/forecast-band/` 아래 타임스탬프 파일만 쓴다. 운영 경로는 건드리지 않는다.
@@ -26,6 +27,25 @@ name: Band Forecast → HF
 # 같은 예보 발행을 두 번 돌리지 않는다. `scripts/ml/band_guard.py` 가 이미 처리한 발행이면 건너뛰게 하고(`force` 면
 # 건너뛰지 않는다), 판정을 못 하면 경고만 남기고 돌린다. 건너뛴 run 의 발행 잡은 돌지 않는다.
 #
+# ── 기다리기 (`wait` 잡) ────────────────────────────────────────────────────────
+# band 엔진은 예보 issue 시각을 시 단위로 내린 H 까지를 TimesFM 컨텍스트의 마지막 시각으로 쓴다. 공개 dataset 의 OpenAQ 관측
+# 슬롯 S(`openaq-shadow/openaq-<S 의 UTC %Y%m%d%H>.json.gz`)는 S 시 16~19분에 올라온다(공개 저장소 커밋 시각 기준, 10-13 16시부터
+# 10-16 22시까지의 슬롯을 실측했고 최대 18.8분). H 시 관측은 슬롯 H 에는 일부(관측 수 28~38%)만 있고, 슬롯 H+1 이 올라오면
+# 대부분(약 94%)이 들어온다. 예보 수집 직후에 돌면 마지막 시각을 관측 몇 개의 중앙값으로 쓰게 되어 1시간 앞 예측이 나빠진다.
+# 지난 issue 14개로 비교하면 슬롯 하나를 더 기다릴 때 1시간 앞 예측 오차가 줄었다. 마지막 시각 관측을 버리는 방식은 오히려 나빴다.
+# 그래서 엔진·wheel 은 그대로 두고 실행 시점만 늦춘다 — 이 워크플로는 예보 수집 직후에 시작하지만 추론(infer)은 `wait` 잡이
+# 슬롯 H+1 을 확인한 뒤에 돈다. `wait` 잡은 공개 URL 만 읽는다(토큰·시크릿 없음).
+# · 마감은 H+1 시 30분이다(슬롯 H+1 은 보통 H+1 시 16~19분에 온다). 시작 뒤 90분이 상한이라 issue 시각이 이상해도 그보다 오래
+#   기다리지 않는다.
+# · 못 기다려도 막지 않는다. 슬롯이 마감까지 안 오거나, 예보 발행 시각을 읽지 못하거나, 그 시각으로 슬롯을 정할 수 없으면 경고만
+#   남기고 성공으로 끝나 infer 가 그대로 돈다(기다림은 최적화일 뿐이라 발행을 놓치는 쪽이 더 나쁘다). `wait` 잡 자체가 실패해도
+#   (체크아웃·설치 오류, 스크립트 예외) infer 는 기다리지 않고 돈다(infer 잡의 `!cancelled()`). 그 run 은 실패로 표시된다.
+# · 슬롯이 이미 올라와 있으면(백업 schedule, 늦은 run, 이미 처리한 issue 를 `force` 로 다시 돌릴 때) 바로 끝난다. 방금 수집된
+#   issue 를 `force` 로 돌리면 그 슬롯이 올라올 때까지 기다린다.
+# · 기다리는 동안 이 워크플로의 동시성 그룹(`cancel-in-progress: false`)을 쥐고 있다. 그 사이 도착한 run 은 하나만 대기열에
+#   남고, 더 오면 먼저 기다리던 대기 run 이 취소된다. 어느 run 이든 그때의 forecast.json 을 읽고 중복은 guard 가 막으므로
+#   결과는 같다.
+#
 # ── 설치 ────────────────────────────────────────────────────────────────────────
 # 세 단계다. wheel 의 기본 의존성(xgboost 등)은 band 에 필요 없어서 깔지 않는다 — xgboost 가 CUDA 계열 패키지를 끌어온다.
 #   ① CPU torch 만 PyTorch CPU 인덱스에서(`requirements-band-torch.lock.txt`, 해시 고정)
@@ -46,7 +66,7 @@ name: Band Forecast → HF
 # wheel 은 버전 + sha256 핀으로 받는다. 배포 = 아래 두 핀을 바꾸는 PR(ml-predict.yml 과 같은 wheel 이라 함께 고친다).
 # wheel 핀을 올릴 때 함께 점검한다: ml-predict.yml 과 이 파일의 핀, 아래 `BAND_SKIPPED_BASE_DEPS`, `test_ml_workflow_safety.py` 의
 # `PIP_EXPECTED_MISSING`, `test_check_band_env.py` 의 VERSION, band 고정본(`constraints-band.txt` 와 lock 두 개).
-# 컷오버 조건의 시간 기준: infer 잡 시간(run 의 잡 기록)이 35분 미만인 run 이 3회 이상이다.
+# 컷오버 조건의 시간 기준: infer 잡 시간(run 의 잡 기록)이 35분 미만인 run 이 3회 이상이다. wait 잡의 대기 시간은 들어가지 않는다.
 # 가드: `scripts/ml/test_ml_workflow_safety.py`.
 
 on:
@@ -81,9 +101,41 @@ defaults:
     shell: bash
 
 jobs:
+  # 공개 URL 만 읽는다(토큰·시크릿 없음). 슬롯 H+1 을 기다리고, 못 기다려도 성공으로 끝난다(머리 주석 「기다리기」).
+  wait:
+    name: Wait for the next observation slot (public reads only)
+    if: github.repository == 'AirLens-cloud/airlens-data' && github.ref == 'refs/heads/main' && (github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success')
+    runs-on: ubuntu-latest
+    timeout-minutes: 100
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
+        with:
+          python-version: '3.12'  # 표준 라이브러리만 쓴다(infer 의 guard 스텝과 같은 버전)
+
+      # 스크립트가 러너의 timeout 보다 먼저 끝나야 한다: 대기 상한(`band_guard.MAX_WAIT`, 90분)에 체크아웃·설치와 마지막 조회 몫을
+      # 더한 값이 잡 timeout 이다. 러너가 먼저 끊으면 이 잡은 cancelled 로 끝나는데, 그때 infer 가 도는지는 infer 의
+      # `!cancelled()` 조건이 보장하지 않는다.
+      - name: Wait for the observation slot after the forecast issue
+        run: |
+          set -euo pipefail
+          python3 scripts/ml/band_guard.py wait-slot
+
+  # wait 가 실패해도(체크아웃·설치 오류, 스크립트 예외) infer 는 기다리지 않고 돈다 — 기다림은 최적화일 뿐이다. 조건 끝의
+  # `!cancelled()` 가 기본 조건(`success()`)을 대신한다: wait 의 결과를 묻지 않고, run 이 취소되면 돌지 않는다. publish 는 그대로
+  # infer 의 성공을 따른다. 러너가 timeout 으로 wait 를 끊으면 그 잡은 cancelled 로 끝나는데, 그때 infer 가 도는지는 이 조건이
+  # 보장하지 않는다 — 그래서 스크립트가 그 전에 끝나게 했다(wait 잡의 timeout 주석).
   infer:
     name: Infer (wheel, no write token)
-    if: github.repository == 'AirLens-cloud/airlens-data' && github.ref == 'refs/heads/main' && (github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success')
+    needs: wait
+    if: github.repository == 'AirLens-cloud/airlens-data' && github.ref == 'refs/heads/main' && (github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success') && !cancelled()
     runs-on: ubuntu-latest
     timeout-minutes: 45
     permissions:
