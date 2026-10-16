@@ -1306,7 +1306,7 @@ def test_band_prepare_step_defines_every_work_folder_under_the_runner_temp_direc
     assert set(defined) == {"WORK", "VENV", "WHEEL_DIR", "STAGE", "CACHE_DIR", "OUT_DIR"}
     assert all(Path(value).is_relative_to(runner) for value in defined.values()), defined
     assert all(Path(defined[key]).is_dir() for key in ("WORK", "STAGE", "CACHE_DIR", "OUT_DIR"))
-    assert Path(defined["STAGE"]) == runner / "stage"  # 업로드 스텝의 path(`runner.temp`/stage)와 같은 폴더
+    assert Path(defined["STAGE"]) == runner / "stage"  # 업로드 스텝 path 가 가리키는 파일의 폴더(`runner.temp`/stage)
 
 
 def test_band_only_the_payload_json_is_staged_and_uploaded(band):
@@ -1319,10 +1319,14 @@ def test_band_only_the_payload_json_is_staged_and_uploaded(band):
     [upload] = uploads
     upload_path = str(upload["with"]["path"])
 
-    # Assert — 업로드하는 폴더(STAGE)에 쓰는 줄은 페이로드 JSON 한 개를 내는 명령뿐이다. 발행 잡이 받는 이름이 같다
+    # Assert — 업로드하는 것은 페이로드 JSON 파일 하나다(폴더·와일드카드가 아니다). 진입점이 `--out` 옆에 다른 파일을 써도 나가지 않는다.
+    # STAGE 에 쓰는 줄은 그 파일을 내는 명령뿐이고, 올리는 파일 이름은 발행 매핑이 찾는 이름과 같다. 발행 잡이 받는 artifact 이름도 같다
+    stage_dir = "${{ runner.temp }}/stage/"
     assert downloads == [upload["with"]["name"]]
-    assert upload_path == "${{ runner.temp }}/stage"
-    assert len(stage_lines) == 1 and stage_lines[0].endswith('--out "$STAGE/forecast_band_latest.json"') and "airlens-band-publish" in stage_lines[0]
+    assert upload_path.startswith(stage_dir)
+    uploaded = upload_path.removeprefix(stage_dir)
+    assert uploaded == publish_targets.BAND_FILE and not re.search(r"[/*?\[\]{}]", uploaded)
+    assert len(stage_lines) == 1 and stage_lines[0].endswith(f'--out "$STAGE/{uploaded}"') and "airlens-band-publish" in stage_lines[0]
     assert not re.search(r"wheel|venv|\.whl|\.log|lock|cache|parquet|work", upload_path, re.IGNORECASE)
     assert upload["with"].get("if-no-files-found") == "error"
     assert 0 < int(upload["with"]["retention-days"]) <= 7
@@ -1342,6 +1346,21 @@ def test_band_publish_uses_the_mapping_script_for_the_destination_and_validates_
     assert '|| { echo "::error::' in batch[0] and "exit 1" in batch[0]
     assert len(maps) == 1 and "--group band" in maps[0] and '--mode "$PUBLISH_MODE"' in maps[0]
     assert all("aq-data/" not in line for _j, _i, script in run_scripts(band) for line in logical_lines(script)), "목적지 경로가 워크플로에 하드코딩됐다"
+
+
+def test_band_publish_maps_the_folder_the_single_file_artifact_is_downloaded_into(band):
+    # Arrange
+    [download] = [s for j, _i, s in all_steps(band) if j == "publish" and str(s.get("uses", "")).startswith("actions/download-artifact")]
+    lines = [line for j, _i, script in run_scripts(band) if j == "publish" for line in logical_lines(script)]
+
+    # Act
+    pub = [line for line in lines if line.startswith("PUB=")]
+    maps = [line for line in lines if "publish_targets.py maps" in line]
+
+    # Assert — 단일 artifact 는 download path 바로 아래에 풀려(올린 파일 하나가 그 폴더의 `forecast_band_latest.json` 이 된다)
+    # 발행 매핑이 읽는 폴더(`--dir "$PUB"`)가 같은 폴더여야 한다
+    assert download["with"]["path"] == "${{ runner.temp }}/pub" and pub == ['PUB="$RUNNER_TEMP/pub"']
+    assert len(maps) == 1 and '--dir "$PUB"' in maps[0]
 
 
 def test_band_production_snapshot_has_no_secrets_and_is_taken_before_the_publish(band):

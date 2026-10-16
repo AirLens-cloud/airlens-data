@@ -38,7 +38,7 @@ name: Band Forecast → HF
 # ── 공개 레포라서 ───────────────────────────────────────────────────────────────
 # · 시크릿은 쓰는 스텝의 env 에만. 두 잡은 main 에서만 돈다(`github.ref` 가드).
 # · wheel·venv·pip·모델 캐시를 어떤 캐시에도 넣지 않는다(actions/cache 도 쓰지 않아 모든 run 이 콜드다).
-#   artifact 에는 JSON 산출물만 올린다.
+#   artifact 에는 발행 페이로드 JSON 한 파일만 올린다.
 # · 실패해도 비공개 코드 줄이 로그에 남지 않게 모든 airlens-* 명령은 `scripts/ml/run_entry.py` 로 돌린다.
 # · 이 워크플로에서 `HF_LIVE_REPO` 를 설정하지 않는다(발행·관측 읽기의 대상 저장소가 함께 바뀐다).
 # · 경로 플래그를 전부 명시한다 — 빠진 플래그의 기본 경로에 기대지 않는다. `--issues-limit` 은 쓰지 않는다.
@@ -216,13 +216,14 @@ jobs:
             --band-predictions-path "$OUT_DIR/band_predictions.parquet" --out "$STAGE/forecast_band_latest.json"
           ls -l "$STAGE"
 
-      # 발행 잡으로 넘기는 것은 JSON 산출물뿐이다 (wheel·venv·캐시·로그는 올리지 않는다).
+      # 발행 잡으로 넘기는 것은 발행 페이로드 JSON 한 파일뿐이다. 폴더가 아니라 그 파일을 가리켜서, 진입점이 `--out` 옆에
+      # 다른 파일을 써도 공개 artifact 로 나가지 않는다. 파일이 없으면 `if-no-files-found: error` 로 run 이 실패한다.
       - name: Upload JSON outputs
         if: steps.guard.outputs.skip != 'true'
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
         with:
           name: band-forecast-output
-          path: ${{ runner.temp }}/stage
+          path: ${{ runner.temp }}/stage/forecast_band_latest.json
           retention-days: 7
           if-no-files-found: error
 
