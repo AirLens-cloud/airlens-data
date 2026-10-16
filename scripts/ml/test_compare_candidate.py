@@ -12,6 +12,7 @@ import io
 import json
 import re
 import ssl
+import sys
 import time
 import urllib.error
 from pathlib import Path
@@ -1027,9 +1028,9 @@ def test_http_persistent_short_body_ends_as_source_error_with_class_name_only(mo
     assert len(calls) == cc.FETCH_RETRIES
 
 
-@pytest.mark.parametrize("content_length", [None, 8, "not-a-number", ""], ids=["absent", "exact", "garbage", "empty"])
+@pytest.mark.parametrize("content_length", [None, 8, "not-a-number", "", "²"], ids=["absent", "exact", "garbage", "empty", "superscript-digit"])
 def test_http_body_that_matches_or_does_not_declare_its_length_is_accepted(monkeypatch, content_length):
-    # Arrange — 길이를 알 수 없거나(없음·깨진 값) 정확히 맞으면 그대로 받는다
+    # Arrange — 길이를 알 수 없거나(없음·깨진 값·`int()` 가 못 읽는 숫자 모양 문자) 정확히 맞으면 그대로 받는다
     response = FakeResponse(b'{"x": 1}', content_length=8 if content_length == 8 else None)
     if isinstance(content_length, str):
         response.headers["Content-Length"] = content_length
@@ -1038,6 +1039,23 @@ def test_http_body_that_matches_or_does_not_declare_its_length_is_accepted(monke
     # Act / Assert
     assert source.read_json("dir/a.json") == {"x": 1}
     assert len(calls) == 1
+
+
+def test_http_content_length_beyond_the_int_digit_limit_is_treated_as_unknown(monkeypatch):
+    # Arrange — int() 는 자릿수 한도를 넘는 문자열에 ValueError 를 낸다. http.client 는 그런 값을 길이 모름으로 보고 응답을 그냥
+    # 읽는다(루프백 서버로 실측). 한도를 최소로 낮춰서 한도가 다른 환경에서도 같은 경로를 탄다
+    previous = sys.get_int_max_str_digits()
+    sys.set_int_max_str_digits(640)
+    try:
+        response = FakeResponse(b'{"x": 1}')
+        response.headers["Content-Length"] = "9" * 1000
+        source, calls, _ = scripted_source(monkeypatch, {"a.json": [response]})
+
+        # Act / Assert
+        assert source.read_json("dir/a.json") == {"x": 1}
+        assert len(calls) == 1
+    finally:
+        sys.set_int_max_str_digits(previous)
 
 
 def tree_entry(rel: str, kind: str = "file") -> dict:
