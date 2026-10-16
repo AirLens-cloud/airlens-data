@@ -45,10 +45,11 @@ def test_real_pip_check_output_of_a_bare_wheel_install_flags_exactly_the_depende
 
 
 def test_no_broken_requirements_message_and_blank_lines_are_fine():
-    # Act / Assert
+    # Act / Assert — 빈 줄은 줄로 세지 않는다. 출력이 통째로 비었는지는 `problems` 가 본다(아래)
     assert cbe.unexpected_pip_check_lines("No broken requirements found.\n\n", PROJECT, VERSION, SKIPPED) == []
-    assert cbe.unexpected_pip_check_lines("", PROJECT, VERSION, SKIPPED) == []
-    assert cbe.unexpected_pip_check_lines("  \n\n", PROJECT, VERSION, SKIPPED) == []
+    assert cbe.unexpected_pip_check_lines("\n" + EXPECTED_PIP_CHECK.replace("\n", "\n\n"), PROJECT, VERSION, SKIPPED) == []
+    assert cbe.pip_check_lines("  a \n\n\tb\n") == ["a", "b"]
+    assert cbe.pip_check_lines("") == cbe.pip_check_lines("  \n\n") == []
 
 
 @pytest.mark.parametrize(
@@ -93,6 +94,28 @@ def test_allowed_lines_follow_the_project_and_version_arguments():
     # Act / Assert
     assert cbe.unexpected_pip_check_lines(output, "other-project", "9.9.9", ["joblib"]) == []
     assert cbe.unexpected_pip_check_lines(output, PROJECT, VERSION, ["joblib"]) == [output.strip()]
+
+
+@pytest.mark.parametrize(
+    ("output", "expected"),
+    [
+        (EXPECTED_PIP_CHECK, len(SKIPPED)),
+        ("\n".join(line(dep) for dep in SKIPPED[:5]) + "\n", 5),  # 하나는 깔려서 그 줄이 없다
+        ("No broken requirements found.\n", 0),  # 정상 메시지는 허용 줄이 아니다
+        ("", 0),
+        (EXPECTED_PIP_CHECK + EXPECTED_PIP_CHECK, len(SKIPPED)),  # 같은 줄은 한 번만 센다
+        (EXPECTED_PIP_CHECK + line("numpy") + "\n", len(SKIPPED)),  # 허용하지 않은 줄은 세지 않는다
+        (line("joblib", version="0.2.0") + "\n", 0),  # 다른 버전의 줄은 허용 줄이 아니다
+    ],
+)
+def test_observed_allowed_lines_counts_the_allowed_lines_that_are_really_there(output, expected):
+    # Act / Assert — 허용 목록의 크기가 아니라 pip check 에 실제로 남은 줄 수
+    assert cbe.observed_allowed_lines(output, PROJECT, VERSION, SKIPPED) == expected
+
+
+def test_observed_allowed_lines_compares_dependency_names_in_canonical_form():
+    # Act / Assert
+    assert cbe.observed_allowed_lines(line("python-dotenv") + "\n", PROJECT, VERSION, ["Python_Dotenv"]) == 1
 
 
 @pytest.mark.parametrize(("raw", "expected"), [("a,b", ["a", "b"]), (" Joblib , scikit_learn ", ["joblib", "scikit-learn"]), ("x", ["x"])])
@@ -144,6 +167,20 @@ def test_a_clean_cpu_install_has_no_problems():
     assert problems() == []
 
 
+@pytest.mark.parametrize("output", ["", "  ", "\n\n", " \t\n \n"])
+def test_an_empty_pip_check_output_is_a_problem_even_when_the_install_is_otherwise_clean(output):
+    # Act
+    found = problems(pip_check=output)
+
+    # Assert — 정상이어도 pip 는 `No broken requirements found.` 를 쓴다. 빈 출력은 pip 가 아무것도 쓰지 않은 것이다
+    assert len(found) == 1 and "비어 있다" in found[0]
+
+
+def test_the_no_broken_requirements_message_alone_has_no_problems():
+    # Act / Assert — 일부러 깔지 않은 의존성이 실제로는 깔려 있어도(그 줄이 없어도) 막지 않는다
+    assert problems(pip_check="No broken requirements found.\n") == []
+
+
 def test_each_failure_is_reported_on_its_own():
     # Act
     pip_check = problems(pip_check=EXPECTED_PIP_CHECK + line("numpy") + "\n")
@@ -193,7 +230,32 @@ def test_cli_passes_a_clean_install_and_says_what_was_checked(tmp_path, capsys):
     # Assert
     assert code == 0
     assert "통과" in out and "::error::" not in out
-    assert f"{PROJECT}=={VERSION}" in out and "6개" in out
+    assert f"{PROJECT}=={VERSION}" in out and "허용 줄 6개" in out
+
+
+@pytest.mark.parametrize(
+    ("pip_check", "observed"),
+    [("No broken requirements found.\n", 0), ("\n".join(line(dep) for dep in SKIPPED[:5]) + "\n", 5)],
+    ids=["no-broken-message-only", "five-of-six-lines"],
+)
+def test_cli_success_message_reports_the_allowed_lines_it_saw_not_the_size_of_the_allow_list(tmp_path, capsys, pip_check, observed):
+    # Act — 허용 목록은 6개지만 pip check 에 실제로 남은 줄은 다르다
+    code, out = cli(tmp_path, capsys, pip_check=pip_check)
+
+    # Assert
+    assert code == 0
+    assert f"허용 줄 {observed}개" in out and "6개" not in out
+
+
+@pytest.mark.parametrize("pip_check", ["", "  \n\n"])
+def test_cli_fails_when_pip_check_wrote_nothing(tmp_path, capsys, pip_check):
+    # Act
+    code, out = cli(tmp_path, capsys, pip_check=pip_check)
+
+    # Assert
+    assert code == 1
+    assert out.count("::error::band 설치 검사 실패") == 1 and "비어 있다" in out
+    assert "통과" not in out
 
 
 def test_cli_reports_every_problem_as_an_error_annotation_and_exits_one(tmp_path, capsys):

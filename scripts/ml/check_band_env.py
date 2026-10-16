@@ -8,6 +8,7 @@
 
 세 가지를 본다.
   1. pip check — 허용한 "설치 안 함" 줄 외의 줄이 없어야 한다. 줄에 wheel 버전이 들어 있어서 다른 버전이 깔려도 걸린다.
+     출력이 비어 있어도 실패다 — 정상이어도 pip 는 `No broken requirements found.` 를 쓰므로 빈 출력은 pip 가 아무것도 쓰지 않은 것이다.
   2. 설치 목록(`pip list --format=freeze`) — wheel 이 핀 버전으로 깔려 있고, GPU 스택(nvidia-*, cuda-*, triton)이 없어야 한다.
   3. `torch.version.cuda` — CPU 빌드면 `None` 이다.
 
@@ -40,14 +41,30 @@ def parse_allow_missing(raw: str) -> list[str]:
     return names
 
 
+def pip_check_lines(output: str) -> list[str]:
+    """`pip check` 출력의 비어 있지 않은 줄(앞뒤 공백 제거)."""
+    return [line for line in (raw.strip() for raw in output.splitlines()) if line]
+
+
+def _allowed_lines(project: str, version: str, allowed_missing: Iterable[str]) -> set[str]:
+    """허용하는 "설치 안 함" 줄 = `<project> <version> requires <dep>, which is not installed.`"""
+    return {f"{project} {version} requires {canonical(dep)}, which is not installed." for dep in allowed_missing}
+
+
 def unexpected_pip_check_lines(output: str, project: str, version: str, allowed_missing: Iterable[str]) -> list[str]:
     """`pip check` 출력에서 허용하지 않은 줄들. 허용 = `<project> <version> requires <dep>, which is not installed.` 정확히 한 줄.
 
     부분 일치가 아니다 — 줄 전체가 같아야 한다. `No broken requirements found.` 도 정상 줄이다.
+    출력이 비었는지는 여기서 보지 않는다(`problems` 가 본다).
     """
-    allowed = {f"{project} {version} requires {canonical(dep)}, which is not installed." for dep in allowed_missing}
-    allowed.add(NO_PROBLEMS_LINE)
-    return [line for line in (raw.strip() for raw in output.splitlines()) if line and line not in allowed]
+    allowed = _allowed_lines(project, version, allowed_missing) | {NO_PROBLEMS_LINE}
+    return [line for line in pip_check_lines(output) if line not in allowed]
+
+
+def observed_allowed_lines(output: str, project: str, version: str, allowed_missing: Iterable[str]) -> int:
+    """`pip check` 출력에 실제로 남은 허용 줄의 수(같은 줄은 한 번). `No broken requirements found.` 는 세지 않는다."""
+    allowed = _allowed_lines(project, version, allowed_missing)
+    return len(allowed.intersection(pip_check_lines(output)))
 
 
 def _freeze_entries(freeze: str) -> list[tuple[str, str]]:
@@ -74,6 +91,8 @@ def installed_version(freeze: str, name: str) -> str | None:
 def problems(pip_check: str, pip_list: str, torch_cuda: str, project: str, version: str, allowed_missing: Iterable[str]) -> list[str]:
     """실패 사유 목록(비면 통과)."""
     found: list[str] = []
+    if not pip_check_lines(pip_check):
+        found.append("pip check 출력이 비어 있다 — pip 가 아무것도 쓰지 않았다")
     for line in unexpected_pip_check_lines(pip_check, project, version, allowed_missing):
         found.append(f"pip check 예상 밖 줄: {line}")
     installed = installed_version(pip_list, project)
@@ -109,7 +128,8 @@ def main(argv: list[str] | None = None) -> int:
         for reason in found:
             print(f"::error::band 설치 검사 실패 — {reason}")
         return 1
-    print(f"band 설치 검사 통과 — {args.project}=={args.version}, 설치 안 한 기본 의존성 {len(allowed)}개만 pip check 에 남음, "
+    observed = observed_allowed_lines(pip_check, args.project, args.version, allowed)
+    print(f"band 설치 검사 통과 — {args.project}=={args.version}, pip check 에 남은 허용 줄 {observed}개, "
           f"GPU 패키지 0개, torch.version.cuda=None")
     return 0
 
