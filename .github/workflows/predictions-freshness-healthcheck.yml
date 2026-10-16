@@ -21,9 +21,10 @@ name: Predictions Freshness Healthcheck
 # 발행 워크플로를 일부러 끄는 작업(롤백 등)을 하면 `workflow_inactive` 경보가 켜진다. 그때는 아래
 # `WATCHED_WORKFLOWS` 에서 그 파일을 같은 PR 에서 뺀다.
 
+# 스케줄은 컷오버 PR 에서 켠다: `schedule: [{cron: '17 */2 * * *'}]`(발행 :45 이 끝난 뒤, 2h 주기).
+# 그 전까지는 기존 감시가 같은 판정을 하고 있어서, 여기서도 켜면 경보 이슈가 중복된다. 게다가 GitHub 스케줄
+# 지연으로 grid_latest 가 4h 를 자주 넘어 공개 이슈가 대부분의 시간 열려 있게 된다. 그동안은 수동 실행만 둔다.
 on:
-  schedule:
-    - cron: '17 */2 * * *'   # 발행(:45)이 끝난 뒤를 본다 — 2h 주기
   workflow_dispatch:
     inputs:
       max_age_hours:
