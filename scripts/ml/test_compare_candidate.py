@@ -1003,11 +1003,13 @@ def test_http_response_size_limit_is_far_above_the_files_that_are_read_and_still
     assert 4 * 1024 * 1024 <= cc.MAX_RESPONSE_BYTES <= 64 * 1024 * 1024
 
 
-def test_http_body_shorter_than_its_content_length_is_retried_then_succeeds(monkeypatch):
+@pytest.mark.parametrize("cut", [b"{", b'{"x"', b'{"x": 1'], ids=["1-of-8-bytes", "5-of-8-bytes", "one-byte-missing"])
+def test_http_body_shorter_than_its_content_length_is_retried_then_succeeds(monkeypatch, cut):
     # Arrange — 크기를 주고 읽으면 연결이 끊겨 Content-Length 보다 짧게 와도 http.client 는 예외 없이 짧은 본문을 준다(실측).
-    # 그대로 두면 잘린 본문이 재시도 없이 "JSON 아님" 으로 끝난다
-    cut = FakeResponse(b'{"x"', content_length=10)
-    source, calls, sleeps = scripted_source(monkeypatch, {"a.json": [cut, FakeResponse(b'{"x": 1}', content_length=8)]})
+    # 그대로 두면 잘린 본문이 재시도 없이 "JSON 아님" 으로 끝난다. 얼마나 잘렸든(1바이트만 모자라도) 같다
+    complete = b'{"x": 1}'
+    source, calls, sleeps = scripted_source(monkeypatch, {"a.json": [
+        FakeResponse(cut, content_length=len(complete)), FakeResponse(complete, content_length=len(complete))]})
 
     # Act
     payload = source.read_json("dir/a.json")
@@ -1015,6 +1017,19 @@ def test_http_body_shorter_than_its_content_length_is_retried_then_succeeds(monk
     # Assert
     assert payload == {"x": 1}
     assert len(calls) == 2 and sleeps == [2.0]
+
+
+def test_http_response_over_the_limit_is_a_size_error_even_when_its_content_length_is_honest(monkeypatch):
+    # Arrange — 정직한 큰 파일이다: 상한까지만 읽은 본문은 선언한 길이보다 짧지만, 끊긴 응답이 아니라 큰 응답이다.
+    # 재시도(그때마다 상한만큼 다시 받는다)가 아니라 곧바로 "상한 초과" 로 끝나야 한다
+    monkeypatch.setattr(cc, "MAX_RESPONSE_BYTES", 16)
+    source, calls, sleeps = scripted_source(monkeypatch, {"a.json": [FakeResponse(b"x" * 100, content_length=100)]})
+
+    # Act / Assert
+    with pytest.raises(cc.SourceError) as exc:
+        source.read_bytes("dir/a.json")
+    assert str(exc.value) == "dir/a.json: 응답 크기 상한 초과"
+    assert len(calls) == 1 and sleeps == []
 
 
 def test_http_persistent_short_body_ends_as_source_error_with_class_name_only(monkeypatch):
