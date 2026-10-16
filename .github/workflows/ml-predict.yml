@@ -141,7 +141,9 @@ jobs:
             "$MODEL_METADATA_SHA256" "aod_pm25_${MODEL_VERSION}.metadata.json" \
             | sha256sum -c --strict -
           # 폴더에는 조달기가 받는 일반 파일 네 개만 있어야 한다(`.sha256` 은 조달기가 함께 받는 매니페스트). 리더가 이
-          # 폴더에서 무엇을 여는지와 무관하게 핀 밖 파일을 막고, 검증한 바이트는 뒤 스텝이 덮어쓰지 못하게 한다.
+          # 폴더에서 무엇을 여는지와 무관하게 핀 밖 파일을 막는다. 읽기 전용은 뒤 스텝이 실수로 검증한 바이트를 바꾸지
+          # 않게 하는 장치다 — 같은 사용자는 권한을 되돌릴 수 있으니 경계는 아니다. 실패해도 파일명은 찍지 않는다
+          # (`::` 로 시작하는 줄은 워크플로 명령으로 해석된다).
           expected="./aod_pm25_${MODEL_VERSION}.gtwr.npz ./aod_pm25_${MODEL_VERSION}.metadata.json ./aod_pm25_${MODEL_VERSION}.pkl ./aod_pm25_${MODEL_VERSION}.sha256"
           if [ -n "$(find . -mindepth 1 ! -type f -print -quit)" ] \
             || [ "$(find . -mindepth 1 -type f | LC_ALL=C sort | paste -sd ' ' -)" != "$expected" ]; then
