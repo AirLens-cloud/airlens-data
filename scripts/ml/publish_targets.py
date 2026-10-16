@@ -43,6 +43,7 @@ DQSS_FILE = "data_quality.json"
 SHADOW_FILE = "shadow_stations.json"
 BAND_FILE = "forecast_band_latest.json"  # 예측 밴드 산출물(artifact 디렉터리 기준)
 BAND_PROD_SNAPSHOT = "prod_latest.json"  # 같은 시점 운영 latest 사본 — `--prod-snapshot` 이 가리키는 파일의 역할 이름
+BAND_LATEST = "aq-data/forecast-band/latest.json"  # 운영 경로 — 운영 band 는 이 파일 하나만 덮어쓴다
 
 
 @dataclass(frozen=True)
@@ -111,18 +112,27 @@ def predictions_targets(mode: str, stamp: str) -> list[Target]:
     ]
 
 
+def band_history_dest(stamp: str) -> str:
+    """후보 모드의 band 발행물 경로(타임스탬프 파일). STAMP = 후보 발행물의 issue_time."""
+    return f"{CANDIDATE_ROOT}/forecast-band/history/band_{parse_stamp(stamp)}.json"
+
+
+def band_prod_copy_dest(stamp: str) -> str:
+    """후보 모드에서 그 시점 운영 latest 사본을 두는 경로. STAMP = 운영 latest 의 issue_time."""
+    return f"{CANDIDATE_ROOT}/forecast-band/prod/band_{parse_stamp(stamp)}.json"
+
+
 def band_targets(mode: str, stamp: str, prod_stamp: str | None = None) -> list[Target]:
     """예측 밴드 발행 대상. `prod_stamp` 는 후보 모드에서 운영 latest 사본을 같이 남길 때만 준다(운영 모드는 무시)."""
     if mode not in MODES:
         raise ValueError(f"mode 는 {MODES} 중 하나여야 한다: {mode!r}")
     stamp = parse_stamp(stamp)
     if mode == "candidate":
-        targets = [Target("band", BAND_FILE, f"{CANDIDATE_ROOT}/forecast-band/history/band_{stamp}.json", True)]
+        targets = [Target("band", BAND_FILE, band_history_dest(stamp), True)]
         if prod_stamp is not None:
-            targets.append(Target("band", BAND_PROD_SNAPSHOT,
-                                  f"{CANDIDATE_ROOT}/forecast-band/prod/band_{parse_stamp(prod_stamp)}.json", False))
+            targets.append(Target("band", BAND_PROD_SNAPSHOT, band_prod_copy_dest(prod_stamp), False))
         return targets
-    return [Target("band", BAND_FILE, "aq-data/forecast-band/latest.json", True)]
+    return [Target("band", BAND_FILE, BAND_LATEST, True)]
 
 
 def prune_prefixes(mode: str) -> list[tuple[str, int]]:

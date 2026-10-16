@@ -491,3 +491,21 @@ def test_cli_band_candidate_and_production_prune_lines_follow_the_predictions_ru
 
     # Assert
     assert (code, out) == (0, "")
+
+
+# ── band 경로 헬퍼: band_guard 가 같은 경로를 쓴다 ───────────────────────────
+def test_band_path_helpers_are_the_single_source_of_the_band_paths():
+    # Act / Assert
+    assert pt.band_history_dest(STAMP) == f"aq-data/_candidate/forecast-band/history/band_{STAMP}.json"
+    assert pt.band_prod_copy_dest(PROD_STAMP) == f"aq-data/_candidate/forecast-band/prod/band_{PROD_STAMP}.json"
+    assert pt.BAND_LATEST == BAND_PRODUCTION_PATH
+    assert [t.dest for t in pt.band_targets("candidate", STAMP, PROD_STAMP)] == [pt.band_history_dest(STAMP), pt.band_prod_copy_dest(PROD_STAMP)]
+    assert [t.dest for t in pt.band_targets("production", STAMP)] == [pt.BAND_LATEST]
+
+
+@pytest.mark.parametrize("bad", ["", "202610150", "20261015066", "2026-10-15", "2026131506", "abcdefghij"])
+@pytest.mark.parametrize("helper", ["band_history_dest", "band_prod_copy_dest"])
+def test_band_path_helpers_reject_stamps_that_are_not_real_ten_digit_hours(helper, bad):
+    # Act / Assert
+    with pytest.raises(ValueError):
+        getattr(pt, helper)(bad)
