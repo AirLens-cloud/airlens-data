@@ -127,8 +127,23 @@ def forecast(generated_at: object = ISSUE_Z) -> bytes:
     return doc(generated_at=generated_at, cities=[])
 
 
+def band_doc(issue_time: object = "2026-10-15T06:15:42+00:00", schema_version: object = "w3-band-v1") -> dict:
+    """계약(`w3-band-v1`)을 지키는 가장 작은 발행물."""
+    return {
+        "schema_version": schema_version, "generated_at": "2026-10-15T06:40:00+00:00", "model": "timesfm-test + CQR", "issue_time": issue_time,
+        "cities": [{"name": "city-00", "horizons": [{"lead_hours": 1, "valid_time": "2026-10-15T07:00:00+00:00", "p10": 1.0, "p50": 2.0, "p90": 3.0}]}],
+        "uncertainty": {"method": "CQR conformal", "picp80_claim_by_horizon": {}, "provisional_horizons": []},
+        "dqss": {"grade": None, "status": "unscored"},
+    }
+
+
 def band(issue_time: object = "2026-10-15T06:15:42+00:00", schema_version: object = "w3-band-v1") -> bytes:
-    return doc(schema_version=schema_version, issue_time=issue_time, cities=[])
+    return json.dumps(band_doc(issue_time, schema_version)).encode()
+
+
+def test_the_helper_payload_satisfies_the_real_band_contract():
+    # Act / Assert — 아래 snapshot 시험의 입력이 계약에서 벗어나 있으면 시험이 아무것도 보증하지 못한다
+    assert cc.contract_validator()(band_doc()) is None
 
 
 def test_production_check_skips_when_latest_has_the_same_issue_written_with_a_different_suffix():
@@ -356,8 +371,9 @@ def test_bad_arguments_exit_with_usage_error(argv):
 
 # ── snapshot ────────────────────────────────────────────────────────────────
 def test_snapshot_saves_the_published_latest_byte_for_byte(tmp_path, capsys):
-    # Arrange — 따옴표·공백·순서까지 그대로여야 "그대로 옮긴 사본" 이다
-    raw = b'{"schema_version":  "w3-band-v1",\n "issue_time": "2026-10-15T06:15:42+00:00", "cities": []}\n'
+    # Arrange — 따옴표·공백·순서까지 그대로여야 "그대로 옮긴 사본" 이다(키 순서를 뒤집고 들여쓰고 줄바꿈으로 끝낸 원문)
+    raw = json.dumps(dict(reversed(band_doc().items())), indent=1).encode() + b"\n"
+    assert raw != band()
     client = FakeClient({pt.BAND_LATEST: raw})
     dest = tmp_path / "prod" / "prod_latest.json"
 
@@ -419,6 +435,46 @@ def test_snapshot_without_a_usable_latest_leaves_no_file_and_never_fails_the_ste
     # Assert — 사본은 보조 자료다: 못 받아도 후보 발행을 막지 않는다
     assert code == 0 and not dest.exists()
     assert expected in stdout
+
+
+@pytest.mark.parametrize(
+    "break_it",
+    [
+        lambda d: d.update(cities=[]),  # 도시가 하나도 없다
+        lambda d: d["cities"][0]["horizons"][0].update(p10=-1.0),  # 음수 농도
+        lambda d: d.pop("uncertainty"),  # 필수 필드 누락
+    ],
+    ids=["no-cities", "negative-p10", "missing-uncertainty"],
+)
+def test_snapshot_does_not_keep_a_copy_that_breaks_the_band_contract_and_still_exits_zero(tmp_path, capsys, break_it):
+    # Arrange — 모양(schema_version·issue_time)은 맞지만 계약을 어긴 운영 latest. 남기면 발행기의 계약 검증이 batch 전체를 멈춘다.
+    broken = band_doc()
+    break_it(broken)
+    client = FakeClient({pt.BAND_LATEST: json.dumps(broken).encode()})
+    dest = tmp_path / "prod_latest.json"
+
+    # Act
+    code, stdout, _, _ = run_main(["snapshot", "--mode", "candidate", "--dest", str(dest)], client, tmp_path, capsys)
+
+    # Assert — 스텝은 성공이고(후보 발행을 막지 않는다) 사본 파일은 없다. 같은 issue 의 사본 존재 확인까지 가지 않는다
+    assert code == 0 and not dest.exists()
+    assert f"::warning::band_guard: {pt.BAND_LATEST}: band 계약을 어겼다" in stdout
+    assert "계약을 어겨 사본을 남기지 않는다" in stdout
+    assert client.calls == [(pt.BAND_LATEST, True)]
+
+
+def test_snapshot_warning_for_a_contract_violation_is_one_bounded_line(tmp_path, capsys):
+    # Arrange — 위반 설명에 줄바꿈이 섞여 있어도 로그에서 워크플로 명령(`::...`)을 흉내 낼 수 없고, 길이도 짧다
+    client = FakeClient({pt.BAND_LATEST: band()})
+    hostile = "x\n::error::injected" + "y" * 500
+
+    # Act
+    code = bg.main(["snapshot", "--mode", "candidate", "--dest", str(tmp_path / "x.json")], client=client, env={}, validate=lambda _doc: hostile)
+
+    # Assert
+    commands = [line for line in capsys.readouterr().out.splitlines() if line.startswith("::")]
+    assert code == 0
+    assert len(commands) == 1 and commands[0].startswith("::warning::band_guard: ") and len(commands[0]) < 500
 
 
 def test_snapshot_still_writes_when_the_existence_check_fails_and_says_so(tmp_path, capsys):

@@ -19,7 +19,7 @@ band job 은 예보 수집(forecast-collect) 직후와 백업 스케줄에 모�
 CLI (워크플로가 쓴다):
     band_guard.py check    --mode M --force true|false   → $GITHUB_OUTPUT 에 `skip=true|false`
     band_guard.py snapshot --mode M --dest FILE          → 후보 모드에서만: 지금의 운영 latest 원문을 FILE 로 저장
-                                                            (같은 issue 의 사본이 이미 있거나 받지 못하면 쓰지 않는다)
+                                                            (같은 issue 의 사본이 이미 있거나, 받지 못하거나, 계약을 어기면 쓰지 않는다)
 
 운영 band 는 latest 하나만 덮어써서 이력이 없다. 후보 모드가 후보 발행물과 같은 시점의 운영 latest 사본을 같이
 남겨야(`snapshot` → `publish_targets.py maps --prod-snapshot`) 나중에 같은 issue 끼리 짝지어 비교할 수 있다.
@@ -29,7 +29,7 @@ from __future__ import annotations
 import argparse
 import os
 import sys
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -114,11 +114,12 @@ def check(mode: str, force: bool, client: cc.HttpSource) -> tuple[Decision, list
     return decide(mode, force, facts), warnings
 
 
-def snapshot(client: cc.HttpSource, dest: Path, warnings: list[str]) -> str:
+def snapshot(client: cc.HttpSource, dest: Path, warnings: list[str], validate: Callable[[dict], str | None]) -> str:
     """지금의 운영 latest 원문을 dest 로 저장한다(후보 모드). 결과 설명 한 줄을 돌려준다.
 
-    같은 issue 의 사본이 이미 있으면 쓰지 않는다. 운영 latest 를 못 받거나 band 계약 모양이 아니면 쓰지 않고 경고만 남긴다 —
-    사본은 비교용 보조 자료라 후보 발행을 막지 않는다.
+    같은 issue 의 사본이 이미 있으면 쓰지 않는다. 운영 latest 를 못 받거나 band 모양이 아니거나 계약 검증(`validate`)에
+    걸리면 쓰지 않고 경고만 남긴다 — 사본은 비교용 보조 자료라 후보 발행을 막지 않는다. 계약 검증은 발행기의
+    `batch --schema auto` 와 같은 검증기다: 거르지 않으면 계약을 어긴 사본 하나가 batch 전체(후보 발행물까지)를 멈춘다.
     """
     try:
         body = client.read_bytes(pt.BAND_LATEST)
@@ -135,6 +136,10 @@ def snapshot(client: cc.HttpSource, dest: Path, warnings: list[str]) -> str:
     except ValueError as exc:
         warnings.append(f"{pt.BAND_LATEST}: band 발행물 모양이 아니다 ({exc})")
         return "운영 latest 가 band 발행물 모양이 아니라 사본을 남기지 않는다"
+    error = validate(doc)
+    if error is not None:
+        warnings.append(f"{pt.BAND_LATEST}: band 계약을 어겼다 ({error!r:.300})")  # repr: 줄바꿈이 섞여도 로그 한 줄, 길이도 제한
+        return "운영 latest 가 band 계약을 어겨 사본을 남기지 않는다"
     try:
         if client.exists(pt.band_prod_copy_dest(stamp)):
             return f"issue {stamp} 의 운영 사본이 이미 있다 — 쓰지 않는다"
@@ -153,7 +158,13 @@ def _append(env: Mapping[str, str], key: str, text: str) -> None:
             fh.write(text)
 
 
-def main(argv: list[str] | None = None, *, client: cc.HttpSource | None = None, env: Mapping[str, str] | None = None) -> int:
+def main(
+    argv: list[str] | None = None,
+    *,
+    client: cc.HttpSource | None = None,
+    env: Mapping[str, str] | None = None,
+    validate: Callable[[dict], str | None] | None = None,
+) -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = parser.add_subparsers(dest="cmd", required=True)
 
@@ -183,7 +194,7 @@ def main(argv: list[str] | None = None, *, client: cc.HttpSource | None = None, 
     if args.mode != "candidate":
         print("band_guard: 운영 모드는 운영 latest 사본이 필요 없다")
         return 0
-    message = snapshot(client, args.dest, warnings)
+    message = snapshot(client, args.dest, warnings, validate or cc.contract_validator())
     for warning in warnings:
         print(f"::warning::band_guard: {warning}")
     print(f"band_guard: {message}")

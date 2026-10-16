@@ -668,7 +668,7 @@ class HttpSource:
         return None if body is None else parse_json_object(body, rel_path)
 
 
-def _contract_validator() -> Callable[[dict], str | None]:
+def contract_validator() -> Callable[[dict], str | None]:
     """contracts/validate.py 를 파일 경로로 적재한다(hf_publish 와 같은 방식 — 전역 import 경로를 건드리지 않는다)."""
     path = Path(__file__).resolve().parents[2] / "contracts" / "validate.py"
     spec = importlib.util.spec_from_file_location("_airlens_contract_validate", path)
@@ -736,7 +736,7 @@ def main(argv: list[str] | None = None, validate: Callable[[dict], str | None] |
         source: Source = LocalSource(args.local) if args.local else HttpSource()
         min_strict = args.min_strict_pairs if args.min_strict_pairs is not None else MIN_STRICT_PAIRS_BY_PRODUCT[args.product]
         runner = run_band if args.product == "band" else run
-        results, summary = runner(source, validate or _contract_validator(), since, min_strict)
+        results, summary = runner(source, validate or contract_validator(), since, min_strict)
     except (ValueError, SourceError) as exc:
         print(f"compare_candidate: {exc}", file=sys.stderr)
         return 2

@@ -1250,7 +1250,7 @@ def minimal_valid_grid() -> dict:
 
 def test_contract_validator_accepts_a_valid_grid_and_describes_violations():
     # Arrange
-    validate = cc._contract_validator()
+    validate = cc.contract_validator()
     broken = minimal_valid_grid()
     del broken["predictions"][0]["lat"]
 
@@ -1340,7 +1340,7 @@ def test_identical_band_payloads_pass_as_a_strict_pair():
 
 def test_the_helper_payload_satisfies_the_real_band_contract():
     # Arrange / Act / Assert — 아래 시험의 입력이 계약에서 벗어나 있으면 시험이 아무것도 보증하지 못한다
-    assert cc._contract_validator()(band()) is None
+    assert cc.contract_validator()(band()) is None
 
 
 def test_band_difference_of_exactly_the_tolerance_everywhere_passes():
@@ -1630,7 +1630,7 @@ def test_a_horizon_left_out_of_the_p10_p90_judgement_is_still_covered_by_the_con
     cand = with_n_holdout(band_set(band(), 3, 2, p90="x"), {"24": N_HOLDOUT["24"] + 1})
 
     # Act
-    result = classify_band(band(), cand, cc._contract_validator())
+    result = classify_band(band(), cand, cc.contract_validator())
 
     # Assert
     assert result.verdict == cc.FAIL

@@ -281,8 +281,9 @@ jobs:
           name: band-forecast-output
           path: ${{ runner.temp }}/pub
 
-      # 후보 모드에서만 받는다(운영 모드는 아무것도 하지 않는다). 공개 URL 읽기라 토큰이 없고, 실패해도 후보 발행을 막지
-      # 않는다 — 사본이 없으면 이번 STAMP 는 비교 짝이 만들어지지 않을 뿐이다.
+      # 후보 모드에서만 받는다(운영 모드는 아무것도 하지 않는다). 공개 URL 읽기라 토큰이 없다. 받지 못하거나 모양·계약이
+      # 틀리면 사본을 남기지 않는다 — 스텝은 성공으로 끝나고, 이번 STAMP 는 비교 짝이 만들어지지 않을 뿐이다. 계약 검증은
+      # 아래 발행기의 `--schema auto` 와 같은 검증기다(계약을 어긴 사본이 후보 발행까지 멈추게 하지 않으려고 먼저 거른다).
       - name: Snapshot production latest (candidate only)
         run: |
           set -euo pipefail
