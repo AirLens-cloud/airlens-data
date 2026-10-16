@@ -8,7 +8,7 @@
 구성
   A. 전체 워크플로 공통 (PR 트리거 ↔ 비공개 시크릿, `pull_request_target`, 캐시 경로, SHA 고정)
   B. ML 워크플로 공통 (repo 가드, 시간 제한, 권한, 동시성, 발행 모드, 시크릿 위치)
-  C. `ml-predict.yml` 전용 (2잡 분리, 핀, run_entry 경유, 설치 플래그, artifact 내용)
+  C. `ml-predict.yml` 전용 (2잡 분리, wheel·가중치 핀, run_entry 경유, 설치 플래그, artifact 내용)
   D. 환경 고정 파일 (constraints ↔ 해시 고정본, publish 잡의 해시 고정본)
   E. 공개 위생 (로컬 경로·운영 환경 이름·내부 문서 번호·토큰 모양·IP 가 새 파일에 없고, 저장소 id 는 허용목록 안에 있다)
      + 그 검사기 자체의 시험
@@ -16,6 +16,7 @@
 """
 from __future__ import annotations
 
+import hashlib
 import importlib.util
 import json
 import os
@@ -468,6 +469,74 @@ def test_wheel_fetch_uses_the_pins_and_exports_the_wheel_path(predict):
     assert '--version "$INFERENCE_VERSION"' in line and '--sha256 "$INFERENCE_WHEEL_SHA256"' in line
     install = next(s for _j, _i, s in all_steps(predict) if s.get("name") == "Install pinned environment")
     assert install["env"]["WHEEL"] == "${{ steps.wheel.outputs.wheel }}"
+
+
+WEIGHT_FETCH_STEP = "Fetch model weights (public HF)"
+WEIGHT_CHECK_STEP = "Verify model weights (pinned sha256)"
+WEIGHT_PINS = {"MODEL_PKL_SHA256": "pkl", "MODEL_GTWR_SHA256": "gtwr.npz", "MODEL_METADATA_SHA256": "metadata.json"}
+
+
+def test_weight_pins_are_exact_sha256_in_the_workflow_env(predict):
+    # Arrange
+    env = predict["env"]
+
+    # Act / Assert — 같은 저장소의 `.sha256` 만 믿으면, 그 저장소에 쓸 수 있는 토큰이 가중치와 해시를 함께 바꿀 수 있다
+    for key in WEIGHT_PINS:
+        assert SHA256_RE.fullmatch(str(env[key])), key
+
+
+def test_every_step_that_reads_the_weights_runs_after_the_pin_check(predict):
+    # Arrange
+    infer = steps(jobs(predict)["infer"])
+    names = [s.get("name") for s in infer]
+    fetch, check = names.index(WEIGHT_FETCH_STEP), names.index(WEIGHT_CHECK_STEP)
+
+    # Act
+    readers = [i for i, s in enumerate(infer) if "ci-artifacts/aod" in str(s.get("run", "")) and i not in (fetch, check)]
+
+    # Assert — pkl 은 로드할 때 코드를 실행할 수 있다
+    assert check == fetch + 1
+    assert readers and all(i > check for i in readers), [names[i] for i in readers]
+    assert not infer[check].get("continue-on-error")
+
+
+_WEIGHTS = {"aod_pm25_v2.pkl": b"pkl", "aod_pm25_v2.gtwr.npz": b"npz", "aod_pm25_v2.metadata.json": b"{}"}
+
+
+def run_weight_check(tmp_path: Path, predict: dict, *, files: dict[str, bytes], pins: dict[str, str]) -> subprocess.CompletedProcess:
+    """검증 스텝의 run 스크립트를 GitHub 의 bash 기본 옵션(`-eo pipefail`)으로 실제 실행한다."""
+    tool = shutil.which("sha256sum")
+    if tool is None:
+        pytest.skip("sha256sum 없음")
+    weights = tmp_path / "work" / "ci-artifacts" / "aod"
+    weights.mkdir(parents=True)
+    for name, data in files.items():
+        (weights / name).write_bytes(data)
+    script = tmp_path / "step.sh"
+    script.write_text(next(s for _j, _i, s in all_steps(predict) if s.get("name") == WEIGHT_CHECK_STEP)["run"], encoding="utf-8")
+    env = {"PATH": f"{Path(tool).parent}:/usr/bin:/bin", "WORK": str(tmp_path / "work"), "MODEL_VERSION": "v2", **pins}
+    return subprocess.run([shutil.which("bash") or "bash", "--noprofile", "--norc", "-eo", "pipefail", str(script)],
+                          env=env, capture_output=True, text=True, timeout=60)
+
+
+@pytest.mark.parametrize(
+    ("label", "files", "pins", "ok"),
+    [
+        ("all-match", _WEIGHTS, {}, True),
+        ("pkl-tampered", {**_WEIGHTS, "aod_pm25_v2.pkl": b"tampered"}, {}, False),
+        ("npz-missing", {k: v for k, v in _WEIGHTS.items() if not k.endswith(".npz")}, {}, False),
+        ("metadata-pin-empty", _WEIGHTS, {"MODEL_METADATA_SHA256": ""}, False),
+    ],
+)
+def test_weight_check_step_fails_unless_every_file_matches_its_pin(tmp_path, predict, label, files, pins, ok):
+    # Arrange
+    good = {key: hashlib.sha256(_WEIGHTS[f"aod_pm25_v2.{suffix}"]).hexdigest() for key, suffix in WEIGHT_PINS.items()}
+
+    # Act
+    proc = run_weight_check(tmp_path, predict, files=files, pins={**good, **pins})
+
+    # Assert
+    assert (proc.returncode == 0) is ok, f"{label}: rc={proc.returncode} {proc.stdout} {proc.stderr}"
 
 
 def test_every_airlens_command_runs_through_run_entry_in_isolated_unbuffered_mode(predict):
