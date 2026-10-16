@@ -8,7 +8,7 @@
 구성
   A. 전체 워크플로 공통 (PR 트리거 ↔ 비공개 시크릿, `pull_request_target`, 캐시 경로, SHA 고정)
   B. ML 워크플로 공통 (repo 가드, 시간 제한, 권한, 동시성, 발행 모드, 시크릿 위치)
-  C. `ml-predict.yml` 전용 (2잡 분리, 핀, run_entry 경유, 설치 플래그, artifact 내용)
+  C. `ml-predict.yml` 전용 (2잡 분리, wheel·가중치 핀, run_entry 경유, 설치 플래그, artifact 내용)
   D. 환경 고정 파일 (constraints ↔ 해시 고정본, publish 잡의 해시 고정본)
   E. 공개 위생 (로컬 경로·운영 환경 이름·내부 문서 번호·토큰 모양·IP 가 새 파일에 없고, 저장소 id 는 허용목록 안에 있다)
      + 그 검사기 자체의 시험
@@ -16,6 +16,7 @@
 """
 from __future__ import annotations
 
+import hashlib
 import importlib.util
 import json
 import os
@@ -468,6 +469,130 @@ def test_wheel_fetch_uses_the_pins_and_exports_the_wheel_path(predict):
     assert '--version "$INFERENCE_VERSION"' in line and '--sha256 "$INFERENCE_WHEEL_SHA256"' in line
     install = next(s for _j, _i, s in all_steps(predict) if s.get("name") == "Install pinned environment")
     assert install["env"]["WHEEL"] == "${{ steps.wheel.outputs.wheel }}"
+
+
+WEIGHT_FETCH_STEP = "Fetch model weights (public HF)"
+WEIGHT_CHECK_STEP = "Verify model weights (pinned sha256)"
+WEIGHT_PINS = {"MODEL_PKL_SHA256": "pkl", "MODEL_GTWR_SHA256": "gtwr.npz", "MODEL_METADATA_SHA256": "metadata.json"}
+
+
+def test_weight_pins_are_exact_sha256_in_the_workflow_env(predict):
+    # Arrange
+    env = predict["env"]
+
+    # Act / Assert — 같은 저장소의 `.sha256` 만 믿으면, 그 저장소에 쓸 수 있는 토큰이 가중치와 해시를 함께 바꿀 수 있다
+    for key in WEIGHT_PINS:
+        assert SHA256_RE.fullmatch(str(env[key])), key
+
+
+def test_every_step_that_reads_the_weights_runs_after_the_pin_check(predict):
+    # Arrange
+    infer = steps(jobs(predict)["infer"])
+    names = [s.get("name") for s in infer]
+    fetch, check = names.index(WEIGHT_FETCH_STEP), names.index(WEIGHT_CHECK_STEP)
+
+    # Act
+    readers = [i for i, s in enumerate(infer) if i not in (fetch, check) and "ci-artifacts" in json.dumps(s)]
+
+    # Assert — pkl 은 로드할 때 코드를 실행할 수 있다
+    assert check == fetch + 1
+    assert readers and all(i > check for i in readers), [names[i] for i in readers]
+    assert not infer[check].get("continue-on-error")
+
+
+_WEIGHTS = {"aod_pm25_v2.pkl": b"pkl", "aod_pm25_v2.gtwr.npz": b"npz", "aod_pm25_v2.metadata.json": b"{}",
+            "aod_pm25_v2.sha256": b"manifest"}
+_GOOD_PINS = {key: hashlib.sha256(_WEIGHTS[f"aod_pm25_v2.{suffix}"]).hexdigest() for key, suffix in WEIGHT_PINS.items()}
+
+
+def run_weight_check(tmp_path: Path, predict: dict, *, files: dict[str, bytes | str], pins: dict[str, str],
+                     prepare=None) -> tuple[subprocess.CompletedProcess, dict[str, int]]:
+    """검증 스텝의 run 스크립트를 GitHub 의 bash 기본 옵션(`-eo pipefail`)으로 실제 실행한다.
+
+    `files` 값이 str 이면 그 경로를 가리키는 심링크를 만든다. `prepare(폴더)` 는 파일을 만든 뒤, 실행 전에 부른다.
+    실행 뒤의 권한 비트(폴더·파일)를 함께 돌려준다.
+    """
+    tool = shutil.which("sha256sum")
+    if tool is None:
+        if os.environ.get("CI"):
+            pytest.fail("CI 러너에 sha256sum 이 없다 — 가중치 검사 스텝도 실패한다")
+        pytest.skip("sha256sum 없음")
+    weights = tmp_path / "work" / "ci-artifacts" / "aod"
+    weights.mkdir(parents=True)
+    for name, data in sorted(files.items(), key=lambda kv: isinstance(kv[1], str)):
+        target = weights / name
+        if isinstance(data, str):
+            target.symlink_to(data)
+        else:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(data)
+    if prepare is not None:
+        prepare(weights)
+    script = tmp_path / "step.sh"
+    script.write_text(next(s for _j, _i, s in all_steps(predict) if s.get("name") == WEIGHT_CHECK_STEP)["run"], encoding="utf-8")
+    env = {"PATH": f"{Path(tool).parent}:/usr/bin:/bin", "WORK": str(tmp_path / "work"), "MODEL_VERSION": "v2", **pins}
+    try:
+        proc = subprocess.run([shutil.which("bash") or "bash", "--noprofile", "--norc", "-eo", "pipefail", str(script)],
+                              env=env, capture_output=True, text=True, timeout=60)
+        modes = {p.name: p.lstat().st_mode & 0o777 for p in [weights, *weights.iterdir()]}
+    finally:
+        subprocess.run(["chmod", "-R", "u+w", str(tmp_path / "work")], check=False)
+    return proc, modes
+
+
+@pytest.mark.parametrize(
+    ("label", "files", "pins", "ok"),
+    [
+        ("all-match", _WEIGHTS, {}, True),
+        ("pkl-tampered", {**_WEIGHTS, "aod_pm25_v2.pkl": b"tampered"}, {}, False),
+        ("npz-tampered", {**_WEIGHTS, "aod_pm25_v2.gtwr.npz": b"tampered"}, {}, False),
+        ("metadata-tampered", {**_WEIGHTS, "aod_pm25_v2.metadata.json": b'{"x":1}'}, {}, False),
+        ("npz-missing", {k: v for k, v in _WEIGHTS.items() if not k.endswith(".npz")}, {}, False),
+        ("metadata-pin-empty", _WEIGHTS, {"MODEL_METADATA_SHA256": ""}, False),
+        ("manifest-missing", {k: v for k, v in _WEIGHTS.items() if not k.endswith(".sha256")}, {}, False),
+        ("extra-file", {**_WEIGHTS, "aod_pm25_v2.extra.pkl": b"pkl"}, {}, False),
+        ("extra-symlink", {**_WEIGHTS, "aod_pm25_v2.extra.pkl": "aod_pm25_v2.pkl"}, {}, False),
+        ("extra-dir", {**_WEIGHTS, "sub/.keep": b""}, {}, False),
+        ("hidden-file", {**_WEIGHTS, ".hidden": b""}, {}, False),
+        ("newline-in-name", {**{k: v for k, v in _WEIGHTS.items() if not k.endswith(".sha256")},
+                             "aod_pm25_v2.sha256\n./aod_pm25_v2.pkl": b"manifest"}, {}, False),
+        ("pkl-is-symlink", {**_WEIGHTS, "../outside.pkl": b"pkl", "aod_pm25_v2.pkl": "../outside.pkl"}, {}, False),
+    ],
+)
+def test_weight_check_step_fails_unless_the_folder_holds_exactly_the_pinned_files(tmp_path, predict, label, files, pins, ok):
+    # Arrange — 핀 밖 파일·심링크가 있으면, 리더가 무엇을 여는지와 무관하게 실패해야 한다
+    pins = {**_GOOD_PINS, **pins}
+
+    # Act
+    proc, _modes = run_weight_check(tmp_path, predict, files=files, pins=pins)
+
+    # Assert
+    assert (proc.returncode == 0) is ok, f"{label}: rc={proc.returncode} {proc.stdout} {proc.stderr}"
+
+
+def test_weight_check_step_accepts_a_hardlinked_pin_file(tmp_path, predict):
+    # Arrange — 하드링크는 해시를 잰 그 inode 자체라 무결성 차이가 없다(일반 파일로 보인다)
+    def hardlink_pkl(weights: Path) -> None:
+        outside = weights.parent / "outside.pkl"
+        outside.write_bytes(_WEIGHTS["aod_pm25_v2.pkl"])
+        (weights / "aod_pm25_v2.pkl").unlink()
+        os.link(outside, weights / "aod_pm25_v2.pkl")
+
+    # Act
+    proc, _modes = run_weight_check(tmp_path, predict, files=_WEIGHTS, pins=_GOOD_PINS, prepare=hardlink_pkl)
+
+    # Assert
+    assert proc.returncode == 0, proc.stderr
+
+
+def test_weight_check_step_leaves_the_verified_folder_read_only(tmp_path, predict):
+    # Arrange / Act
+    proc, modes = run_weight_check(tmp_path, predict, files=_WEIGHTS, pins=_GOOD_PINS)
+
+    # Assert — 뒤 스텝이 실수로 검증한 바이트를 바꾸거나 폴더에 파일을 더하지 않게 한다(같은 사용자는 되돌릴 수 있다)
+    assert proc.returncode == 0, proc.stderr
+    assert set(modes) == {"aod", *_WEIGHTS}
+    assert all(mode & 0o222 == 0 for mode in modes.values()), {k: oct(v) for k, v in modes.items()}
 
 
 def test_every_airlens_command_runs_through_run_entry_in_isolated_unbuffered_mode(predict):

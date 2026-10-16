@@ -28,6 +28,7 @@ name: ML Predict → HF
 # · 이 워크플로에서 `HF_LIVE_REPO` 를 설정하지 않는다(발행·가중치 조달·관측 읽기의 대상 저장소가 함께 바뀐다).
 #
 # wheel 은 버전 + sha256 핀으로 받는다(`latest` 를 따라가지 않는다). 배포 = 아래 두 핀을 바꾸는 PR.
+# 가중치도 파일마다 sha256 핀과 대조한다. 가중치 교체 = `MODEL_VERSION` 과 `MODEL_*_SHA256` 세 핀을 바꾸는 PR.
 # 설치는 `requirements-predict.lock.txt`(해시 고정) → wheel(`--no-deps`) → `pip check` 순서다.
 # 가드: `scripts/ml/test_ml_workflow_safety.py`.
 
@@ -51,8 +52,11 @@ concurrency:
 env:
   PUBLISH_MODE: candidate  # candidate | production — 컷오버는 이 줄을 바꾸는 PR
   MODEL_VERSION: v2  # 공개 HF 의 가중치 버전
-  INFERENCE_VERSION: '0.1.0'  # wheel 버전 핀
-  INFERENCE_WHEEL_SHA256: 'ca279f3703abbb1d98b27eb7f30636027a62cca6d90ca9e478135770f650ca3c'  # 위 버전 wheel 의 sha256 핀
+  MODEL_PKL_SHA256: '4c59657841ce03e4eebb503c8dd87d9a9bc8c178057bb3e27bbd4e97ef4eca58'  # 위 버전 가중치 파일별 sha256 핀
+  MODEL_GTWR_SHA256: '3578afb2f2ed0f436381dea7fcb06ae1625eefb105e3baa74b21a3cfd773ed82'
+  MODEL_METADATA_SHA256: '1a0428b7b7d58d491a5bcdcfbdbae198ee8e6ce70557ae290b4d6a057a5cdc4b'
+  INFERENCE_VERSION: '0.3.0'  # wheel 버전 핀
+  INFERENCE_WHEEL_SHA256: '63eed042320a0ddfe69c695c74b1ebb4cf80b90966e976dbb76728c430910a3c'  # 위 버전 wheel 의 sha256 핀
 
 defaults:
   run:
@@ -123,6 +127,30 @@ jobs:
           cd "$WORK"
           "$VENV/bin/python" -I -u "$GITHUB_WORKSPACE/scripts/ml/run_entry.py" \
             airlens-fetch-model fetch --dest ci-artifacts/aod --version "$MODEL_VERSION"
+
+      # 조달기는 같은 저장소에서 받은 `.sha256` 과만 맞춘다. 그 저장소에 쓸 수 있는 토큰(이 레포의 발행 토큰 포함)이면
+      # 가중치와 해시를 함께 바꿀 수 있으므로, 이 워크플로에 박은 파일별 핀과 다시 대조한다. pkl 은 로드할 때 코드를
+      # 실행할 수 있어서, 가중치를 읽는 스텝은 모두 이 스텝 뒤에 둔다.
+      - name: Verify model weights (pinned sha256)
+        run: |
+          set -euo pipefail
+          cd "$WORK/ci-artifacts/aod"
+          printf '%s  %s\n' \
+            "$MODEL_PKL_SHA256" "aod_pm25_${MODEL_VERSION}.pkl" \
+            "$MODEL_GTWR_SHA256" "aod_pm25_${MODEL_VERSION}.gtwr.npz" \
+            "$MODEL_METADATA_SHA256" "aod_pm25_${MODEL_VERSION}.metadata.json" \
+            | sha256sum -c --strict -
+          # 폴더에는 조달기가 받는 일반 파일 네 개만 있어야 한다(`.sha256` 은 조달기가 함께 받는 매니페스트). 리더가 이
+          # 폴더에서 무엇을 여는지와 무관하게 핀 밖 파일을 막는다. 읽기 전용은 뒤 스텝이 실수로 검증한 바이트를 바꾸지
+          # 않게 하는 장치다 — 같은 사용자는 권한을 되돌릴 수 있으니 경계는 아니다. 실패해도 파일명은 찍지 않는다
+          # (`::` 로 시작하는 줄은 워크플로 명령으로 해석된다).
+          expected="./aod_pm25_${MODEL_VERSION}.gtwr.npz ./aod_pm25_${MODEL_VERSION}.metadata.json ./aod_pm25_${MODEL_VERSION}.pkl ./aod_pm25_${MODEL_VERSION}.sha256"
+          if [ -n "$(find . -mindepth 1 ! -type f -print -quit)" ] \
+            || [ "$(find . -mindepth 1 -type f | LC_ALL=C sort | paste -sd ' ' -)" != "$expected" ]; then
+            echo "::error::가중치 폴더에 핀 밖 항목이 있다"
+            exit 1
+          fi
+          chmod -R a-w .
 
       # 관측 read 는 공개 GET(토큰 불요)이다. OpenAQ 슬롯 신선도 게이트(4h)에 걸리면 predict 가 fail-loud 로
       # non-zero 종료한다(무음 실패 없음). `--dqss` 는 같은 프로세스에서 data_quality.json 과 shadow_stations.json
