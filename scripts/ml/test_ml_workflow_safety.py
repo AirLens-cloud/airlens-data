@@ -7,20 +7,24 @@
 
 구성
   A. 전체 워크플로 공통 (PR 트리거 ↔ 비공개 시크릿, `pull_request_target`, 캐시 경로, SHA 고정)
-  B. ML 워크플로 공통 (repo 가드, 시간 제한, 권한, 동시성, 발행 모드, 시크릿 위치)
+  B. ML 워크플로 공통 (트리거 형태, repo 가드, 시간 제한, 권한, 동시성, 발행 모드, 시크릿 위치)
   C. `ml-predict.yml` 전용 (2잡 분리, wheel·가중치 핀, run_entry 경유, 설치 플래그, artifact 내용)
-  D. 환경 고정 파일 (constraints ↔ 해시 고정본, publish 잡의 해시 고정본)
+  C2. `band-forecast.yml` 전용 (건너뛰기 가드, 2잡 분리, 3단계 설치와 설치 검사, run_entry 경유와 경로 플래그,
+      artifact 내용, 워크플로 ↔ 스크립트 인자 계약)
+  D. 환경 고정 파일 (constraints ↔ 해시 고정본, band 의 CPU torch · PyPI 두 갈래 고정본, publish 잡의 해시 고정본)
   E. 공개 위생 (로컬 경로·운영 환경 이름·내부 문서 번호·토큰 모양·IP 가 새 파일에 없고, 저장소 id 는 허용목록 안에 있다)
      + 그 검사기 자체의 시험
   F. 감시 워크플로 / keepalive
 """
 from __future__ import annotations
 
+import argparse
 import hashlib
 import importlib.util
 import json
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -29,6 +33,10 @@ from pathlib import Path
 import pytest
 import yaml
 
+import band_guard
+import check_band_env
+import publish_targets
+
 ROOT = Path(__file__).resolve().parents[2]
 WORKFLOW_DIR = ROOT / ".github" / "workflows"
 ML_DIR = ROOT / "scripts" / "ml"
@@ -36,11 +44,14 @@ PREDICT_LOCK = ML_DIR / "requirements-predict.lock.txt"
 PUBLISH_LOCK = ROOT / "scripts" / "etl" / "requirements-publish.lock.txt"  # 발행기를 쓰는 다른 워크플로가 재사용한다
 
 ALL_WORKFLOWS = sorted(WORKFLOW_DIR.glob("*.yml"))
-# band-forecast.yml 은 후속 변경이 추가한다 — 생기면 같은 공통 규칙이 자동으로 적용된다.
-ML_WORKFLOW_NAMES = [n for n in ("ml-predict.yml", "band-forecast.yml") if (WORKFLOW_DIR / n).exists()]
+BAND_WORKFLOW = "band-forecast.yml"
+# 파일이 없으면 아래 공통 시험이 조용히 줄어들지 않고 로드 단계에서 실패한다(존재 시험이 따로 있다)
+ML_WORKFLOW_NAMES = ["ml-predict.yml", BAND_WORKFLOW]
 
 REPO_GUARD = "github.repository == 'AirLens-cloud/airlens-data'"
 MAIN_REF_GUARD = "github.ref == 'refs/heads/main'"
+# workflow_run 으로 시작된 run 은 앞선 수집이 성공했을 때만 돈다(다른 이벤트에서는 이 절이 항상 참이다)
+WORKFLOW_RUN_GUARD = "(github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success')"
 SHA_RE = re.compile(r"[0-9a-f]{40}")
 SHA256_RE = re.compile(r"[0-9a-f]{64}")
 VERSION_RE = re.compile(r"[0-9]+(\.[0-9]+)*")
@@ -49,6 +60,7 @@ PUBLISH_MODES = {"candidate", "production"}
 WHEEL_SECRET_PREFIX = "HF_MODELS_"
 WRITE_SECRET = "HF_TOKEN"
 CONSOLE_SCRIPTS = ("airlens-fetch-model", "airlens-predict-grid", "airlens-dqss-check", "airlens-drift-monitor")
+BAND_CONSOLE_SCRIPTS = ("airlens-band-fresh-openaq", "airlens-band-engine", "airlens-band-publish")  # 실행 순서
 
 
 # ── 도우미 ───────────────────────────────────────────────────────────────────
@@ -128,9 +140,10 @@ def predict() -> dict:
 
 
 # ── A. 전체 워크플로 공통 ────────────────────────────────────────────────────
-def test_ml_predict_workflow_exists_and_is_listed():
-    # Arrange / Act / Assert — 아래 모든 ML 시험이 이 목록으로 도는데 목록이 비면 무음 통과한다
-    assert "ml-predict.yml" in ML_WORKFLOW_NAMES
+def test_ml_workflows_exist_and_are_listed():
+    # Arrange / Act / Assert — 아래 모든 ML 시험이 이 목록으로 도는데 파일이 없거나 목록에서 빠지면 무음 통과한다
+    assert ML_WORKFLOW_NAMES == ["ml-predict.yml", BAND_WORKFLOW]
+    assert all((WORKFLOW_DIR / name).is_file() for name in ML_WORKFLOW_NAMES)
 
 
 @pytest.mark.parametrize("path", ALL_WORKFLOWS, ids=lambda p: p.name)
@@ -217,22 +230,73 @@ def test_every_action_is_pinned_to_a_commit_sha(path):
 
 
 # ── B. ML 워크플로 공통 ──────────────────────────────────────────────────────
+def allowed_workflow_run() -> dict:
+    """허용하는 `workflow_run` 은 이 한 형태뿐이다 — 예보 수집이 main 에서 끝난 직후.
+
+    `workflows` 는 대상 파일의 `name:` 과 글자까지 같아야 매칭된다(파일 이름이 아니다). 그 이름을 이 시험이 대상 파일에서 읽는다.
+    """
+    return {"workflows": [load(WORKFLOW_DIR / "forecast-collect.yml")["name"]], "types": ["completed"], "branches": ["main"]}
+
+
 @ml_params
 def test_ml_workflow_has_no_pull_request_style_trigger(name):
     # Arrange
     doc = load(WORKFLOW_DIR / name)
+    trig = triggers(doc)
 
-    # Act / Assert
+    # Act / Assert — schedule · workflow_dispatch, 그리고 예보 수집을 따라붙는 workflow_run 한 형태만 허용한다
+    assert not pr_like(doc)
+    assert set(trig) <= {"schedule", "workflow_dispatch", "workflow_run"}
+    if "workflow_run" in trig:
+        assert trig["workflow_run"] == allowed_workflow_run()
+
+
+def test_the_workflow_that_band_follows_cannot_be_started_by_a_pull_request():
+    # Arrange
+    doc = load(WORKFLOW_DIR / "forecast-collect.yml")
+
+    # Act / Assert — workflow_run 은 앞선 run 이 어떤 이벤트로 시작됐든 따라붙는다. 앞선 워크플로가 PR 류로 시작될 수 없어야
+    # (cron 과 쓰기 권한자의 수동 실행뿐) 외부 기여자가 이 발행 경로를 일으키지 못한다
     assert not pr_like(doc)
     assert set(triggers(doc)) <= {"schedule", "workflow_dispatch"}
 
 
+def split_top_level(condition: str, operator: str) -> list[str] | None:
+    """괄호 밖·따옴표 밖의 `operator` 로만 나눈다. 괄호나 따옴표가 닫히지 않으면 None."""
+    parts: list[str] = []
+    depth, quoted, start, i = 0, False, 0, 0
+    while i < len(condition):
+        char = condition[i]
+        if char == "'":
+            quoted = not quoted  # `''`(이스케이프)는 두 번 뒤집혀 상태가 그대로다
+        elif not quoted:
+            if char == "(":
+                depth += 1
+            elif char == ")":
+                depth -= 1
+                if depth < 0:
+                    return None
+            elif depth == 0 and condition.startswith(operator, i):
+                parts.append(condition[start:i].strip())
+                start = i + len(operator)
+                i = start
+                continue
+        i += 1
+    if depth or quoted:
+        return None
+    return [*parts, condition[start:].strip()]
+
+
 def guard_clauses(job: dict) -> list[str]:
-    """job.if 를 `&&` 로 나눈 절(`${{ }}` 감싸기·공백 차이는 무시). `||` 가 있으면 AND 가 보장되지 않아 빈 목록이다."""
+    """job.if 를 최상위 `&&` 로 나눈 절(`${{ }}` 감싸기·공백 차이는 무시). 괄호 안의 `||` 는 한 절로 남는다.
+
+    최상위에 `||` 가 있거나 괄호·따옴표가 어긋나면 AND 가 보장되지 않아 빈 목록이다.
+    """
     condition = re.sub(r"^\s*\$\{\{|\}\}\s*$", "", str(job.get("if", ""))).strip()
-    if "||" in condition:
+    any_of, all_of = split_top_level(condition, "||"), split_top_level(condition, "&&")
+    if any_of is None or all_of is None or len(any_of) > 1:
         return []
-    return [clause.strip() for clause in condition.split("&&")]
+    return all_of
 
 
 @ml_params
@@ -262,6 +326,18 @@ def test_every_ml_job_has_the_repository_guard_and_runs_only_on_main(name):
         (f"{REPO_GUARD} && github.ref == 'refs/heads/main-x'", False),  # 다른 ref
         (f"{REPO_GUARD} && github.ref_name == 'main'", False),  # 같은 뜻이어도 정해진 표현만 인정한다
         ("", False),
+        # 괄호가 든 조건 — 괄호 안의 || 는 그 절의 일이고, 최상위가 AND 면 가드는 유효하다
+        (f"{REPO_GUARD} && {MAIN_REF_GUARD} && {WORKFLOW_RUN_GUARD}", True),
+        (f"{WORKFLOW_RUN_GUARD} && {MAIN_REF_GUARD} && {REPO_GUARD}", True),
+        (f"needs.infer.outputs.skip != 'true' && {REPO_GUARD} && {MAIN_REF_GUARD} && {WORKFLOW_RUN_GUARD}", True),
+        (f"{REPO_GUARD} && {MAIN_REF_GUARD} || {WORKFLOW_RUN_GUARD}", False),  # 괄호 밖 || — 뒤쪽 절만 참이어도 돈다
+        (f"{REPO_GUARD} && ({MAIN_REF_GUARD} || true)", False),  # main 가드가 OR 안에 있으면 지켜지지 않는다
+        (f"({REPO_GUARD} && {MAIN_REF_GUARD})", False),  # 통째로 괄호면 정해진 표현이 아니다
+        (f"{REPO_GUARD} && {MAIN_REF_GUARD} && (github.event_name != 'x' || false", False),  # 괄호가 닫히지 않았다
+        (f"{REPO_GUARD} && {MAIN_REF_GUARD} && github.event_name != 'x' || false)", False),  # 괄호가 먼저 닫힌다
+        (f"{REPO_GUARD} && github.actor != 'a || b' && {MAIN_REF_GUARD}", True),  # 따옴표 안의 || 는 연산자가 아니다
+        (f"{REPO_GUARD} && github.actor != 'a && b' && {MAIN_REF_GUARD}", True),  # 따옴표 안의 && 도 마찬가지다
+        (f"{REPO_GUARD} && {MAIN_REF_GUARD} && github.actor != 'it''s", False),  # 따옴표가 닫히지 않았다
     ],
 )
 def test_the_job_guard_check_accepts_only_an_and_of_both_guards(condition, ok):
@@ -394,7 +470,8 @@ def test_predict_trigger_is_the_documented_schedule_plus_manual_dispatch_with_on
     # Arrange / Act
     trig = triggers(predict)
 
-    # Assert
+    # Assert — 공통 시험이 workflow_run 한 형태를 허용하지만 이 워크플로는 쓰지 않는다(예측은 자기 주기로 돈다)
+    assert set(trig) == {"schedule", "workflow_dispatch"}
     assert trig["schedule"] == [{"cron": "45 */3 * * *"}]
     assert set((trig["workflow_dispatch"] or {}).get("inputs") or {}) == {"max_age_hours"}
 
@@ -914,10 +991,450 @@ def test_python_versions_follow_the_documented_split(predict):
     assert versions == {"infer": "3.12", "publish": "3.11"}
 
 
+# ── C2. band-forecast.yml 전용 ───────────────────────────────────────────────
+BAND_GUARD_SKIP = "steps.guard.outputs.skip != 'true'"
+BAND_PUBLISH_SKIP = "needs.infer.outputs.skip != 'true'"
+BAND_VERIFY_STEP = "Verify installed environment (CPU only)"
+# 명령별로 넘기는 플래그 전부와 값이 놓일 폴더. 경로 플래그를 하나라도 빼면 기본 경로에 기대게 된다.
+BAND_CLI_FLAGS = {
+    "airlens-band-fresh-openaq": {"--cache-dir": "CACHE_DIR", "--out-dir": "OUT_DIR"},
+    "airlens-band-engine": {"--series-path": "OUT_DIR", "--cities-path": "OUT_DIR", "--cache-dir": "CACHE_DIR", "--out-dir": "OUT_DIR"},
+    "airlens-band-publish": {"--band-predictions-path": "OUT_DIR", "--out": "STAGE"},
+}
+PIP_EXPECTED_MISSING = {"joblib", "lightgbm", "python-dotenv", "scikit-learn", "scipy", "xgboost"}  # 0.3.0 wheel 에서 실측한 6개
+_REAL_PARSE_ARGS = argparse.ArgumentParser.parse_args
+
+
+@pytest.fixture(scope="module")
+def band() -> dict:
+    return load(WORKFLOW_DIR / BAND_WORKFLOW)
+
+
+def _named_step(doc: dict, name: str) -> dict:
+    return next(s for _j, _i, s in all_steps(doc) if s.get("name") == name)
+
+
+def _band_commands(doc: dict) -> list[tuple[str, str, str]]:
+    """(잡, 명령 이름, 논리 줄) — airlens-band-* console script 를 부르는 줄."""
+    return [(j, name, line) for j, _i, script in run_scripts(doc) for line in logical_lines(script)
+            for name in BAND_CONSOLE_SCRIPTS if name in line]
+
+
+def band_command(line: str) -> tuple[list[str], str, dict[str, str]]:
+    """`<python> -I -u .../run_entry.py <명령> --플래그 값 ...` 줄을 (실행기 토큰, 명령, {플래그: 값}) 으로 읽는다(따옴표는 셸처럼 벗긴다)."""
+    tokens = shlex.split(line)
+    at = next(i for i, token in enumerate(tokens) if token.endswith("scripts/ml/run_entry.py"))
+    command, *rest = tokens[at + 1:]
+    flags = dict(zip(rest[::2], rest[1::2]))
+    assert len(rest) % 2 == 0 and len(flags) == len(rest) // 2, line  # 플래그마다 값이 하나, 중복 없음
+    return tokens[: at + 1], command, flags
+
+
+def run_step(tmp_path: Path, doc: dict, name: str, env: dict[str, str]) -> subprocess.CompletedProcess:
+    """스텝의 run 스크립트를 GitHub 의 bash 기본 옵션(`-eo pipefail`)으로 실제 실행한다."""
+    script = tmp_path / "step.sh"
+    script.write_text(_named_step(doc, name)["run"], encoding="utf-8")
+    return subprocess.run([shutil.which("bash") or "bash", "--noprofile", "--norc", "-eo", "pipefail", str(script)],
+                          env={"PATH": "/usr/bin:/bin", **env}, capture_output=True, text=True, timeout=60)
+
+
+def test_band_trigger_is_workflow_run_plus_backup_schedule_plus_dispatch_with_only_force(band):
+    # Arrange / Act
+    trig = triggers(band)
+    inputs = (trig["workflow_dispatch"] or {}).get("inputs") or {}
+
+    # Assert — 예보 수집 직후(workflow_run)와 백업 스케줄. 수동 실행은 force 만 받는다(발행 모드는 입력이 아니다)
+    assert set(trig) == {"workflow_run", "schedule", "workflow_dispatch"}
+    assert trig["schedule"] == [{"cron": "50 */6 * * *"}]
+    assert set(inputs) == {"force"}
+    assert inputs["force"]["type"] == "boolean" and inputs["force"]["default"] is False
+
+
+def test_band_has_separate_infer_and_publish_jobs_with_publish_after_infer(band):
+    # Act / Assert
+    assert set(jobs(band)) == {"infer", "publish"}
+    assert jobs(band)["publish"].get("needs") == "infer"
+
+
+def test_band_jobs_run_only_after_a_successful_collection_and_publish_follows_the_skip_decision(band):
+    # Arrange
+    infer, publish = guard_clauses(jobs(band)["infer"]), guard_clauses(jobs(band)["publish"])
+
+    # Act / Assert — 공통 가드(repo · main)에 더해, workflow_run 으로 시작됐다면 앞선 수집이 성공해야 한다(실패한 수집 뒤에 낡은
+    # 입력으로 밴드를 만들지 않는다). 발행 잡은 건너뛰기 판정을 따른다 — 건너뛴 run 에서는 발행 잡이 돌지 않는다.
+    assert sorted(infer) == sorted([REPO_GUARD, MAIN_REF_GUARD, WORKFLOW_RUN_GUARD])
+    assert sorted(publish) == sorted([BAND_PUBLISH_SKIP, REPO_GUARD, MAIN_REF_GUARD, WORKFLOW_RUN_GUARD])
+    assert jobs(band)["infer"]["outputs"] == {"skip": "${{ steps.guard.outputs.skip }}"}
+
+
+def test_band_guard_step_comes_first_and_every_later_infer_step_follows_its_decision(band):
+    # Arrange
+    infer = steps(jobs(band)["infer"])
+    at = next(i for i, s in enumerate(infer) if s.get("id") == "guard")
+    before, after = infer[:at], infer[at + 1:]
+    conditions = {step_name(s, at + 1 + i): str(s.get("if", "")) for i, s in enumerate(after)}
+
+    # Act / Assert — guard 앞에는 코드를 돌리는 스텝이 없다(체크아웃과 파이썬 설치뿐). 뒤의 모든 스텝이 skip 출력을 따른다.
+    # 타이밍 요약만 실패한 run 에서도 돌지만 건너뛴 run 에서는 돌지 않는다.
+    assert [str(s["uses"]).split("@")[0] for s in before] == ["actions/checkout", "actions/setup-python"]
+    assert after and all(cond in (BAND_GUARD_SKIP, f"always() && {BAND_GUARD_SKIP}") for cond in conditions.values()), conditions
+    assert [name for name, cond in conditions.items() if cond.startswith("always()")] == ["Step timings"]
+
+
+def test_band_guard_step_reads_public_data_only_and_passes_mode_and_force_to_the_script(band):
+    # Arrange
+    guard = next(s for _j, _i, s in all_steps(band) if s.get("id") == "guard")
+
+    # Act / Assert — 토큰 없이 공개 URL 만 읽는다. 조회 실패는 스크립트가 경고만 남기고 "실행" 으로 판정한다(test_band_guard.py)
+    assert "if" not in guard and not guard.get("continue-on-error")
+    assert not secrets_in(guard)
+    assert guard["env"] == {"FORCE": "${{ inputs.force || false }}"}  # workflow_run · schedule 에서는 입력이 비어 false 가 된다
+    assert logical_lines(guard["run"]) == ["set -euo pipefail", 'python3 scripts/ml/band_guard.py check --mode "$PUBLISH_MODE" --force "$FORCE"']
+
+
+def test_band_wheel_read_token_exists_only_in_the_wheel_fetch_step_of_the_infer_job(band):
+    # Arrange / Act
+    holders = [(j, s.get("id")) for j, _i, s in all_steps(band) if any(k.startswith(WHEEL_SECRET_PREFIX) for k in (s.get("env") or {}))]
+    names = {n for _j, _i, s in all_steps(band) for n in secrets_in(s) if n.startswith(WHEEL_SECRET_PREFIX)}
+
+    # Assert — 읽기 토큰은 한 스텝에만, 발행 잡에는 없다
+    assert holders == [("infer", "wheel")]
+    assert names == {"HF_MODELS_READ", "HF_MODELS_REPO"}
+
+
+def test_band_write_token_exists_only_in_the_publish_step_that_runs_the_publisher(band):
+    # Arrange / Act
+    holders = [(j, s.get("name")) for j, _i, s in all_steps(band) if WRITE_SECRET in (s.get("env") or {})]
+
+    # Assert — infer 잡(서드파티 의존성 + 비공개 wheel 실행)에는 쓰기 토큰이 없다. 워크플로가 쓰는 시크릿은 이 셋뿐이다
+    assert holders == [("publish", "Publish band")]
+    assert "hf_publish.py" in _named_step(band, "Publish band")["run"]
+    assert WRITE_SECRET not in json.dumps(jobs(band)["infer"], default=str)
+    assert secrets_in(band) == {"HF_MODELS_READ", "HF_MODELS_REPO", WRITE_SECRET}
+
+
+def test_band_publish_job_has_no_wheel_and_infer_job_has_no_publisher(band):
+    # Arrange
+    publish_text = json.dumps(jobs(band)["publish"], ensure_ascii=False, default=str)
+    infer_text = json.dumps(jobs(band)["infer"], ensure_ascii=False, default=str)
+
+    # Act / Assert
+    for forbidden in ("fetch_inference_wheel", "run_entry.py", "requirements-band", "airlens-band", "HF_MODELS_"):
+        assert forbidden not in publish_text
+    for forbidden in ("hf_publish.py", "publish_targets.py", WRITE_SECRET):
+        assert forbidden not in infer_text
+
+
+def test_band_pins_are_exact_never_latest_and_the_same_wheel_as_predict(band, predict):
+    # Arrange
+    env, predict_env = band["env"], predict["env"]
+
+    # Act / Assert
+    assert SHA256_RE.fullmatch(str(env["INFERENCE_WHEEL_SHA256"]))
+    assert VERSION_RE.fullmatch(str(env["INFERENCE_VERSION"]))
+    assert "latest" not in json.dumps(env).lower()
+    # 같은 wheel 이라 핀을 함께 바꾼다(워크플로 머리 주석). 따로 가려면 이 단언을 고치고 이유를 남긴다 — band 쪽은 새 wheel 의
+    # `[band]` 폐포와 pip check 허용 목록을 다시 확인해야 한다
+    assert (env["INFERENCE_VERSION"], env["INFERENCE_WHEEL_SHA256"]) == (predict_env["INFERENCE_VERSION"], predict_env["INFERENCE_WHEEL_SHA256"])
+
+
+def test_band_wheel_fetch_uses_the_pins_and_exports_the_wheel_path(band):
+    # Arrange
+    step = next(s for _j, _i, s in all_steps(band) if s.get("id") == "wheel")
+
+    # Act
+    line = " ".join(logical_lines(step["run"]))
+
+    # Assert
+    assert "fetch_inference_wheel.py" in line
+    assert '--version "$INFERENCE_VERSION"' in line and '--sha256 "$INFERENCE_WHEEL_SHA256"' in line
+    assert _named_step(band, "Install inference wheel (no deps)")["env"]["WHEEL"] == "${{ steps.wheel.outputs.wheel }}"
+
+
+def test_band_install_steps_are_three_hash_pinned_binary_only_uncached_installs_in_order(band):
+    # Arrange
+    infer = steps(jobs(band)["infer"])
+    installs = [(i, line) for i, s in enumerate(infer) for line in logical_lines(s.get("run", "")) if "pip install" in line]
+    torch_at, torch = next((i, line) for i, line in installs if "requirements-band-torch.lock.txt" in line)
+    wheel_at, wheel = next((i, line) for i, line in installs if '"$WHEEL"' in line)
+    deps_at, deps = next((i, line) for i, line in installs if "requirements-band.lock.txt" in line)
+
+    # Act / Assert — CPU torch → 추론 wheel(--no-deps) → 나머지 폐포. 세 줄뿐이고 모두 캐시 없이, wheel 의 기본 의존성(xgboost 등)을 끌어오지 않는다
+    assert len(installs) == 3
+    assert torch_at < wheel_at < deps_at
+    assert all("--no-cache-dir" in line and "--no-deps" in line for _i, line in installs)
+    for line in (torch, deps):
+        assert "--require-hashes" in line and "--only-binary :all:" in line
+    # CPU 인덱스는 torch 한 줄에만 있다 — 다른 설치는 PyPI 만 본다(인덱스를 섞으면 같은 이름의 다른 패키지를 받을 수 있다)
+    assert "--index-url https://download.pytorch.org/whl/cpu" in torch
+    assert not any(flag in line for line in (wheel, deps) for flag in ("--index-url", "--extra-index-url", "--find-links"))
+    assert not re.search(r"--extra-index-url|PIP_(EXTRA_)?INDEX_URL|PIP_FIND_LINKS|PIP_TRUSTED_HOST", json.dumps(band, default=str))
+    # venv 는 첫 설치 스텝이 만든다(뒤 스텝은 모두 그 안의 python 을 쓴다)
+    torch_step = logical_lines(infer[torch_at]["run"])
+    assert 'python3 -m venv "$VENV"' in torch_step and torch_step.index('python3 -m venv "$VENV"') < torch_step.index(torch)
+
+
+def test_band_environment_is_verified_after_the_last_install_and_before_inference(band):
+    # Arrange
+    infer = steps(jobs(band)["infer"])
+    verify_at = next(i for i, s in enumerate(infer) if s.get("name") == BAND_VERIFY_STEP)
+    last_install = max(i for i, s in enumerate(infer) if "pip install" in s.get("run", ""))
+    first_inference = min(i for i, s in enumerate(infer) if any(name in s.get("run", "") for name in BAND_CONSOLE_SCRIPTS))
+    lines = logical_lines(infer[verify_at]["run"])
+    pip_check = next(line for line in lines if "-m pip check" in line)
+    judge = next(line for line in lines if "check_band_env.py" in line)
+
+    # Act / Assert — GPU 스택(nvidia-*, cuda-*, triton)과 CPU 빌드 torch 는 설치가 끝난 뒤, 추론을 돌리기 전에 본다
+    assert last_install < verify_at < first_inference
+    assert not infer[verify_at].get("continue-on-error")
+    # `pip check` 의 종료 코드만 삼키고(남는 줄의 판정은 check_band_env.py 가 한다) 판정 줄과 그 밖의 줄에는 || true 가 없다
+    assert [line for line in lines if "|| true" in line] == [pip_check]
+    assert "|| true" not in judge
+    assert any("pip list --format=freeze" in line for line in lines)
+    # 판정은 설치된 torch 가 보고한 값으로 한다 — 현재 폴더의 torch.py 가 아니라 설치된 것을 읽도록 격리 모드(-I)로
+    assert any(line.startswith('TORCH_CUDA=$("$VENV/bin/python" -I -c ') and "torch.version.cuda" in line for line in lines)
+    assert '--torch-cuda "$TORCH_CUDA"' in judge
+
+
+def test_band_commands_run_through_run_entry_in_the_venv_in_isolated_unbuffered_mode(band):
+    # Arrange
+    found = _band_commands(band)
+
+    # Act / Assert — 한 번씩, 이 순서로, infer 잡에서. 실패해도 비공개 코드 줄이 공개 로그에 남지 않게 run_entry 를 거친다
+    # (traceback 에서 프레임·소스 줄 제거). 작업 폴더(러너 임시 폴더 밑)로 옮겨서 돌린다.
+    assert [(j, name) for j, name, _line in found] == [("infer", name) for name in BAND_CONSOLE_SCRIPTS]
+    for _job, name, line in found:
+        runner, command, _flags = band_command(line)
+        assert runner == ["$VENV/bin/python", "-I", "-u", "$GITHUB_WORKSPACE/scripts/ml/run_entry.py"], line
+        assert command == name
+        lines = next(logical_lines(script) for _j, _i, script in run_scripts(band) if line in logical_lines(script))
+        assert 'cd "$WORK"' in lines and lines.index('cd "$WORK"') < lines.index(line)
+
+
+def test_band_commands_pass_every_path_flag_explicitly_and_nothing_else(band):
+    # Arrange
+    commands = {name: band_command(line) for _j, name, line in _band_commands(band)}
+
+    # Act / Assert — 경로 플래그를 하나라도 빼면 기본 경로에 기대게 된다. 값은 모두 준비 스텝이 정한 폴더(러너 임시 폴더 밑)
+    # 아래다. `--issues-limit` 같은 스모크 전용 플래그와 그 밖의 플래그는 없다.
+    assert set(commands) == set(BAND_CONSOLE_SCRIPTS)
+    for name, (_runner, _command, flags) in commands.items():
+        expected = BAND_CLI_FLAGS[name]
+        assert set(flags) == set(expected), (name, flags)
+        for flag, folder in expected.items():
+            assert re.fullmatch(rf"\${folder}(/[^/\s]+)?", flags[flag]), (name, flag, flags[flag])
+
+
+def test_band_prepare_step_defines_every_work_folder_under_the_runner_temp_directory(tmp_path, band):
+    # Arrange
+    runner, github_env = tmp_path / "runner", tmp_path / "github.env"
+
+    # Act — 스텝을 실제로 돌려 GITHUB_ENV 에 쓴 변수와 만든 폴더를 본다
+    proc = run_step(tmp_path, band, "Prepare directories", {"RUNNER_TEMP": str(runner), "GITHUB_ENV": str(github_env)})
+
+    # Assert — 체크아웃(작업 공간) 밖이라 artifact·커밋에 딸려 가지 않는다. 뒤 스텝이 쓰는 변수가 모두 여기서 정해지고,
+    # 엔진·페이로드 스텝이 mkdir 없이 쓰는 폴더는 미리 만들어져 있다
+    assert proc.returncode == 0, proc.stderr
+    defined = dict(line.split("=", 1) for line in github_env.read_text(encoding="utf-8").splitlines())
+    assert set(defined) == {"WORK", "VENV", "WHEEL_DIR", "STAGE", "CACHE_DIR", "OUT_DIR", "TIMINGS"}
+    assert all(Path(value).is_relative_to(runner) for value in defined.values()), defined
+    assert all(Path(defined[key]).is_dir() for key in ("WORK", "STAGE", "CACHE_DIR", "OUT_DIR"))
+    assert Path(defined["TIMINGS"]).is_file() and Path(defined["TIMINGS"]).stat().st_size == 0
+    assert Path(defined["STAGE"]) == runner / "stage"  # 업로드 스텝의 path(`runner.temp`/stage)와 같은 폴더
+
+
+def test_band_only_the_payload_json_is_staged_and_uploaded(band):
+    # Arrange
+    uploads = [s for _j, _i, s in all_steps(band) if str(s.get("uses", "")).startswith("actions/upload-artifact")]
+    downloads = [s["with"]["name"] for _j, _i, s in all_steps(band) if str(s.get("uses", "")).startswith("actions/download-artifact")]
+    stage_lines = [line for _j, _i, script in run_scripts(band) for line in logical_lines(script) if "$STAGE" in line and not line.startswith("ls ")]
+
+    # Act
+    [upload] = uploads
+    upload_path = str(upload["with"]["path"])
+
+    # Assert — 업로드하는 폴더(STAGE)에 쓰는 줄은 페이로드 JSON 한 개를 내는 명령뿐이다. 발행 잡이 받는 이름이 같다
+    assert downloads == [upload["with"]["name"]]
+    assert upload_path == "${{ runner.temp }}/stage"
+    assert len(stage_lines) == 1 and stage_lines[0].endswith('--out "$STAGE/forecast_band_latest.json"') and "airlens-band-publish" in stage_lines[0]
+    assert not re.search(r"wheel|venv|\.whl|\.log|lock|cache|parquet|work", upload_path, re.IGNORECASE)
+    assert upload["with"].get("if-no-files-found") == "error"
+    assert 0 < int(upload["with"]["retention-days"]) <= 7
+
+
+def test_band_publish_uses_the_mapping_script_for_the_destination_and_validates_before_upload(band):
+    # Arrange
+    lines = [line for j, _i, script in run_scripts(band) if j == "publish" for line in logical_lines(script)]
+
+    # Act
+    batch = [line for line in lines if "hf_publish.py batch" in line]
+    maps = [line for line in lines if "publish_targets.py maps" in line]
+
+    # Assert — 목적지 경로를 워크플로에 손으로 적지 않는다(모드에 따라 publish_targets.py 가 정한다). 계약 검증은 올리기 전에 끝나고,
+    # 올리다 실패하면 run 이 실패한다
+    assert len(batch) == 1 and "--schema auto" in batch[0]
+    assert '|| { echo "::error::' in batch[0] and "exit 1" in batch[0]
+    assert len(maps) == 1 and "--group band" in maps[0] and '--mode "$PUBLISH_MODE"' in maps[0]
+    assert all("aq-data/" not in line for _j, _i, script in run_scripts(band) for line in logical_lines(script)), "목적지 경로가 워크플로에 하드코딩됐다"
+
+
+def test_band_production_snapshot_has_no_secrets_and_is_taken_before_the_publish(band):
+    # Arrange
+    publish = steps(jobs(band)["publish"])
+    names = [s.get("name") for s in publish]
+    snapshot = _named_step(band, "Snapshot production latest (candidate only)")
+
+    # Act / Assert — 공개 URL 읽기라 토큰이 없고, 발행 스텝보다 앞에서 돈다
+    assert names.index(snapshot["name"]) < names.index("Publish band")
+    assert not secrets_in(snapshot) and not snapshot.get("continue-on-error")
+
+
+def test_band_publish_job_installs_only_the_hash_locked_file_and_checks_the_environment_after(band):
+    # Arrange
+    lines = [line for j, _i, script in run_scripts(band) if j == "publish" for line in logical_lines(script)]
+    install_step = next(s for j, _i, s in all_steps(band) if j == "publish" and "requirements-publish.lock.txt" in s.get("run", ""))
+
+    # Act
+    installs = [line for line in lines if re.search(r"\binstall\b", line)]
+
+    # Assert — 쓰기 토큰이 있는 잡: 설치는 해시 고정본 한 줄뿐이고(ml-predict 와 같은 파일), 설치 스텝에는 토큰이 없다
+    assert len(installs) == 1, installs
+    for flag in ("--require-hashes", "--no-deps", "--only-binary :all:", "--no-cache-dir"):
+        assert flag in installs[0]
+    assert installs[0].endswith(f"-r {PUBLISH_LOCK.relative_to(ROOT).as_posix()}")
+    assert lines.index(installs[0]) < lines.index("python3 -m pip check")
+    assert not secrets_in(install_step)
+
+
+def test_band_checkouts_do_not_persist_credentials_and_never_check_out_an_event_ref(band):
+    # Arrange
+    checkouts = [s for _j, _i, s in all_steps(band) if str(s.get("uses", "")).startswith("actions/checkout")]
+
+    # Act / Assert — `with` 가 이것뿐이라 ref·repository 를 바꿀 수 없다(workflow_run 이벤트의 브랜치·SHA 는 외부가 정할 수 있다)
+    assert len(checkouts) == 2
+    assert all(s.get("with") == {"persist-credentials": False} for s in checkouts)
+
+
+def test_band_reads_only_the_conclusion_from_the_workflow_run_event(band):
+    # Arrange
+    text = "\n".join(line for line in (WORKFLOW_DIR / BAND_WORKFLOW).read_text(encoding="utf-8").splitlines() if not line.lstrip().startswith("#"))
+
+    # Act / Assert — 이벤트 payload 의 브랜치·SHA·PR 정보는 앞선 run 을 일으킨 쪽이 정한다. 읽는 값은 성공 여부 하나다
+    assert set(re.findall(r"github\.event\.[A-Za-z0-9_.]+", text)) == {"github.event.workflow_run.conclusion"}
+    assert not re.search(r"github\.(head_ref|base_ref)|github\.event\.pull_request", text)
+
+
+def test_band_python_versions_follow_the_documented_split(band):
+    # Arrange
+    versions = {j: str((s.get("with") or {}).get("python-version")) for j, _i, s in all_steps(band) if str(s.get("uses", "")).startswith("actions/setup-python")}
+
+    # Act / Assert — 추론은 3.12(고정본을 cp312 wheel 해시로 만들었다), 발행기는 기존 워크플로와 같은 3.11
+    assert versions == {"infer": "3.12", "publish": "3.11"}
+
+
+def test_band_run_steps_fail_fast_and_nothing_is_allowed_to_fail_silently(band):
+    # Arrange
+    scripts = [(j, step_name(s, i), s) for j, i, s in all_steps(band) if "run" in s]
+
+    # Act / Assert
+    assert scripts
+    for job_id, name, step in scripts:
+        assert logical_lines(step["run"])[0] == "set -euo pipefail", f"{job_id}:{name}"
+        assert "continue-on-error" not in step, f"{job_id}:{name}"
+
+
+class _Parsed(Exception):
+    """스크립트의 인자 파서가 argv 를 받아들였다는 신호 — 파싱 직후에 멈춰서 스크립트가 일을 하지 않는다."""
+
+
+def parse_only(monkeypatch, main, argv: list[str]) -> argparse.Namespace:
+    """스크립트의 진짜 파서로 argv 를 읽는다. 받아들이면 그 Namespace 를, 거부하면 시험을 실패시킨다."""
+    def stop_after_parsing(self, args=None, namespace=None):
+        raise _Parsed(_REAL_PARSE_ARGS(self, args, namespace))
+
+    monkeypatch.setattr(argparse.ArgumentParser, "parse_args", stop_after_parsing)
+    try:
+        main(argv)
+    except _Parsed as parsed:
+        return parsed.args[0]
+    except SystemExit as exc:
+        pytest.fail(f"스크립트가 인자를 받아들이지 않는다: {argv} (exit {exc.code})")
+    pytest.fail(f"인자 파서를 거치지 않았다: {argv}")
+
+
+def workflow_args(doc: dict, marker: str) -> list[str]:
+    """`marker` 가 든 run 줄(정확히 하나)에서 그 뒤의 인자를 셸처럼 쪼갠다. 변수는 워크플로 env 값으로, 그 밖에는 자리표시로 바꾼다."""
+    lines = [line for _j, _i, script in run_scripts(doc) for line in logical_lines(script) if marker in line]
+    assert len(lines) == 1, (marker, lines)
+    values = {key: str(value) for key, value in (doc.get("env") or {}).items()}
+    values.update(FORCE="false", TORCH_CUDA="None", RUNNER_TEMP="/runner/temp", WORK="/runner/work", PUB="/runner/pub")
+    tail = lines[0].split(marker, 1)[1].rstrip(")")  # `OUT=$(... )` 꼴의 닫는 괄호
+    return shlex.split(re.sub(r"\$\{?([A-Za-z_][A-Za-z0-9_]*)\}?", lambda m: values.get(m.group(1), "placeholder"), tail))
+
+
+def test_band_workflow_arguments_are_accepted_by_the_scripts_they_call(band, monkeypatch):
+    # Arrange / Act — 스크립트의 진짜 파서로 읽는다. 플래그 오타·빠진 필수 인자는 그대로 두면 첫 hosted run 에서야 드러난다.
+    check = parse_only(monkeypatch, band_guard.main, ["check", *workflow_args(band, "band_guard.py check")])
+    snapshot = parse_only(monkeypatch, band_guard.main, ["snapshot", *workflow_args(band, "band_guard.py snapshot")])
+    env_check = parse_only(monkeypatch, check_band_env.main, workflow_args(band, "check_band_env.py"))
+    maps = parse_only(monkeypatch, publish_targets.main, ["maps", *workflow_args(band, "publish_targets.py maps")])
+
+    # Assert
+    mode = band["env"]["PUBLISH_MODE"]
+    assert (check.mode, check.force) == (mode, "false")
+    assert (snapshot.mode, maps.mode, maps.group) == (mode, mode, "band")
+    assert snapshot.dest == maps.prod_snapshot  # 내려받은 사본을 발행 매핑이 같은 파일로 읽는다
+    assert (env_check.project, env_check.version) == ("airlens-inference", band["env"]["INFERENCE_VERSION"])
+    assert env_check.allow_missing == band["env"]["BAND_SKIPPED_BASE_DEPS"]
+    assert check_band_env.parse_allow_missing(env_check.allow_missing)  # 비거나 빈 항목이 아니다
+
+
+@pytest.mark.skipif(shutil.which("awk") is None, reason="awk 가 없다")
+def test_band_step_timings_summarize_the_recorded_steps_in_the_run_summary(tmp_path, band):
+    # Arrange
+    timings, summary = tmp_path / "timings.tsv", tmp_path / "summary.md"
+    timings.write_text("wheel fetch\t12\nband engine\t1800\n", encoding="utf-8")
+
+    # Act
+    proc = run_step(tmp_path, band, "Step timings", {"TIMINGS": str(timings), "GITHUB_STEP_SUMMARY": str(summary)})
+
+    # Assert — 컷오버 조건(hosted 합계 35분 미만 3회 이상)을 run 요약에서 바로 읽는다
+    text = summary.read_text(encoding="utf-8")
+    assert proc.returncode == 0, proc.stderr
+    table = [line for line in text.splitlines() if line.startswith("|")]
+    assert table == ["| step | seconds |", "|---|---|", "| wheel fetch | 12 |", "| band engine | 1800 |"]  # 머리글·구분선이 없으면 표로 그려지지 않는다
+    assert "recorded steps: 1812 s (30.2 min)" in text and "35 min" in text
+
+
+@pytest.mark.skipif(shutil.which("awk") is None, reason="awk 가 없다")
+@pytest.mark.parametrize("records", ["unset", "missing-file", "empty-file"])
+def test_band_step_timings_without_records_exit_zero_and_write_no_summary(tmp_path, band, records):
+    # Arrange — guard 가 실패했거나 첫 스텝에서 죽어 기록이 없는 run: 요약 스텝이 run 을 더 망가뜨리지 않는다
+    summary, timings = tmp_path / "summary.md", tmp_path / "timings.tsv"
+    env = {"GITHUB_STEP_SUMMARY": str(summary)}
+    if records != "unset":
+        env["TIMINGS"] = str(timings)
+    if records == "empty-file":
+        timings.write_text("", encoding="utf-8")
+
+    # Act
+    proc = run_step(tmp_path, band, "Step timings", env)
+
+    # Assert
+    assert proc.returncode == 0, proc.stderr
+    assert "기록된 스텝 시간이 없다" in proc.stdout
+    assert not summary.exists()
+
+
 # ── D. 환경 고정 파일 ────────────────────────────────────────────────────────
-def _constraint_pins() -> dict[str, str]:
+BAND_CONSTRAINTS = ML_DIR / "constraints-band.txt"
+BAND_TORCH_LOCK = ML_DIR / "requirements-band-torch.lock.txt"  # CPU torch 한 줄 — PyTorch CPU 인덱스에서만 받는다
+BAND_LOCK = ML_DIR / "requirements-band.lock.txt"  # 나머지 — PyPI
+
+
+def _constraint_pins(constraints: Path = ML_DIR / "constraints-predict.txt") -> dict[str, str]:
     pins = {}
-    for line in (ML_DIR / "constraints-predict.txt").read_text(encoding="utf-8").splitlines():
+    for line in constraints.read_text(encoding="utf-8").splitlines():
         line = line.strip()
         if not line or line.startswith("#"):
             continue
@@ -956,7 +1473,43 @@ def test_constraints_and_hash_lock_pin_the_same_versions():
     assert pins == lock
 
 
-@pytest.mark.parametrize(("lock", "minimum"), [(PREDICT_LOCK, 15), (PUBLISH_LOCK, 10)], ids=["predict", "publish"])
+def test_band_constraints_split_exactly_into_the_cpu_torch_lock_and_the_pypi_lock():
+    # Arrange
+    pins = {f"{name}=={version}" for name, version in _constraint_pins(BAND_CONSTRAINTS).items()}
+
+    # Act
+    torch_lock, pypi_lock = set(_lock_entries(BAND_TORCH_LOCK)), set(_lock_entries(BAND_LOCK))
+
+    # Assert — 한쪽만 올리면 여기서 걸린다. torch 는 CPU 빌드(`+cpu`) 한 줄이고 PyPI 쪽 lock 에는 없다(PyPI 의 torch 는 CUDA 패키지를 끌어온다)
+    assert len(torch_lock) == 1 and next(iter(torch_lock)).startswith("torch==") and next(iter(torch_lock)).endswith("+cpu")
+    assert not any(entry.startswith("torch==") for entry in pypi_lock)
+    assert not torch_lock & pypi_lock
+    assert pins == torch_lock | pypi_lock
+
+
+def test_band_closure_has_no_gpu_stack_package():
+    # Arrange / Act
+    names = set(_constraint_pins(BAND_CONSTRAINTS)) | {entry.partition("==")[0] for lock in (BAND_TORCH_LOCK, BAND_LOCK) for entry in _lock_entries(lock)}
+
+    # Assert — xgboost·PyPI 의 torch 가 끌어오는 CUDA 계열이 고정본에 들어오면 GPU 없는 러너에 수 GB 가 깔린다
+    assert not [name for name in names if name.startswith(("nvidia-", "cuda-")) or name == "triton"]
+
+
+def test_band_pip_check_allow_list_is_exactly_the_base_dependencies_the_closure_leaves_out(band):
+    # Arrange
+    allowed = set(band["env"]["BAND_SKIPPED_BASE_DEPS"].split(","))
+
+    # Act / Assert — 0.3.0 wheel 을 실측한 6개다(wheel 핀을 올리면 다시 잰다). 설치되는 패키지는 pip check 에 "미설치" 로 나오지 않으므로
+    # 고정본에 있는 이름은 허용 목록에 없어야 하고, 허용 목록이 실측보다 넓으면 정말 빠진 의존성이 숨는다
+    assert allowed == PIP_EXPECTED_MISSING
+    assert not allowed & set(_constraint_pins(BAND_CONSTRAINTS))
+
+
+@pytest.mark.parametrize(
+    ("lock", "minimum"),
+    [(PREDICT_LOCK, 15), (PUBLISH_LOCK, 10), (BAND_TORCH_LOCK, 1), (BAND_LOCK, 25)],
+    ids=["predict", "publish", "band-torch", "band"],
+)
 def test_every_lock_entry_has_sha256_hashes_and_nothing_can_redirect_the_index(lock, minimum):
     # Arrange
     entries = _lock_entries(lock)
@@ -1006,9 +1559,10 @@ def test_publish_step_installing_the_lock_has_no_secrets(predict):
     assert not secrets_in(step)
 
 
-def test_constraints_have_no_range_specifiers():
+@pytest.mark.parametrize("constraints", [ML_DIR / "constraints-predict.txt", BAND_CONSTRAINTS], ids=["predict", "band"])
+def test_constraints_have_no_range_specifiers(constraints):
     # Arrange
-    text = (ML_DIR / "constraints-predict.txt").read_text(encoding="utf-8")
+    text = constraints.read_text(encoding="utf-8")
     code = [line for line in text.splitlines() if line.strip() and not line.lstrip().startswith("#")]
 
     # Act / Assert
@@ -1059,6 +1613,7 @@ def hygiene_findings(text: str, *, check_ips: bool = True) -> list[tuple[str, st
 def public_files() -> list[Path]:
     files = [
         WORKFLOW_DIR / "ml-predict.yml",
+        WORKFLOW_DIR / BAND_WORKFLOW,
         WORKFLOW_DIR / "predictions-freshness-healthcheck.yml",
         ROOT / "scripts" / "etl" / "probe_predictions_freshness.py",
         ROOT / "scripts" / "etl" / "test_probe_predictions_freshness.py",
@@ -1088,7 +1643,10 @@ def test_the_hygiene_scan_covers_the_expected_files():
     assert {"ml-predict.yml", "predictions-freshness-healthcheck.yml", "probe_predictions_freshness.py",
             "fetch_inference_wheel.py", "run_entry.py", "publish_targets.py", "compare_candidate.py",
             "summarize_predict_log.py", "constraints-predict.txt", "requirements-predict.lock.txt",
-            "requirements-publish.lock.txt", "test_ml_workflow_safety.py"} <= names
+            "requirements-publish.lock.txt", "test_ml_workflow_safety.py",
+            BAND_WORKFLOW, "band_guard.py", "check_band_env.py", "constraints-band.txt",
+            "requirements-band-torch.lock.txt", "requirements-band.lock.txt",
+            "test_band_guard.py", "test_check_band_env.py"} <= names
 
 
 def test_every_allowed_repo_id_is_referenced_by_a_scanned_file():
@@ -1211,9 +1769,9 @@ def test_probe_workflow_does_not_checkout_with_persisted_credentials(probe_workf
     assert checkout["with"]["persist-credentials"] is False
 
 
-# 감시 대상 중 이 레포에 아직 없는 것. 예측 밴드 발행(band-forecast.yml)이 이 레포로 옮겨 오기 전까지만 "미배포" 로 읽혀도 정상이다.
-# 그 변경이 파일을 추가하면서 이 집합에서 뺀다(아래 마지막 시험이 남아 있는 항목을 잡는다).
-PLANNED_WATCHED = {"band-forecast.yml"}
+# 감시 대상 중 이 레포에 아직 없는 것. 감시 목록에 먼저 적고 워크플로 파일을 나중에 옮겨 올 때만 채운다("미배포" 로 읽혀도 정상인 기간).
+# 파일이 생기면 이 집합에서 뺀다(아래 마지막 시험이 남아 있는 항목을 잡는다). 지금은 감시 대상이 모두 이 레포에 있다.
+PLANNED_WATCHED: set[str] = set()
 
 
 def _watched_names(doc: dict) -> list[str]:
@@ -1230,7 +1788,7 @@ def test_watched_workflow_names_are_real_files_or_explicitly_planned(probe_workf
 
     # Assert — 오타·이름 변경이면 영원히 "미배포" 로 읽혀 경보가 안 난다. 아직 없는 파일은 예정 집합에만 허용한다.
     assert not unknown, unknown
-    assert "ml-predict.yml" in names
+    assert {"ml-predict.yml", BAND_WORKFLOW} <= set(names)
     assert len(names) == len(set(names))
 
 
