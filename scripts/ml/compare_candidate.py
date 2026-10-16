@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """후보(`aq-data/_candidate/`)와 운영 발행물을 같은 STAMP 끼리 짝지어 비교한다 (stdlib 전용).
 
-지금은 predictions(grid + DQSS)만 다룬다. 입력은 공개 저장소(토큰 불요) 또는 `--local DIR`(저장소 트리를
-그대로 미러한 디렉터리 — 오프라인·시험용)이다. 비교 판정은 네트워크 없는 순수 함수라 단위 시험으로 고정한다.
+predictions(grid + DQSS, 기본)와 band(예측 밴드, `--product band`)를 다룬다. 입력은 공개 저장소(토큰 불요) 또는
+`--local DIR`(저장소 트리를 그대로 미러한 디렉터리 — 오프라인·시험용)이다. 비교 판정은 네트워크 없는 순수 함수라
+단위 시험으로 고정한다.
 
 **엄격 짝** = 같은 STAMP + `observation_slot` + `model_sha` + `model_version` 이 모두 같은 쌍. 입력이 같으니
 출력도 같아야 한다 — 추론 경로에 난수가 없다(난수는 학습 부트스트랩에만 있다). 다만 run 사이에 바뀌는 것이
@@ -19,13 +20,23 @@
     · station_id 집합 동일, |Δfinal_score| ≤ 1 인 지점 ≥ 95%, badge 일치 ≥ 95%
   엄격 짝이 아닌 쌍(INPUT-DIFF)은 계약 통과와 키 겹침(≥ 95%)만 **보고**한다. 계약 위반은 FAIL 이다.
 
+band — 후보 `_candidate/forecast-band/history/band_<STAMP>` ↔ 같은 STAMP 의 운영 사본 `_candidate/forecast-band/prod/`
+(운영 band 는 latest 하나만 덮어써서 이력이 없다. 후보 잡이 그 시점 운영 latest 를 옮겨 둔다). STAMP = 발행물 `issue_time` 의
+UTC 시. 값은 도시·지평(lead_hours) 셀 단위로 비교한다.
+  엄격 짝 = `issue_time`(시각으로 비교) · `model` · 지평별 `n_holdout`(uncertainty.picp80_claim_by_horizon) 이 모두 같은 쌍.
+  `n_holdout` 이 다르면 보정(CQR) 표본이 달라 p10/p90 이 정당하게 달라지므로 엄격 비교하지 않는다(INPUT-DIFF).
+    · 도시 집합 동일, 도시별 지평 집합 동일, 키 중복 없음 (필수)
+    · p10/p50/p90 |Δ| ≤ 0.01 인 셀 ≥ 95%, 지평별 최대 |Δ| ≤ 0.5   (p50 은 반올림 없이 float 로 나온다)
+  이 값은 첫 엄격 짝을 본 뒤 보정한다. 계약 위반은 INPUT-DIFF 여도 FAIL 이다.
+
 판정: PASS / FAIL / INPUT-DIFF(입력이 달라 엄격 비교 불가) / UNPAIRED(한쪽에 파일 없음).
-종료 코드: 0 = FAIL 없음 + 엄격 PASS ≥ 최소(기본 3) / 1 = FAIL 있음 / 2 = 엄격 PASS 부족 또는 읽기 실패.
+종료 코드: 0 = FAIL 없음 + 엄격 PASS ≥ 최소(predictions 3, band 2) / 1 = FAIL 있음 / 2 = 엄격 PASS 부족 또는 읽기 실패.
 
 사용:
     python3 scripts/ml/compare_candidate.py                    # 공개 저장소의 후보 전부
     python3 scripts/ml/compare_candidate.py --since 2026-10-16 --json
     python3 scripts/ml/compare_candidate.py --local DIR --min-strict-pairs 1
+    python3 scripts/ml/compare_candidate.py --product band
 """
 from __future__ import annotations
 
@@ -42,6 +53,7 @@ import urllib.error
 import urllib.request
 from collections.abc import Callable
 from dataclasses import asdict, dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Protocol
 
@@ -53,6 +65,8 @@ PROD_GRID_DIR = "aq-data/predictions/history"
 CAND_GRID_DIR = "aq-data/_candidate/predictions/history"
 PROD_QUALITY_DIR = "aq-data/quality-history"
 CAND_QUALITY_DIR = "aq-data/_candidate/quality-history"
+CAND_BAND_DIR = "aq-data/_candidate/forecast-band/history"
+PROD_BAND_DIR = "aq-data/_candidate/forecast-band/prod"  # 운영 band 는 latest 만 있어서 후보 잡이 옮겨 둔 사본
 
 # ── 판정 기준 ────────────────────────────────────────────────────────────────
 STRICT_ID_FIELDS = ("observation_slot", "model_sha", "model_version")
@@ -69,6 +83,13 @@ DQSS_BADGE_FRACTION = 0.95
 OVERLAP_FRACTION = 0.95  # 엄격 짝이 아닐 때 보고하는 키 겹침 기준
 MIN_STRICT_PAIRS = 3
 EPS = 1e-9  # 0.1 의 부동소수 오차
+
+# band — 첫 엄격 짝을 본 뒤 보정한다
+BAND_QUANTILES = ("p10", "p50", "p90")
+BAND_TOL = 1e-2  # p50 은 CQR 전 값이 float 그대로 나온다(반올림 없음). 연산 장치가 다르면 미세하게 달라질 수 있다
+BAND_TOL_FRACTION = 0.95
+BAND_MAX = 0.5
+MIN_STRICT_PAIRS_BY_PRODUCT = {"predictions": MIN_STRICT_PAIRS, "band": 2}
 
 WORST_ROWS = 10
 STAMP_RE = re.compile(r"\d{10}")
@@ -305,6 +326,157 @@ def classify_pair(
     return PairResult(stamp, FAIL if reasons else PASS, True, reasons, checks, max_delta, worst)
 
 
+# ── band 판정 ────────────────────────────────────────────────────────────────
+def _instant(value: object) -> datetime | None:
+    """ISO 시각 문자열 → UTC 시각. 모양이 틀리면 None. 오프셋이 없으면 UTC 로 본다(`Z` 와 `+00:00` 은 같은 시각이다)."""
+    if not isinstance(value, str) or not value.strip():
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return parsed.astimezone(timezone.utc) if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+
+
+def _holdout_counts(payload: dict) -> dict[str, int] | None:
+    """지평(문자열 키) → n_holdout. 하나라도 정수가 아니거나 비어 있으면 None(같다고 말할 수 없다)."""
+    uncertainty = payload.get("uncertainty")
+    claims = uncertainty.get("picp80_claim_by_horizon") if isinstance(uncertainty, dict) else None
+    if not isinstance(claims, dict) or not claims:
+        return None
+    counts: dict[str, int] = {}
+    for horizon, claim in claims.items():
+        n = claim.get("n_holdout") if isinstance(claim, dict) else None
+        if isinstance(n, bool) or not isinstance(n, int):
+            return None
+        counts[str(horizon)] = n
+    return counts
+
+
+def band_identity_mismatches(prod: dict, cand: dict) -> list[str]:
+    """엄격 짝 조건 중 서로 다른 항목 이름. 비면 엄격 짝. 값이 없거나 읽을 수 없으면 다른 것으로 센다."""
+    out = []
+    p_issue, c_issue = _instant(prod.get("issue_time")), _instant(cand.get("issue_time"))
+    if p_issue is None or c_issue is None or p_issue != c_issue:
+        out.append("issue_time")
+    if prod.get("model") != cand.get("model"):
+        out.append("model")
+    p_counts, c_counts = _holdout_counts(prod), _holdout_counts(cand)
+    if p_counts is None or p_counts != c_counts:
+        out.append("n_holdout")
+    return out
+
+
+def _band_cells(payload: dict) -> tuple[dict[tuple, dict], int]:
+    """(도시, lead_hours) → 지평 행. 두 번째 값은 중복으로 덮인 셀 수. 모양이 다른 항목은 건너뛴다(계약 검사가 따로 잡는다)."""
+    cells: dict[tuple, dict] = {}
+    total = 0
+    cities = payload.get("cities")
+    for city in cities if isinstance(cities, list) else []:
+        horizons = city.get("horizons") if isinstance(city, dict) else None
+        for horizon in horizons if isinstance(horizons, list) else []:
+            if isinstance(horizon, dict):
+                total += 1
+                cells[(city.get("name"), horizon.get("lead_hours"))] = horizon
+    return cells, total - len(cells)
+
+
+def _leads_by_city(cells: dict[tuple, dict]) -> dict[object, set]:
+    out: dict[object, set] = {}
+    for city, lead in cells:
+        out.setdefault(city, set()).add(lead)
+    return out
+
+
+def compare_band(prod: dict, cand: dict) -> tuple[list[Check], dict[str, float], list[dict]]:
+    """엄격 짝의 band 비교. (checks, 분위수별 최대 |Δ|, 실패 셀 상위)."""
+    p_cells, p_dups = _band_cells(prod)
+    c_cells, c_dups = _band_cells(cand)
+    p_leads, c_leads = _leads_by_city(p_cells), _leads_by_city(c_cells)
+
+    only_prod, only_cand = set(p_leads) - set(c_leads), set(c_leads) - set(p_leads)  # 개수만 쓴다(키에 None·str 이 섞여도 정렬하지 않는다)
+    checks = [Check("도시 집합", f"운영 {len(p_leads)} / 후보 {len(c_leads)} (운영만 {len(only_prod)}, 후보만 {len(only_cand)})",
+                    not only_prod and not only_cand)]
+    differing = [city for city in set(p_leads) & set(c_leads) if p_leads[city] != c_leads[city]]
+    checks.append(Check("지평 집합", f"도시별 지평이 다른 도시 {len(differing)}곳", not differing))
+    checks.append(Check("키 중복", f"운영 {p_dups} / 후보 {c_dups}", p_dups == 0 and c_dups == 0))
+
+    common = sorted(set(p_cells) & set(c_cells), key=repr)
+    if not common:
+        checks.append(Check("비교할 셀", "공통 셀 없음", False))
+        return checks, {}, []
+
+    deltas: dict[str, list[float | None]] = {q: [] for q in BAND_QUANTILES}
+    worst: list[dict] = []
+    within = 0
+    for key in common:
+        cell_ok = True
+        cell_worst: tuple[float, str, object, object] | None = None
+        for q in BAND_QUANTILES:
+            a, b = _num(p_cells[key].get(q)), _num(c_cells[key].get(q))
+            if a is None or b is None:
+                deltas[q].append(None)
+                cell_ok = False
+                cell_worst = (float("inf"), q, _shown(p_cells[key].get(q)), _shown(c_cells[key].get(q)))
+                continue
+            d = abs(a - b)
+            deltas[q].append(d)
+            if d > BAND_TOL + EPS:
+                cell_ok = False
+            if cell_worst is None or d > cell_worst[0]:
+                cell_worst = (d, q, a, b)
+        within += cell_ok
+        if not cell_ok and cell_worst is not None:
+            worst.append({"name": key[0], "field": f"h{key[1]} {cell_worst[1]}", "prod": cell_worst[2], "cand": cell_worst[3],
+                          "abs_delta": None if cell_worst[0] == float("inf") else round(cell_worst[0], 6)})
+    frac = _fraction(within, len(common))
+    checks.append(Check(f"p10/p50/p90 |Δ|≤{BAND_TOL:g}", f"{within}/{len(common)} ({_pct(frac)})", frac >= BAND_TOL_FRACTION))
+
+    max_delta: dict[str, float] = {}
+    for q in BAND_QUANTILES:
+        finite = [d for d in deltas[q] if d is not None]
+        max_delta[q] = round(max(finite), 6) if finite else 0.0
+    unreadable = sum(d is None for q in BAND_QUANTILES for d in deltas[q])
+    over = max(max_delta.values()) > BAND_MAX + EPS or unreadable > 0
+    checks.append(Check(f"최대 |Δ|≤{BAND_MAX}", ", ".join(f"{q} {max_delta[q]}" for q in BAND_QUANTILES)
+                        + (f" (숫자 아님 {unreadable})" if unreadable else ""), not over))
+
+    worst.sort(key=lambda r: (r["abs_delta"] is not None, -(r["abs_delta"] or 0)))
+    return checks, max_delta, worst[:WORST_ROWS]
+
+
+def classify_band_pair(
+    stamp: str,
+    prod: dict | None,
+    cand: dict | None,
+    validate: Callable[[dict], str | None],
+) -> PairResult:
+    """한 STAMP 의 운영 사본·후보 band payload 로 판정한다. validate(payload) 는 계약 위반 설명 또는 None."""
+    if prod is None or cand is None:
+        side = "운영 사본" if prod is None else "후보"
+        return PairResult(stamp, UNPAIRED, False, [f"{side} 쪽 band 파일이 없다"])
+
+    error = validate(cand)
+    diff = band_identity_mismatches(prod, cand)
+    if diff:
+        result = PairResult(stamp, INPUT_DIFF, False, [f"입력이 다르다({', '.join(diff)}) — 엄격 비교 불가"])
+        p_cities, c_cities = {k[0] for k in _band_cells(prod)[0]}, {k[0] for k in _band_cells(cand)[0]}
+        overlap = _fraction(len(p_cities & c_cities), max(len(p_cities), len(c_cities)))
+        low = f" — {_pct(OVERLAP_FRACTION)} 미만" if overlap < OVERLAP_FRACTION else ""
+        result.checks = [
+            Check("후보 계약", error or "통과", error is None),
+            Check("도시 겹침(보고)", _pct(overlap) + low, None),
+        ]
+        if error:
+            result.verdict, result.reasons = FAIL, [f"후보가 계약을 어겼다: {error}"]
+        return result
+
+    checks, max_delta, worst = compare_band(prod, cand)
+    checks.append(Check("후보 계약", error or "통과", error is None))
+    reasons = [f"{c.name}: {c.detail}" for c in checks if c.ok is False]
+    return PairResult(stamp, FAIL if reasons else PASS, True, reasons, checks, max_delta, worst)
+
+
 def parse_since(value: str) -> str:
     """`YYYYMMDDHH` · `YYYYMMDD` · `YYYY-MM-DD` → 10자리 스탬프(이 시각 이후만 비교)."""
     digits = value.replace("-", "")
@@ -313,10 +485,10 @@ def parse_since(value: str) -> str:
     return digits if len(digits) == 10 else digits + "00"
 
 
-def summarize(results: list[PairResult], prod_only: int, min_strict: int) -> dict:
+def summarize(results: list[PairResult], prod_only: int, min_strict: int, quantiles: tuple[str, ...] = QUANTILES) -> dict:
     counts = {v: sum(r.verdict == v for r in results) for v in (PASS, FAIL, INPUT_DIFF, UNPAIRED)}
     strict_pass = sum(r.verdict == PASS and r.strict for r in results)
-    max_delta = {q: max((r.max_delta.get(q, 0.0) for r in results if r.strict), default=0.0) for q in QUANTILES}
+    max_delta = {q: max((r.max_delta.get(q, 0.0) for r in results if r.strict), default=0.0) for q in quantiles}
     code = 1 if counts[FAIL] else (2 if strict_pass < min_strict else 0)
     return {"pairs": len(results), "counts": counts, "strict_pass": strict_pass, "min_strict_pairs": min_strict,
             "prod_only_stamps": prod_only, "max_delta": max_delta, "exit_code": code}
@@ -327,10 +499,10 @@ def _cell(value: object) -> str:
     return str(value).replace("|", "\\|").replace("\n", " ")
 
 
-def render_markdown(results: list[PairResult], summary: dict) -> str:
+def render_markdown(results: list[PairResult], summary: dict, product: str = "predictions") -> str:
     c = summary["counts"]
     lines = [
-        "## 후보 ↔ 운영 비교 (predictions)",
+        f"## 후보 ↔ 운영 비교 ({product})",
         "",
         f"짝 {summary['pairs']}개 — PASS {c[PASS]} · FAIL {c[FAIL]} · INPUT-DIFF {c[INPUT_DIFF]} · UNPAIRED {c[UNPAIRED]}"
         f" (후보 시간대의 운영 STAMP 중 후보 없음 {summary['prod_only_stamps']})",
@@ -474,27 +646,41 @@ def run(source: Source, validate: Callable[[dict], str | None], since: str | Non
             cand_q = source.read_json(f"{CAND_QUALITY_DIR}/quality_{stamp}.json")
         results.append(classify_pair(stamp, prod, cand, prod_q, cand_q, validate))
 
-    # 후보가 돈 시간대(첫 후보 STAMP 이후)에 운영만 있는 STAMP — 후보가 건너뛴 슬롯
-    prod_only = 0
-    if cand_stamps:
-        first, seen = cand_stamps[0], set(cand_stamps)
-        prod_only = len([s for s in source.list_stamps(PROD_GRID_DIR, "grid") if s >= first and s not in seen])
-    return results, summarize(results, prod_only, min_strict)
+    return results, summarize(results, _prod_only_count(source, PROD_GRID_DIR, "grid", cand_stamps), min_strict)
+
+
+def _prod_only_count(source: Source, rel_dir: str, prefix: str, cand_stamps: list[str]) -> int:
+    """후보가 돈 시간대(첫 후보 STAMP 이후)에 운영만 있는 STAMP 수 — 후보가 건너뛴 슬롯."""
+    if not cand_stamps:
+        return 0
+    first, seen = cand_stamps[0], set(cand_stamps)
+    return len([s for s in source.list_stamps(rel_dir, prefix) if s >= first and s not in seen])
+
+
+def run_band(source: Source, validate: Callable[[dict], str | None], since: str | None, min_strict: int) -> tuple[list[PairResult], dict]:
+    cand_stamps = [s for s in source.list_stamps(CAND_BAND_DIR, "band") if since is None or s >= since]
+    results = [classify_band_pair(stamp, source.read_json(f"{PROD_BAND_DIR}/band_{stamp}.json"),
+                                  source.read_json(f"{CAND_BAND_DIR}/band_{stamp}.json"), validate)
+               for stamp in cand_stamps]
+    return results, summarize(results, _prod_only_count(source, PROD_BAND_DIR, "band", cand_stamps), min_strict, BAND_QUANTILES)
 
 
 def main(argv: list[str] | None = None, validate: Callable[[dict], str | None] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--product", default="predictions", choices=["predictions"])
+    parser.add_argument("--product", default="predictions", choices=["predictions", "band"])
     parser.add_argument("--local", type=Path, help="저장소 트리를 미러한 디렉터리 (없으면 공개 저장소를 읽는다)")
     parser.add_argument("--since", help="이 시각 이후 STAMP 만 (YYYYMMDDHH · YYYYMMDD · YYYY-MM-DD)")
-    parser.add_argument("--min-strict-pairs", type=int, default=MIN_STRICT_PAIRS, help="엄격 PASS 최소 수 (기본 %(default)s)")
+    parser.add_argument("--min-strict-pairs", type=int, default=None,
+                        help="엄격 PASS 최소 수 (기본: " + ", ".join(f"{k} {v}" for k, v in MIN_STRICT_PAIRS_BY_PRODUCT.items()) + ")")
     parser.add_argument("--json", action="store_true", help="Markdown 대신 JSON 을 stdout 으로")
     args = parser.parse_args(argv)
 
     try:
         since = parse_since(args.since) if args.since else None
         source: Source = LocalSource(args.local) if args.local else HttpSource()
-        results, summary = run(source, validate or _contract_validator(), since, args.min_strict_pairs)
+        min_strict = args.min_strict_pairs if args.min_strict_pairs is not None else MIN_STRICT_PAIRS_BY_PRODUCT[args.product]
+        runner = run_band if args.product == "band" else run
+        results, summary = runner(source, validate or _contract_validator(), since, min_strict)
     except (ValueError, SourceError) as exc:
         print(f"compare_candidate: {exc}", file=sys.stderr)
         return 2
@@ -503,7 +689,7 @@ def main(argv: list[str] | None = None, validate: Callable[[dict], str | None] |
         print(json.dumps({"product": args.product, "summary": summary, "pairs": [asdict(r) for r in results]},
                          ensure_ascii=False, indent=2))
     else:
-        report = render_markdown(results, summary)
+        report = render_markdown(results, summary, args.product)
         print(report)
         path = os.environ.get("GITHUB_STEP_SUMMARY")
         if path:

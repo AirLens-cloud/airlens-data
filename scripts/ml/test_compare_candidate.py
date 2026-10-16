@@ -13,6 +13,7 @@ import json
 import re
 import ssl
 import urllib.error
+from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
@@ -1237,3 +1238,548 @@ def test_main_uses_the_real_contract_validator_when_none_is_injected(tmp_path, c
     # Assert
     assert code == 1
     assert "후보 계약" in capsys.readouterr().out
+
+
+# ── band: 판정 ───────────────────────────────────────────────────────────────
+BAND_STAMP = "2026101506"
+ISSUE = "2026-10-15T06:00:00+00:00"
+HORIZONS = (1, 6, 24)
+N_HOLDOUT = {"1": 1144, "6": 1146, "24": 469}
+
+
+def band(n_cities: int = 20, **top: object) -> dict:
+    """20 도시 × 3 지평 = 60 셀. 95% 경계(57/60)를 셀 하나 단위로 나눌 수 있는 크기다."""
+    payload = {
+        "schema_version": "w3-band-v1",
+        "generated_at": "2026-10-15T06:40:00+00:00",
+        "model": "timesfm-test + CQR",
+        "issue_time": ISSUE,
+        "cities": [
+            {"name": f"city-{i:02d}", "horizons": [
+                {"lead_hours": h, "valid_time": f"2026-10-15T{6 + h % 18:02d}:00:00+00:00",
+                 "p10": 5.0 + i % 5 + h / 10, "p50": 10.0 + i % 5 + h / 10, "p90": 20.0 + i % 5 + h / 10}
+                for h in HORIZONS]}
+            for i in range(n_cities)
+        ],
+        "uncertainty": {
+            "method": "CQR conformal",
+            "picp80_claim_by_horizon": {h: {"picp80_holdout": 0.81, "n_holdout": n, "status": "ok"} for h, n in N_HOLDOUT.items()},
+            "provisional_horizons": [],
+        },
+        "dqss": {"grade": None, "status": "unscored"},
+    }
+    payload.update(top)
+    return payload
+
+
+def band_shift(payload: dict, cells: list[tuple[int, int]], field: str, delta: float) -> dict:
+    """(도시 번호, 지평 번호) 셀들의 field 를 delta 만큼 옮긴 사본."""
+    out = copy.deepcopy(payload)
+    for city, horizon in cells:
+        out["cities"][city]["horizons"][horizon][field] += delta
+    return out
+
+
+def band_set(payload: dict, city: int, horizon: int, **fields: object) -> dict:
+    out = copy.deepcopy(payload)
+    out["cities"][city]["horizons"][horizon].update(fields)
+    return out
+
+
+def classify_band(prod, cand, validate=ok) -> cc.PairResult:
+    return cc.classify_band_pair(BAND_STAMP, prod, cand, validate)
+
+
+def test_identical_band_payloads_pass_as_a_strict_pair():
+    # Act
+    result = classify_band(band(), band())
+
+    # Assert
+    assert (result.verdict, result.strict, result.reasons) == (cc.PASS, True, [])
+    assert result.max_delta == {"p10": 0.0, "p50": 0.0, "p90": 0.0}
+    assert all(c.ok is not False for c in result.checks)
+
+
+def test_the_helper_payload_satisfies_the_real_band_contract():
+    # Arrange / Act / Assert — 아래 시험의 입력이 계약에서 벗어나 있으면 시험이 아무것도 보증하지 못한다
+    assert cc._contract_validator()(band()) is None
+
+
+def test_band_difference_of_exactly_the_tolerance_everywhere_passes():
+    # Arrange — 0.01 은 경계값(부동소수 오차 포함)이다
+    cand = band_shift(band(), [(c, h) for c in range(20) for h in range(3)], "p50", 0.01)
+
+    # Act
+    result = classify_band(band(), cand)
+
+    # Assert
+    assert result.verdict == cc.PASS
+
+
+def test_three_of_sixty_cells_over_tolerance_still_passes_at_the_95_percent_boundary():
+    # Arrange
+    cand = band_shift(band(), [(0, 0), (1, 1), (2, 2)], "p50", 0.02)
+
+    # Act
+    result = classify_band(band(), cand)
+
+    # Assert
+    assert result.verdict == cc.PASS
+    assert check(result, "p10/p50/p90").detail == "57/60 (95.0%)"
+
+
+def test_four_of_sixty_cells_over_tolerance_fails_the_95_percent_rule():
+    # Arrange
+    cand = band_shift(band(), [(0, 0), (1, 1), (2, 2), (3, 0)], "p50", 0.02)
+
+    # Act
+    result = classify_band(band(), cand)
+
+    # Assert
+    assert result.verdict == cc.FAIL
+    assert check(result, "p10/p50/p90").ok is False
+    assert len(result.worst_rows) == 4
+
+
+@pytest.mark.parametrize("quantile", ["p10", "p50", "p90"])
+def test_every_quantile_counts_toward_the_cell_rule(quantile):
+    # Arrange — 한 셀의 한 분위수만 어긋나도 그 셀은 어긋난 셀이다
+    cand = band_shift(band(), [(c, 0) for c in range(4)], quantile, 0.05)
+
+    # Act
+    result = classify_band(band(), cand)
+
+    # Assert
+    assert result.verdict == cc.FAIL
+    assert result.worst_rows[0]["field"] == f"h1 {quantile}"
+
+
+def test_a_single_cell_off_by_exactly_half_passes_but_more_than_half_fails():
+    # Arrange — 한 셀은 95% 규칙이 허용하는 범위지만, 지평별 최대 |Δ| 는 0.5 를 넘으면 안 된다
+    at_limit = band_shift(band(), [(0, 0)], "p50", 0.5)
+    over = band_shift(band(), [(0, 0)], "p50", 0.51)
+
+    # Act
+    ok_result, bad_result = classify_band(band(), at_limit), classify_band(band(), over)
+
+    # Assert
+    assert ok_result.verdict == cc.PASS and ok_result.max_delta["p50"] == 0.5
+    assert bad_result.verdict == cc.FAIL
+    assert check(bad_result, "최대").ok is False
+
+
+@pytest.mark.parametrize("bad", [None, "12", float("nan"), float("inf"), float("-inf"), True])
+@pytest.mark.parametrize("side", ["prod", "cand"])
+def test_non_numeric_or_non_finite_band_value_fails_even_for_a_single_cell(bad, side):
+    # Arrange — NaN 은 모든 비교가 False 라 허용오차 판정을 조용히 통과한다
+    broken = band_set(band(), 3, 1, p90=bad)
+    prod, cand = (broken, band()) if side == "prod" else (band(), broken)
+
+    # Act
+    result = classify_band(prod, cand)
+
+    # Assert
+    assert result.verdict == cc.FAIL
+    assert "숫자 아님 1" in check(result, "최대").detail
+
+
+def test_missing_city_in_candidate_fails_on_the_city_set():
+    # Arrange
+    cand = band()
+    del cand["cities"][5]
+
+    # Act
+    result = classify_band(band(), cand)
+
+    # Assert
+    assert result.verdict == cc.FAIL
+    assert check(result, "도시 집합").detail == "운영 20 / 후보 19 (운영만 1, 후보만 0)"
+
+
+def test_extra_city_in_candidate_fails_on_the_city_set():
+    # Act
+    result = classify_band(band(), band(21))
+
+    # Assert
+    assert check(result, "도시 집합").detail == "운영 20 / 후보 21 (운영만 0, 후보만 1)"
+    assert result.verdict == cc.FAIL
+
+
+def test_a_missing_horizon_in_one_city_fails_on_the_horizon_set():
+    # Arrange
+    cand = band()
+    del cand["cities"][7]["horizons"][2]
+
+    # Act
+    result = classify_band(band(), cand)
+
+    # Assert
+    assert result.verdict == cc.FAIL
+    assert check(result, "지평 집합").detail == "도시별 지평이 다른 도시 1곳"
+    assert check(result, "도시 집합").ok is True
+
+
+def test_duplicate_city_horizon_cells_fail():
+    # Arrange
+    cand = band()
+    cand["cities"][4]["horizons"].append(copy.deepcopy(cand["cities"][4]["horizons"][0]))
+
+    # Act
+    result = classify_band(band(), cand)
+
+    # Assert
+    assert result.verdict == cc.FAIL
+    assert check(result, "키 중복").detail == "운영 0 / 후보 1"
+
+
+def test_payloads_without_a_common_cell_fail_instead_of_passing_vacuously():
+    # Arrange — 도시 이름이 전부 다르면 비교할 셀이 없다
+    cand = band()
+    for i, city in enumerate(cand["cities"]):
+        city["name"] = f"other-{i:02d}"
+
+    # Act
+    result = classify_band(band(), cand)
+
+    # Assert
+    assert result.verdict == cc.FAIL
+    assert check(result, "비교할 셀").ok is False
+
+
+def test_malformed_city_entries_are_skipped_not_crashed_on():
+    # Arrange — 모양이 틀린 항목은 셀로 세지 않는다(계약 검사가 따로 잡는다)
+    cand = band()
+    cand["cities"] += ["text", None, {"name": "no-horizons"}, {"name": "bad", "horizons": [1, None]}]
+
+    # Act
+    result = classify_band(band(), cand)
+
+    # Assert — 도시 이름은 있지만 셀이 없는 항목은 도시 집합에 들지 않는다
+    assert check(result, "도시 집합").ok is True
+    assert result.verdict == cc.PASS
+
+
+# ── band: 엄격 짝 조건 ───────────────────────────────────────────────────────
+@pytest.mark.parametrize("issue_time", ["2026-10-15T06:00:00Z", "2026-10-15T15:00:00+09:00", "2026-10-15T06:00:00"])
+def test_same_instant_written_differently_is_still_a_strict_pair(issue_time):
+    # Act — 시각은 파싱해서 비교한다(`Z` · 오프셋 · 오프셋 없음(UTC))
+    result = classify_band(band(), band(issue_time=issue_time))
+
+    # Assert
+    assert (result.verdict, result.strict) == (cc.PASS, True)
+
+
+@pytest.mark.parametrize("issue_time", ["2026-10-15T06:00:01+00:00", "2026-10-15T07:00:00+00:00", "", None, 12, "not-a-time"])
+def test_different_or_unreadable_issue_time_makes_the_pair_input_diff(issue_time):
+    # Act
+    result = classify_band(band(), band(issue_time=issue_time))
+
+    # Assert
+    assert (result.verdict, result.strict) == (cc.INPUT_DIFF, False)
+    assert "issue_time" in result.reasons[0]
+
+
+def test_different_model_makes_the_pair_input_diff():
+    # Act
+    result = classify_band(band(), band(model="other model"))
+
+    # Assert
+    assert (result.verdict, result.strict) == (cc.INPUT_DIFF, False)
+    assert "model" in result.reasons[0]
+
+
+def test_n_holdout_difference_in_any_horizon_makes_the_pair_input_diff():
+    # Arrange — 보정(CQR) 표본이 다르면 p10/p90 이 정당하게 달라진다. 한 지평만 달라도 엄격 비교하지 않는다.
+    cand = band()
+    cand["uncertainty"]["picp80_claim_by_horizon"]["24"]["n_holdout"] += 1
+
+    # Act
+    result = classify_band(band(), cand)
+
+    # Assert
+    assert (result.verdict, result.strict) == (cc.INPUT_DIFF, False)
+    assert "n_holdout" in result.reasons[0]
+
+
+def _drop_claims(payload: dict) -> None:
+    del payload["uncertainty"]["picp80_claim_by_horizon"]
+
+
+def _empty_claims(payload: dict) -> None:
+    payload["uncertainty"]["picp80_claim_by_horizon"] = {}
+
+
+def _null_n_holdout(payload: dict) -> None:
+    payload["uncertainty"]["picp80_claim_by_horizon"]["1"]["n_holdout"] = None
+
+
+def _bool_n_holdout(payload: dict) -> None:
+    payload["uncertainty"]["picp80_claim_by_horizon"]["1"]["n_holdout"] = True
+
+
+def _claim_not_object(payload: dict) -> None:
+    payload["uncertainty"]["picp80_claim_by_horizon"]["1"] = 1144
+
+
+def _uncertainty_not_object(payload: dict) -> None:
+    payload["uncertainty"] = []
+
+
+@pytest.mark.parametrize("mutate", [_drop_claims, _empty_claims, _null_n_holdout, _bool_n_holdout, _claim_not_object, _uncertainty_not_object])
+@pytest.mark.parametrize("side", ["prod", "cand"])
+def test_n_holdout_that_cannot_be_read_is_never_treated_as_equal(mutate, side):
+    # Arrange — 양쪽이 똑같이 망가져도 "같다" 고 말할 수 없다(없음 == 없음 이 엄격 짝이 되면 안 된다)
+    broken = band()
+    mutate(broken)
+    prod, cand = (broken, band()) if side == "prod" else (band(), broken)
+
+    # Act
+    both_broken = classify_band(broken, copy.deepcopy(broken))
+    one_broken = classify_band(prod, cand)
+
+    # Assert
+    assert (both_broken.verdict, one_broken.verdict) == (cc.INPUT_DIFF, cc.INPUT_DIFF)
+    assert "n_holdout" in both_broken.reasons[0]
+
+
+def test_input_diff_pair_ignores_value_differences_but_reports_city_overlap():
+    # Arrange — 값이 크게 달라도 입력이 다르면 PASS/FAIL 을 내지 않는다
+    cand = band_shift(band(model="other model"), [(c, h) for c in range(20) for h in range(3)], "p50", 9.0)
+    del cand["cities"][0]
+
+    # Act
+    result = classify_band(band(), cand)
+
+    # Assert
+    assert result.verdict == cc.INPUT_DIFF
+    assert [(c.name, c.ok) for c in result.checks] == [("후보 계약", True), ("도시 겹침(보고)", None)]
+    assert check(result, "도시 겹침").detail == "95.0%"
+
+
+def test_input_diff_pair_below_the_overlap_standard_says_so():
+    # Arrange
+    cand = band(model="other model")
+    cand["cities"] = cand["cities"][:10]
+
+    # Act
+    result = classify_band(band(), cand)
+
+    # Assert
+    assert check(result, "도시 겹침").detail == "50.0% — 95.0% 미만"
+
+
+def test_input_diff_pair_with_contract_violation_is_a_fail():
+    # Arrange
+    def broken(payload: dict) -> str | None:
+        return "p10: 숫자 아님" if payload.get("model") == "other model" else None
+
+    # Act
+    result = classify_band(band(), band(model="other model"), broken)
+
+    # Assert
+    assert result.verdict == cc.FAIL
+    assert result.strict is False
+    assert "후보가 계약을 어겼다" in result.reasons[0]
+
+
+def test_strict_band_pair_with_contract_violation_fails_even_when_values_match():
+    # Act
+    result = classify_band(band(), band(), lambda payload: "cities[0].name: 누락")
+
+    # Assert
+    assert result.verdict == cc.FAIL
+    assert check(result, "후보 계약").ok is False
+    assert result.strict is True
+
+
+@pytest.mark.parametrize(("prod", "cand", "side"), [(None, band(), "운영 사본"), (band(), None, "후보"), (None, None, "운영 사본")])
+def test_missing_band_file_on_either_side_is_unpaired(prod, cand, side):
+    # Act
+    result = classify_band(prod, cand)
+
+    # Assert
+    assert (result.verdict, result.strict) == (cc.UNPAIRED, False)
+    assert side in result.reasons[0]
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        ("2026-10-15T06:00:00Z", datetime(2026, 10, 15, 6, tzinfo=timezone.utc)),
+        ("2026-10-15T06:00:00+00:00", datetime(2026, 10, 15, 6, tzinfo=timezone.utc)),
+        ("2026-10-15T15:00:00+09:00", datetime(2026, 10, 15, 6, tzinfo=timezone.utc)),
+        ("2026-10-15T06:00:00", datetime(2026, 10, 15, 6, tzinfo=timezone.utc)),
+        (" 2026-10-15T06:00:00Z ", datetime(2026, 10, 15, 6, tzinfo=timezone.utc)),
+        ("", None), ("  ", None), ("not-a-time", None), (None, None), (1, None), (["2026-10-15T06:00:00Z"], None),
+    ],
+)
+def test_instant_parses_equal_times_to_equal_values_and_rejects_the_rest(value, expected):
+    assert cc._instant(value) == expected
+
+
+# ── band: 요약·짝짓기·종단 ───────────────────────────────────────────────────
+def test_summarize_with_band_quantiles_keys_the_max_delta_by_band_names():
+    # Arrange
+    strict = cc.PairResult(BAND_STAMP, cc.PASS, True, max_delta={"p10": 0.1, "p50": 0.3, "p90": 0.2})
+
+    # Act
+    summary = cc.summarize([strict], prod_only=0, min_strict=1, quantiles=cc.BAND_QUANTILES)
+
+    # Assert
+    assert summary["max_delta"] == {"p10": 0.1, "p50": 0.3, "p90": 0.2}
+
+
+def test_the_default_minimum_of_strict_pairs_is_two_for_band_and_three_for_predictions():
+    # Act / Assert — 컷오버 조건(엄격 짝 ≥ 2 / ≥ 3)이 기본값이다
+    assert cc.MIN_STRICT_PAIRS_BY_PRODUCT == {"predictions": 3, "band": 2}
+
+
+def test_render_markdown_names_the_product_and_shows_band_labels():
+    # Arrange
+    failed = classify_band(band(), band_shift(band(), [(0, 0), (1, 1), (2, 2), (3, 2)], "p50", 0.2))
+    summary = cc.summarize([failed], prod_only=0, min_strict=2, quantiles=cc.BAND_QUANTILES)
+
+    # Act
+    text = cc.render_markdown([failed], summary, "band")
+
+    # Assert
+    assert "## 후보 ↔ 운영 비교 (band)" in text
+    assert "| city-00 | h1 p50 |" in text
+    assert "최대 |Δ| p10 0.0, p50 0.2, p90 0.0" in text
+
+
+def band_tree(stamps_prod: list[str], stamps_cand: list[str]) -> dict[str, dict]:
+    files: dict[str, dict] = {}
+    for s in stamps_prod:
+        files[f"{cc.PROD_BAND_DIR}/band_{s}.json"] = band()
+    for s in stamps_cand:
+        files[f"{cc.CAND_BAND_DIR}/band_{s}.json"] = band()
+    return files
+
+
+def test_run_band_pairs_candidate_stamps_with_the_same_stamp_in_the_production_snapshots():
+    # Arrange
+    source = MemorySource(band_tree(["2026101500", "2026101506", "2026101512"], ["2026101506", "2026101512"]))
+
+    # Act
+    results, summary = cc.run_band(source, ok, since=None, min_strict=2)
+
+    # Assert
+    assert [(r.stamp, r.verdict) for r in results] == [("2026101506", cc.PASS), ("2026101512", cc.PASS)]
+    assert summary["exit_code"] == 0
+    assert source.reads == [f"{cc.PROD_BAND_DIR}/band_2026101506.json", f"{cc.CAND_BAND_DIR}/band_2026101506.json",
+                            f"{cc.PROD_BAND_DIR}/band_2026101512.json", f"{cc.CAND_BAND_DIR}/band_2026101512.json"]
+
+
+def test_run_band_marks_a_candidate_without_a_snapshot_unpaired_and_counts_snapshot_only_stamps():
+    # Arrange — 사본은 00·12·18시, 후보는 06·12시. 첫 후보(06시) 이후의 사본-only 는 18시 하나(00시는 후보 시작 전)
+    source = MemorySource(band_tree(["2026101500", "2026101512", "2026101518"], ["2026101506", "2026101512"]))
+
+    # Act
+    results, summary = cc.run_band(source, ok, since=None, min_strict=1)
+
+    # Assert
+    assert [(r.stamp, r.verdict) for r in results] == [("2026101506", cc.UNPAIRED), ("2026101512", cc.PASS)]
+    assert summary["prod_only_stamps"] == 1
+    assert summary["exit_code"] == 0
+
+
+def test_run_band_filters_candidate_stamps_by_since_and_without_any_candidate_is_insufficient():
+    # Arrange
+    source = MemorySource(band_tree(["2026101500", "2026101506", "2026101512"], ["2026101500", "2026101506", "2026101512"]))
+
+    # Act
+    results, _ = cc.run_band(source, ok, since="2026101506", min_strict=1)
+    empty, summary = cc.run_band(MemorySource(band_tree(["2026101506"], [])), ok, since=None, min_strict=2)
+
+    # Assert
+    assert [r.stamp for r in results] == ["2026101506", "2026101512"]
+    assert empty == [] and summary["exit_code"] == 2
+
+
+def build_band_tree(root: Path, stamps: list[str], *, mutate_candidate=None) -> None:
+    for s in stamps:
+        write_json(root, f"{cc.PROD_BAND_DIR}/band_{s}.json", band())
+        write_json(root, f"{cc.CAND_BAND_DIR}/band_{s}.json", band() if mutate_candidate is None else mutate_candidate(band()))
+
+
+def test_main_band_local_trees_pass_with_the_band_default_of_two_strict_pairs(tmp_path, capsys, monkeypatch):
+    # Arrange
+    build_band_tree(tmp_path / "two", ["2026101500", "2026101506"])
+    build_band_tree(tmp_path / "one", ["2026101500"])
+    monkeypatch.delenv("GITHUB_STEP_SUMMARY", raising=False)
+
+    # Act
+    two = cc.main(["--product", "band", "--local", str(tmp_path / "two")], validate=ok)
+    out = capsys.readouterr().out
+    one = cc.main(["--product", "band", "--local", str(tmp_path / "one")], validate=ok)
+    capsys.readouterr()
+    one_lowered = cc.main(["--product", "band", "--local", str(tmp_path / "one"), "--min-strict-pairs", "1"], validate=ok)
+    capsys.readouterr()
+
+    # Assert — band 의 기본 최소는 2다(predictions 는 3)
+    assert (two, one, one_lowered) == (0, 2, 0)
+    assert "## 후보 ↔ 운영 비교 (band)" in out
+    assert "PASS 2 · FAIL 0" in out
+    assert "| 2026101506 | PASS | 예 |" in out
+
+
+def test_main_band_local_changed_candidate_fails_with_exit_one(tmp_path, capsys, monkeypatch):
+    # Arrange — 모든 후보 셀의 p50 을 5 만큼 올린다
+    build_band_tree(tmp_path, ["2026101500", "2026101506"],
+                    mutate_candidate=lambda p: band_shift(p, [(c, h) for c in range(20) for h in range(3)], "p50", 5.0))
+    monkeypatch.delenv("GITHUB_STEP_SUMMARY", raising=False)
+
+    # Act
+    code = cc.main(["--product", "band", "--local", str(tmp_path)], validate=ok)
+
+    # Assert
+    out = capsys.readouterr().out
+    assert code == 1
+    assert "FAIL 2" in out
+    assert "최대 \\|Δ\\|≤0.5" in out
+
+
+def test_main_band_json_output_names_the_product_and_stays_strict_json_with_nan(tmp_path, capsys, monkeypatch):
+    # Arrange — NaN 토큰이 그대로 나가면 jq 같은 엄격 파서가 거부한다
+    build_band_tree(tmp_path, ["2026101506"], mutate_candidate=lambda p: band_set(p, 2, 1, p50=float("nan")))
+    monkeypatch.delenv("GITHUB_STEP_SUMMARY", raising=False)
+
+    # Act
+    code = cc.main(["--product", "band", "--local", str(tmp_path), "--json", "--min-strict-pairs", "1"], validate=ok)
+
+    # Assert
+    data = json.loads(capsys.readouterr().out, parse_constant=lambda token: pytest.fail(f"JSON 에 {token} 토큰이 나갔다"))
+    worst = data["pairs"][0]["worst_rows"][0]
+    assert code == 1
+    assert data["product"] == "band"
+    assert (worst["name"], worst["field"], worst["cand"], worst["abs_delta"]) == ("city-02", "h6 p50", "nan", None)
+
+
+def test_main_band_uses_the_real_contract_validator_when_none_is_injected(tmp_path, capsys, monkeypatch):
+    # Arrange — 후보가 계약을 어기면(도시 이름 없음) 값이 같아도 FAIL 이다
+    bad = band()
+    del bad["cities"][0]["name"]
+    write_json(tmp_path, f"{cc.PROD_BAND_DIR}/band_{BAND_STAMP}.json", band())
+    write_json(tmp_path, f"{cc.CAND_BAND_DIR}/band_{BAND_STAMP}.json", bad)
+    monkeypatch.delenv("GITHUB_STEP_SUMMARY", raising=False)
+
+    # Act
+    code = cc.main(["--product", "band", "--local", str(tmp_path), "--min-strict-pairs", "1"])
+
+    # Assert
+    assert code == 1
+    assert "후보 계약" in capsys.readouterr().out
+
+
+def test_main_predictions_remains_the_default_product(tmp_path, capsys, monkeypatch):
+    # Arrange — band 파일만 있는 트리에서 기본 제품(predictions)은 후보가 없어 판단 보류(2)다
+    build_band_tree(tmp_path, ["2026101506"])
+    monkeypatch.delenv("GITHUB_STEP_SUMMARY", raising=False)
+
+    # Act
+    code = cc.main(["--local", str(tmp_path), "--json"], validate=ok)
+
+    # Assert
+    data = json.loads(capsys.readouterr().out)
+    assert (code, data["product"], data["pairs"]) == (2, "predictions", [])
