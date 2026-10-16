@@ -6,7 +6,7 @@
 `pytest scripts` 가 막는다.
 
 구성
-  A. 전체 워크플로 공통 (PR 트리거 ↔ 비공개 시크릿, `pull_request_target`, 캐시 경로, SHA 고정)
+  A. 전체 워크플로 공통 (PR 트리거 ↔ 비공개 시크릿, `pull_request_target`, 캐시 경로, SHA 고정 — `.yml`·`.yaml` 모두)
   B. ML 워크플로 공통 (트리거 형태, repo 가드, 시간 제한, 권한, 동시성, 발행 모드, 시크릿 위치)
   C. `ml-predict.yml` 전용 (2잡 분리, wheel·가중치 핀, run_entry 경유, 설치 플래그, artifact 내용)
   C2. `band-forecast.yml` 전용 (건너뛰기 가드, 2잡 분리, 3단계 설치와 설치 검사, run_entry 경유와 경로 플래그,
@@ -43,7 +43,13 @@ ML_DIR = ROOT / "scripts" / "ml"
 PREDICT_LOCK = ML_DIR / "requirements-predict.lock.txt"
 PUBLISH_LOCK = ROOT / "scripts" / "etl" / "requirements-publish.lock.txt"  # 발행기를 쓰는 다른 워크플로가 재사용한다
 
-ALL_WORKFLOWS = sorted(WORKFLOW_DIR.glob("*.yml"))
+
+def workflow_files(directory: Path) -> list[Path]:
+    """GitHub 이 워크플로로 읽는 파일(`.yml`·`.yaml`)."""
+    return sorted([*directory.glob("*.yml"), *directory.glob("*.yaml")])
+
+
+ALL_WORKFLOWS = workflow_files(WORKFLOW_DIR)
 BAND_WORKFLOW = "band-forecast.yml"
 # 파일이 없으면 아래 공통 시험이 조용히 줄어들지 않고 로드 단계에서 실패한다(존재 시험이 따로 있다)
 ML_WORKFLOW_NAMES = ["ml-predict.yml", BAND_WORKFLOW]
@@ -144,6 +150,32 @@ def test_ml_workflows_exist_and_are_listed():
     # Arrange / Act / Assert — 아래 모든 ML 시험이 이 목록으로 도는데 파일이 없거나 목록에서 빠지면 무음 통과한다
     assert ML_WORKFLOW_NAMES == ["ml-predict.yml", BAND_WORKFLOW]
     assert all((WORKFLOW_DIR / name).is_file() for name in ML_WORKFLOW_NAMES)
+
+
+def test_the_workflow_glob_covers_every_file_in_the_workflow_directory():
+    # Arrange
+    on_disk = {p.name for p in WORKFLOW_DIR.iterdir() if p.is_file()}
+
+    # Act
+    globbed = {p.name for p in ALL_WORKFLOWS}
+
+    # Assert — GitHub 은 .yml/.yaml 만 워크플로로 읽는다. 다른 이름이 글롭 밖에 있으면 아래 시험들이 그 파일을 무음으로 건너뛴다
+    assert on_disk == globbed, f"글롭 밖 파일: {sorted(on_disk - globbed)}"
+
+
+def test_the_workflow_glob_reads_both_yml_and_yaml_files_in_name_order(tmp_path):
+    # Arrange — `.yaml` 도 워크플로다. 다른 확장자와 하위 폴더 안 파일은 아니다. 이름 순서로 정렬해 시험 id 순서를 고정한다
+    # (디렉터리 열거 순서는 보장되지 않는다).
+    for name in ("b.yml", "a.yaml", "c.txt", "d.yml.bak"):
+        (tmp_path / name).write_text("{}", encoding="utf-8")
+    (tmp_path / "nested").mkdir()
+    (tmp_path / "nested" / "e.yml").write_text("{}", encoding="utf-8")
+
+    # Act
+    found = workflow_files(tmp_path)
+
+    # Assert
+    assert [p.name for p in found] == ["a.yaml", "b.yml"]
 
 
 @pytest.mark.parametrize("path", ALL_WORKFLOWS, ids=lambda p: p.name)
