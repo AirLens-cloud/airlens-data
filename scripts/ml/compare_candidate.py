@@ -343,14 +343,18 @@ def classify_pair(
 
 # ── band 판정 ────────────────────────────────────────────────────────────────
 def _instant(value: object) -> datetime | None:
-    """ISO 시각 문자열 → UTC 시각. 모양이 틀리면 None. 오프셋이 없으면 UTC 로 본다(`Z` 와 `+00:00` 은 같은 시각이다)."""
+    """ISO 시각 문자열 → UTC 시각. 모양이 틀리면 None. 오프셋이 없으면 UTC 로 본다(`Z` 와 `+00:00` 은 같은 시각이다).
+
+    `publish_targets.parse_utc` 와 같은 규칙이다(실패는 None ↔ ValueError). 이 스크립트는 `python3 -I` 로 단독 실행해서 다른
+    모듈을 import 하지 않으므로 한 벌 더 두고, test_compare_candidate.py 가 둘을 대조한다.
+    """
     if not isinstance(value, str) or not value.strip():
         return None
     try:
         parsed = datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
-    except ValueError:
+        return parsed.astimezone(timezone.utc) if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+    except (ValueError, OverflowError):
         return None
-    return parsed.astimezone(timezone.utc) if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
 
 
 def _holdout_counts(payload: dict) -> dict[str, int]:

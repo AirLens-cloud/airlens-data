@@ -136,6 +136,52 @@ def test_parse_stamp_rejects_wrong_shapes_and_impossible_times(value):
         pt.parse_stamp(value)
 
 
+ISSUE_UTC = datetime(2026, 10, 15, 6, 15, 42, tzinfo=timezone.utc)
+
+
+@pytest.mark.parametrize(
+    "value",
+    ["2026-10-15T06:15:42Z", "2026-10-15T06:15:42+00:00", "2026-10-15T15:15:42+09:00", "2026-10-15T06:15:42", " 2026-10-15T06:15:42Z "],
+)
+def test_parse_utc_maps_every_notation_of_one_instant_to_the_same_value(value):
+    # Act / Assert — `Z` · 오프셋 · 오프셋 없음(UTC) 은 같은 시각이다
+    assert pt.parse_utc(value) == ISSUE_UTC
+    assert pt.parse_utc(value).utcoffset().total_seconds() == 0
+
+
+@pytest.mark.parametrize(
+    "value",
+    ["", "   ", "not-a-time", "2026-13-01T00:00:00Z", "2026-10-15T25:00:00Z", "0001-01-01T00:00:00+14:00", None, 1, 1.5, ["2026-10-15T06:15:42Z"], {}],
+)
+def test_parse_utc_rejects_anything_that_is_not_an_iso_time_string_with_value_error(value):
+    # Act / Assert — 범위 밖 시각(UTC 로 바꾸면 0000년)도 OverflowError 가 아니라 ValueError 다: 호출부가 한 종류만 잡는다
+    with pytest.raises(ValueError):
+        pt.parse_utc(value)
+
+
+def test_parse_utc_error_message_shows_a_bounded_repr_of_the_value():
+    # Arrange — 줄바꿈이 섞인 값이 그대로 로그에 나가면 워크플로 명령(`::...`)을 흉내 낼 수 있다
+    hostile = "x\n::error::injected" + "y" * 500
+
+    # Act
+    with pytest.raises(ValueError) as caught:
+        pt.parse_utc(hostile)
+
+    # Assert
+    assert "\n" not in str(caught.value)
+    assert len(str(caught.value)) < 200
+
+
+def test_stamp_of_converts_to_utc_before_cutting_to_the_hour():
+    # Arrange — 한국 시각 15:59 는 UTC 06:59 다
+    local = datetime.fromisoformat("2026-10-15T15:59:59+09:00")
+
+    # Act / Assert
+    assert pt.stamp_of(local) == "2026101506"
+    assert pt.stamp_of(ISSUE_UTC) == "2026101506"
+    assert pt.stamp_of(datetime(2026, 10, 15, 23, 59, tzinfo=timezone.utc)) == "2026101523"
+
+
 @pytest.mark.parametrize(
     ("grid", "expected"),
     [
@@ -387,7 +433,10 @@ def test_stamp_from_band_ignores_the_run_time():
     assert pt.stamp_from_band(payload) == "2026101512"
 
 
-@pytest.mark.parametrize("payload", [{}, {"issue_time": ""}, {"issue_time": None}, {"issue_time": 20261015}, {"issue_time": "not-a-time"}])
+@pytest.mark.parametrize(
+    "payload",
+    [{}, {"issue_time": ""}, {"issue_time": None}, {"issue_time": 20261015}, {"issue_time": "not-a-time"}, {"issue_time": "0001-01-01T00:00:00+14:00"}],
+)
 def test_stamp_from_band_without_a_usable_issue_time_fails(payload):
     with pytest.raises((ValueError, KeyError)):
         pt.stamp_from_band(payload)
@@ -469,7 +518,8 @@ def test_cli_band_without_the_artifact_file_fails_in_one_line(band_dir, capsys):
 
 @pytest.mark.parametrize(
     ("text", "error_class"),
-    [("{not json", "JSONDecodeError"), ("[]", "TypeError"), ("{}", "KeyError"), ('{"issue_time": "x"}', "ValueError"), ('{"issue_time": 1}', "ValueError")],
+    [("{not json", "JSONDecodeError"), ("[]", "TypeError"), ("{}", "KeyError"), ('{"issue_time": "x"}', "ValueError"), ('{"issue_time": 1}', "ValueError"),
+     ('{"issue_time": "0001-01-01T00:00:00+14:00"}', "ValueError")],
 )
 @pytest.mark.parametrize("target", ["artifact", "snapshot"])
 def test_cli_band_with_a_broken_payload_fails_with_class_and_message_not_a_traceback(text, error_class, target, band_dir, prod_snapshot, capsys):

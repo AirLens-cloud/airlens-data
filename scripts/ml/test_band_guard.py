@@ -19,47 +19,6 @@ CANDIDATE_PATH = pt.band_history_dest(STAMP)
 PROD_COPY_PATH = pt.band_prod_copy_dest(STAMP)
 
 
-# ── 시각 ─────────────────────────────────────────────────────────────────────
-@pytest.mark.parametrize(
-    "value",
-    ["2026-10-15T06:15:42Z", "2026-10-15T06:15:42+00:00", "2026-10-15T15:15:42+09:00", "2026-10-15T06:15:42", " 2026-10-15T06:15:42Z "],
-)
-def test_parse_time_maps_every_notation_of_one_instant_to_the_same_value(value):
-    # Act / Assert — `Z` · 오프셋 · 오프셋 없음(UTC) 은 같은 시각이다
-    assert bg.parse_time(value) == ISSUE
-    assert bg.parse_time(value).utcoffset().total_seconds() == 0
-
-
-@pytest.mark.parametrize("value", ["", "   ", "not-a-time", "2026-13-01T00:00:00Z", "2026-10-15T25:00:00Z", None, 1, 1.5, ["2026-10-15T06:15:42Z"], {}])
-def test_parse_time_rejects_anything_that_is_not_an_iso_time_string(value):
-    # Act / Assert
-    with pytest.raises(ValueError):
-        bg.parse_time(value)
-
-
-def test_parse_time_error_message_shows_a_bounded_repr_of_the_value():
-    # Arrange — 줄바꿈이 섞인 값이 그대로 로그에 나가면 워크플로 명령(`::...`)을 흉내 낼 수 있다
-    hostile = "x\n::error::injected" + "y" * 500
-
-    # Act
-    with pytest.raises(ValueError) as caught:
-        bg.parse_time(hostile)
-
-    # Assert
-    assert "\n" not in str(caught.value)
-    assert len(str(caught.value)) < 200
-
-
-def test_stamp_of_converts_to_utc_before_cutting_to_the_hour():
-    # Arrange — 한국 시각 15:59 는 UTC 06:59 다
-    local = datetime.fromisoformat("2026-10-15T15:59:59+09:00")
-
-    # Act / Assert
-    assert bg.stamp_of(local) == "2026101506"
-    assert bg.stamp_of(ISSUE) == STAMP
-    assert bg.stamp_of(datetime(2026, 10, 15, 23, 59, tzinfo=timezone.utc)) == "2026101523"
-
-
 # ── 판정 (순수 함수) ─────────────────────────────────────────────────────────
 def decide(mode, facts, force=False):
     return bg.decide(mode, force, facts)
@@ -484,3 +443,20 @@ def test_snapshot_names_the_copy_after_the_published_issue_not_the_forecast_issu
 
     # Assert
     assert client.paths[-1] == "aq-data/_candidate/forecast-band/prod/band_2026101500.json"
+
+
+@pytest.mark.parametrize("issue_time", ["2026-10-15T06:15:42Z", "2026-10-15T06:15:42+00:00", "2026-10-15T15:15:42+09:00", "2026-10-15T06:15:42"])
+def test_a_copy_that_snapshot_saves_is_accepted_by_the_publish_mapping_too(tmp_path, capsys, issue_time):
+    # Arrange — snapshot 이 받은 사본을 발행 매핑이 거부하면 batch 전체가 멈춰 후보 발행이 막힌다. 두 쪽이 같은 파서를 쓴다.
+    dest = tmp_path / "prod" / "prod_latest.json"
+    run_main(["snapshot", "--mode", "candidate", "--dest", str(dest)], FakeClient({pt.BAND_LATEST: band(issue_time)}), tmp_path, capsys)
+    artifact = tmp_path / "pub"
+    artifact.mkdir()
+    (artifact / pt.BAND_FILE).write_bytes(band())
+
+    # Act
+    code = pt.main(["maps", "--mode", "candidate", "--dir", str(artifact), "--group", "band", "--prod-snapshot", str(dest)])
+
+    # Assert
+    assert dest.is_file() and code == 0
+    assert capsys.readouterr().out.splitlines()[-1].endswith(f"={PROD_COPY_PATH}")

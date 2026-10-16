@@ -13,12 +13,12 @@ import json
 import re
 import ssl
 import urllib.error
-from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
 
 import compare_candidate as cc
+import publish_targets as pt
 
 STAMP = "2026101512"
 SHA = "a" * 64
@@ -1767,18 +1767,19 @@ def test_missing_band_file_on_either_side_is_unpaired(prod, cand, side):
 
 
 @pytest.mark.parametrize(
-    ("value", "expected"),
-    [
-        ("2026-10-15T06:00:00Z", datetime(2026, 10, 15, 6, tzinfo=timezone.utc)),
-        ("2026-10-15T06:00:00+00:00", datetime(2026, 10, 15, 6, tzinfo=timezone.utc)),
-        ("2026-10-15T15:00:00+09:00", datetime(2026, 10, 15, 6, tzinfo=timezone.utc)),
-        ("2026-10-15T06:00:00", datetime(2026, 10, 15, 6, tzinfo=timezone.utc)),
-        (" 2026-10-15T06:00:00Z ", datetime(2026, 10, 15, 6, tzinfo=timezone.utc)),
-        ("", None), ("  ", None), ("not-a-time", None), (None, None), (1, None), (["2026-10-15T06:00:00Z"], None),
-    ],
+    "value",
+    ["2026-10-15T06:00:00Z", "2026-10-15T06:00:00+00:00", "2026-10-15T15:00:00+09:00", "2026-10-15T06:00:00", " 2026-10-15T06:00:00Z ",
+     "", "  ", "not-a-time", "2026-13-01T00:00:00Z", None, 1, ["2026-10-15T06:00:00Z"], "0001-01-01T00:00:00+14:00"],
 )
-def test_instant_parses_equal_times_to_equal_values_and_rejects_the_rest(value, expected):
-    assert cc._instant(value) == expected
+def test_instant_agrees_with_the_shared_parser_in_publish_targets(value):
+    # Arrange — 이 스크립트는 단독 실행이라 파서를 한 벌 더 둔다. 같은 입력에서 같은 시각이거나, 함께 실패해야 한다(None ↔ ValueError)
+    try:
+        shared = pt.parse_utc(value)
+    except ValueError:
+        shared = None
+
+    # Act / Assert
+    assert cc._instant(value) == shared
 
 
 # ── band: 요약·짝짓기·종단 ───────────────────────────────────────────────────

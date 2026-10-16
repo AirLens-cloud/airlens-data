@@ -12,7 +12,8 @@ band job 은 예보 수집(forecast-collect) 직후와 백업 스케줄에 모�
   candidate   후보 발행물(`band_<issue 의 UTC %Y%m%d%H>.json`)이 이미 있으면 건너뛴다
   --force true 는 어느 쪽이든 건너뛰지 않는다.
 
-시각 문자열은 출처마다 모양이 다르다(`...Z` ↔ `...+00:00`). 문자열이 아니라 파싱한 시각으로 비교한다.
+시각 문자열은 출처마다 모양이 다르다(`...Z` ↔ `...+00:00`). 문자열이 아니라 파싱한 시각으로 비교한다. 파서는
+`publish_targets.parse_utc` 하나다 — snapshot 이 받은 `issue_time` 은 발행 매핑(`publish_targets.py maps`)도 받는다.
 공개 저장소 조회(재시도·404·오류 문구)는 `compare_candidate.HttpSource` 를 그대로 쓴다 — 조회 코드를 두 벌 두지 않는다.
 
 CLI (워크플로가 쓴다):
@@ -30,7 +31,7 @@ import os
 import sys
 from collections.abc import Mapping
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime
 from pathlib import Path
 
 import compare_candidate as cc
@@ -55,22 +56,6 @@ class Facts:
     candidate_exists: bool = False  # candidate 전용
 
 
-def parse_time(value: object) -> datetime:
-    """ISO 8601 문자열 → UTC 시각. `Z`·오프셋·오프셋 없음(UTC 로 본다)을 받는다. 시각이 아니면 ValueError."""
-    if not isinstance(value, str) or not value.strip():
-        raise ValueError(f"시각 문자열이 아니다: {value!r:.80}")
-    try:
-        parsed = datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
-    except ValueError:  # 표준 메시지는 값 전체를 싣는다 — 로그에는 잘라서 남긴다
-        raise ValueError(f"ISO 시각이 아니다: {value!r:.80}") from None
-    return parsed.astimezone(timezone.utc) if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
-
-
-def stamp_of(moment: datetime) -> str:
-    """시각 → `%Y%m%d%H`(UTC). 후보 발행물 파일명의 STAMP 와 같은 규칙이다."""
-    return moment.astimezone(timezone.utc).strftime("%Y%m%d%H")
-
-
 def decide(mode: str, force: bool, facts: Facts) -> Decision:
     """건너뛸지 정한다. 순수 함수 — 조회는 하지 않는다."""
     if mode not in pt.MODES:
@@ -87,8 +72,8 @@ def decide(mode: str, force: bool, facts: Facts) -> Decision:
             return Decision(True, f"운영 latest 가 이미 예보 발행 {issue} 을(를) 담고 있다")
         return Decision(False, f"새 예보 발행 {issue} (운영 latest 는 {facts.published_issue.isoformat()})")
     if facts.candidate_exists:
-        return Decision(True, f"후보 발행물 band_{stamp_of(facts.issue)}.json 이 이미 있다")
-    return Decision(False, f"후보 발행물 band_{stamp_of(facts.issue)}.json 이 없다 — 예보 발행 {issue} 을(를) 돌린다")
+        return Decision(True, f"후보 발행물 band_{pt.stamp_of(facts.issue)}.json 이 이미 있다")
+    return Decision(False, f"후보 발행물 band_{pt.stamp_of(facts.issue)}.json 이 없다 — 예보 발행 {issue} 을(를) 돌린다")
 
 
 def _read_instant(client: cc.HttpSource, rel_path: str, key: str, warnings: list[str], *, missing_ok: bool = False) -> datetime | None:
@@ -99,7 +84,7 @@ def _read_instant(client: cc.HttpSource, rel_path: str, key: str, warnings: list
             if not missing_ok:
                 warnings.append(f"{rel_path}: 파일이 없다")
             return None
-        return parse_time(doc.get(key))
+        return pt.parse_utc(doc.get(key))
     except cc.SourceError as exc:
         warnings.append(str(exc))
     except ValueError as exc:
@@ -114,7 +99,7 @@ def observe(mode: str, client: cc.HttpSource, warnings: list[str]) -> Facts:
         return Facts(None)
     if mode == "production":
         return Facts(issue, published_issue=_read_instant(client, pt.BAND_LATEST, "issue_time", warnings, missing_ok=True))
-    candidate_path = pt.band_history_dest(stamp_of(issue))
+    candidate_path = pt.band_history_dest(pt.stamp_of(issue))
     try:
         return Facts(issue, candidate_exists=client.exists(candidate_path))
     except cc.SourceError as exc:
@@ -146,7 +131,7 @@ def snapshot(client: cc.HttpSource, dest: Path, warnings: list[str]) -> str:
     try:
         if doc.get("schema_version") != BAND_SCHEMA:
             raise ValueError(f"schema_version 이 {BAND_SCHEMA} 가 아니다")
-        stamp = stamp_of(parse_time(doc.get("issue_time")))
+        stamp = pt.utc_stamp(doc.get("issue_time"))
     except ValueError as exc:
         warnings.append(f"{pt.BAND_LATEST}: band 발행물 모양이 아니다 ({exc})")
         return "운영 latest 가 band 발행물 모양이 아니라 사본을 남기지 않는다"

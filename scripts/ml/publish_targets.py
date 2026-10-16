@@ -62,12 +62,29 @@ def parse_stamp(value: str) -> str:
     return value
 
 
+def parse_utc(value: object) -> datetime:
+    """ISO 8601 시각 문자열 → UTC 시각(tz 있음). `Z`·오프셋·오프셋 없음(UTC 로 본다)을 받는다. 시각이 아니면 ValueError.
+
+    STAMP 를 만드는 `utc_stamp` 와 `band_guard.py` 의 "같은 시각인가" 비교가 이 한 곳을 쓴다 — 한쪽만 받아 주는 값이
+    생기지 않는다. 오류 메시지는 값을 잘라 담는다(표준 메시지는 값 전체를 싣는다).
+    """
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"시각 문자열이 아니다: {value!r:.80}")
+    try:
+        parsed = datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
+        return parsed.astimezone(timezone.utc) if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+    except (ValueError, OverflowError):  # 범위 밖 시각(`0001-01-01T00:00:00+14:00`)은 UTC 로 바꾸다 OverflowError
+        raise ValueError(f"ISO 시각이 아니다: {value!r:.80}") from None
+
+
+def stamp_of(moment: datetime) -> str:
+    """시각(tz 있음) → UTC `%Y%m%d%H`. 후보 발행물 파일명 STAMP 의 규칙이다."""
+    return moment.astimezone(timezone.utc).strftime("%Y%m%d%H")
+
+
 def utc_stamp(ts: object) -> str:
-    """ISO 시각 → UTC `%Y%m%d%H`. 오프셋이 붙은 값은 UTC 로 바꾼 뒤 자른다(오프셋 없는 값은 그대로)."""
-    parsed = datetime.fromisoformat(str(ts).replace("Z", "+00:00"))
-    if parsed.tzinfo is not None:
-        parsed = parsed.astimezone(timezone.utc)
-    return parsed.strftime("%Y%m%d%H")
+    """ISO 시각 문자열 → UTC `%Y%m%d%H`. 오프셋이 붙은 값은 UTC 로 바꾼 뒤 자른다(오프셋 없는 값은 UTC 로 본다)."""
+    return stamp_of(parse_utc(ts))
 
 
 def stamp_from_grid(grid: dict) -> str:
