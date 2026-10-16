@@ -847,6 +847,44 @@ def test_http_read_json_with_non_object_json_raises_source_error(monkeypatch, bo
         source.read_json("dir/odd.json")
 
 
+def test_http_read_bytes_returns_the_body_untouched_and_none_for_404(monkeypatch):
+    # Arrange — JSON 이 아닌 바이트도 그대로 돌려준다(band_guard 의 snapshot 이 원문 그대로 저장한다)
+    raw = b'{"a":  1,\n "b": "\xed\x95\x9c"}\n\xff'
+    source, calls, _ = scripted_source(monkeypatch, {"a.json": [FakeResponse(raw)], "missing.json": [http_error(404)]})
+
+    # Act / Assert
+    assert source.read_bytes("dir/a.json") == raw
+    assert source.read_bytes("dir/missing.json") is None
+    assert calls[0] == f"{cc.RESOLVE_BASE}/dir/a.json"
+
+
+class UnreadableResponse(FakeResponse):
+    """열기만 해야 한다 — 본문을 읽으면 시험이 실패한다."""
+
+    def read(self) -> bytes:
+        raise AssertionError("exists() 는 본문을 읽으면 안 된다")
+
+
+def test_http_exists_opens_the_file_without_reading_the_body_and_is_false_for_404(monkeypatch):
+    # Arrange
+    source, calls, _ = scripted_source(monkeypatch, {"here.json": [UnreadableResponse(b"")], "missing.json": [http_error(404)]})
+
+    # Act / Assert
+    assert source.exists("dir/here.json") is True
+    assert source.exists("dir/missing.json") is False
+    assert calls == [f"{cc.RESOLVE_BASE}/dir/here.json", f"{cc.RESOLVE_BASE}/dir/missing.json"]
+
+
+def test_http_exists_retries_and_reports_a_persistent_failure_as_source_error(monkeypatch):
+    # Arrange
+    source, calls, sleeps = scripted_source(monkeypatch, {"a.json": [http_error(503)]})
+
+    # Act / Assert — 확인을 못 한 것과 없는 것은 다르다
+    with pytest.raises(cc.SourceError, match="status=503"):
+        source.exists("dir/a.json")
+    assert len(calls) == cc.FETCH_RETRIES and sleeps == [2.0, 4.0]
+
+
 def test_http_retries_503_then_succeeds(monkeypatch):
     # Arrange
     source, calls, sleeps = scripted_source(monkeypatch, {"a.json": [http_error(503), http_error(503), FakeResponse(b"{}")]})
@@ -986,7 +1024,7 @@ def test_http_list_stamps_of_an_empty_listing_is_empty(monkeypatch):
 
 
 def test_http_source_never_sends_credentials(monkeypatch):
-    # Arrange — 공개 저장소만 읽는다. 요청 객체에 Authorization 이 없어야 한다.
+    # Arrange — 공개 저장소만 읽는다. 요청 헤더는 User-Agent 하나뿐이어야 한다(Authorization·쿠키 없음).
     seen: list[dict[str, str]] = []
 
     def fake_urlopen(req, timeout):
@@ -1000,7 +1038,7 @@ def test_http_source_never_sends_credentials(monkeypatch):
     cc.HttpSource().read_json("dir/a.json")
 
     # Assert
-    assert seen and all("Authorization" not in h and "authorization" not in h for h in seen)
+    assert seen and all({name.lower() for name in headers} == {"user-agent"} for headers in seen)
 
 
 # ── main(): --local 종단 ─────────────────────────────────────────────────────

@@ -1,16 +1,14 @@
 """band_guard 시험 — 판정은 순수 함수, 조회는 가짜 응답이라 네트워크가 0 이다."""
 from __future__ import annotations
 
-import http.client
-import io
 import json
-import urllib.error
 from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
 
 import band_guard as bg
+import compare_candidate as cc
 import publish_targets as pt
 
 ISSUE_Z = "2026-10-15T06:15:42Z"
@@ -132,187 +130,17 @@ def test_unknown_mode_is_a_programming_error(mode):
         decide(mode, bg.Facts(ISSUE))
 
 
-# ── 조회: 재시도·오류·헤더 ───────────────────────────────────────────────────
-class FakeResponse:
-    def __init__(self, body: bytes = b"", read_error: BaseException | None = None) -> None:
-        self._body = body
-        self._read_error = read_error
-
-    def read(self) -> bytes:
-        if self._read_error is not None:
-            raise self._read_error
-        return self._body
-
-    def __enter__(self) -> FakeResponse:
-        return self
-
-    def __exit__(self, *exc: object) -> bool:
-        return False
-
-
-class Unreadable(FakeResponse):
-    """열기만 해야 한다 — 본문을 읽으면 시험이 실패한다."""
-
-    def read(self) -> bytes:
-        raise AssertionError("exists() 는 본문을 읽으면 안 된다")
-
-
-def http_error(code: int) -> urllib.error.HTTPError:
-    return urllib.error.HTTPError("https://example.invalid/secret/path", code, "msg", {}, io.BytesIO(b"secret body"))
-
-
-def scripted(monkeypatch, outcomes: list[object]) -> tuple[bg.PublicClient, list[str], list[float]]:
-    """요청마다 outcomes 를 차례로 돌려준다(마지막 값은 반복). (client, 요청 URL, sleep 기록)."""
-    urls: list[str] = []
-    sleeps: list[float] = []
-
-    def fake_open(self, url: str):
-        urls.append(url)
-        outcome = outcomes[min(len(urls), len(outcomes)) - 1]
-        if isinstance(outcome, BaseException):
-            raise outcome
-        return outcome
-
-    monkeypatch.setattr(bg.PublicClient, "_open", fake_open)
-    return bg.PublicClient(sleep=sleeps.append), urls, sleeps
-
-
-def test_read_json_returns_the_object_and_requests_the_public_resolve_url(monkeypatch):
-    # Arrange
-    client, urls, _ = scripted(monkeypatch, [FakeResponse(b'{"a": 1}')])
-
-    # Act
-    data = client.read_json("aq-data/forecast.json")
-
-    # Assert
-    assert data == {"a": 1}
-    assert urls == ["https://huggingface.co/datasets/Robeedau/airlens-live/resolve/main/aq-data/forecast.json"]
-
-
-def test_a_missing_file_is_none_and_exists_is_false(monkeypatch):
-    # Arrange
-    client, urls, sleeps = scripted(monkeypatch, [http_error(404)])
-
-    # Act / Assert — 404 는 재시도하지 않는다
-    assert client.read_json("a.json") is None
-    assert client.read_bytes("a.json") is None
-    assert client.exists("a.json") is False
-    assert len(urls) == 3 and sleeps == []
-
-
-def test_exists_opens_the_file_without_reading_the_body(monkeypatch):
-    # Arrange
-    client, _, _ = scripted(monkeypatch, [Unreadable()])
-
-    # Act / Assert
-    assert client.exists("aq-data/anything.json") is True
-
-
-def test_transient_status_is_retried_with_growing_sleeps_then_succeeds(monkeypatch):
-    # Arrange
-    client, urls, sleeps = scripted(monkeypatch, [http_error(503), http_error(429), FakeResponse(b"{}")])
-
-    # Act
-    data = client.read_json("a.json")
-
-    # Assert
-    assert data == {} and len(urls) == 3
-    assert sleeps == [2.0, 4.0]
-
-
-def test_persistent_server_error_raises_after_three_attempts_without_leaking_url_or_body(monkeypatch):
-    # Arrange
-    client, urls, sleeps = scripted(monkeypatch, [http_error(500)])
-
-    # Act
-    with pytest.raises(bg.FetchError) as caught:
-        client.read_json("aq-data/forecast.json")
-
-    # Assert
-    assert str(caught.value) == "aq-data/forecast.json: HTTPError status=500"
-    assert len(urls) == bg.FETCH_RETRIES and sleeps == [2.0, 4.0]
-    assert "secret" not in str(caught.value)
-
-
-@pytest.mark.parametrize("code", [400, 401, 403, 410])
-def test_other_client_errors_fail_immediately(monkeypatch, code):
-    # Arrange
-    client, urls, sleeps = scripted(monkeypatch, [http_error(code)])
-
-    # Act / Assert
-    with pytest.raises(bg.FetchError, match=f"status={code}"):
-        client.read_bytes("a.json")
-    assert len(urls) == 1 and sleeps == []
-
-
-@pytest.mark.parametrize("error", [urllib.error.URLError("dns"), TimeoutError("slow"), ConnectionResetError("reset")])
-def test_connection_errors_are_retried_then_reported_by_class_name_only(monkeypatch, error):
-    # Arrange
-    client, urls, _ = scripted(monkeypatch, [error])
-
-    # Act
-    with pytest.raises(bg.FetchError) as caught:
-        client.exists("a.json")
-
-    # Assert
-    assert str(caught.value) == f"a.json: {type(error).__name__}"
-    assert len(urls) == bg.FETCH_RETRIES
-
-
-def test_a_connection_that_drops_while_reading_the_body_is_retried_too(monkeypatch):
-    # Arrange
-    client, urls, _ = scripted(monkeypatch, [FakeResponse(read_error=http.client.IncompleteRead(b"par")), FakeResponse(b'{"ok": true}')])
-
-    # Act
-    data = client.read_json("a.json")
-
-    # Assert
-    assert data == {"ok": True} and len(urls) == 2
-
-
-@pytest.mark.parametrize(("body", "message"), [(b"<html>", "JSON 아님"), (b"", "JSON 아님"), (b"\xff\xfe", "JSON 아님"), (b"[]", "JSON 객체 아님"), (b"null", "JSON 객체 아님"), (b'"x"', "JSON 객체 아님")])
-def test_read_json_rejects_non_object_bodies(monkeypatch, body, message):
-    # Arrange
-    client, _, _ = scripted(monkeypatch, [FakeResponse(body)])
-
-    # Act / Assert
-    with pytest.raises(bg.FetchError, match=message):
-        client.read_json("a.json")
-
-
-def test_requests_carry_a_user_agent_and_never_a_credential_even_when_a_token_is_in_the_environment(monkeypatch):
-    # Arrange — 이 스크립트는 공개 URL 만 읽는다. 환경에 토큰이 있어도 보내지 않는다.
-    monkeypatch.setenv("HF_TOKEN", "example-not-a-credential")
-    monkeypatch.setenv("HUGGING_FACE_HUB_TOKEN", "example-not-a-credential")
-    seen = []
-
-    def fake_urlopen(request, timeout):
-        seen.append((request, timeout))
-        return FakeResponse(b"{}")
-
-    monkeypatch.setattr(bg.urllib.request, "urlopen", fake_urlopen)
-
-    # Act
-    bg.PublicClient().read_json("a.json")
-
-    # Assert
-    request, timeout = seen[0]
-    headers = {key.lower(): value for key, value in request.header_items()}
-    assert headers == {"user-agent": bg.USER_AGENT}
-    assert request.full_url.startswith("https://huggingface.co/datasets/Robeedau/airlens-live/resolve/main/")
-    assert timeout == bg.FETCH_TIMEOUT_S
-
-
 # ── check: 사실 수집 + 판정 ──────────────────────────────────────────────────
-class FakeClient(bg.PublicClient):
-    """공개 저장소 대역. files = 경로 → bytes | 예외 (없으면 404). 조회한 (경로, 본문을 읽었나) 를 기록한다."""
+class FakeClient(cc.HttpSource):
+    """공개 저장소 대역(`read_json` 은 `HttpSource` 것 그대로). files = 경로 → bytes | 예외 (없으면 404).
+    조회한 (경로, 본문을 읽었나) 를 기록한다. 재시도·상태 코드·헤더는 test_compare_candidate.py 가 `HttpSource` 로 시험한다."""
 
     def __init__(self, files: dict[str, object] | None = None) -> None:
         super().__init__(sleep=lambda _s: None)
         self.files = files or {}
         self.calls: list[tuple[str, bool]] = []
 
-    def _fetch(self, rel_path: str, *, read_body: bool) -> bytes | None:
+    def _lookup(self, rel_path: str, *, read_body: bool) -> bytes | None:
         self.calls.append((rel_path, read_body))
         value = self.files.get(rel_path)
         if isinstance(value, BaseException):
@@ -320,6 +148,12 @@ class FakeClient(bg.PublicClient):
         if value is None:
             return None
         return value if read_body else b""  # type: ignore[return-value]
+
+    def read_bytes(self, rel_path: str) -> bytes | None:
+        return self._lookup(rel_path, read_body=True)
+
+    def exists(self, rel_path: str) -> bool:
+        return self._lookup(rel_path, read_body=False) is not None
 
     @property
     def paths(self) -> list[str]:
@@ -378,7 +212,7 @@ def test_production_check_without_a_published_latest_runs_without_a_warning():
         (b"<html>", "JSON 아님"),
         (doc(schema_version="w3-band-v1"), "issue_time 를 읽을 수 없다"),
         (doc(issue_time="garbage"), "issue_time 를 읽을 수 없다"),
-        (bg.FetchError("aq-data/forecast-band/latest.json: HTTPError status=500"), "status=500"),
+        (cc.SourceError("aq-data/forecast-band/latest.json: HTTPError status=500"), "status=500"),
     ],
 )
 def test_production_check_with_an_unreadable_latest_runs_and_warns(latest, expected):
@@ -401,7 +235,7 @@ def test_production_check_with_an_unreadable_latest_runs_and_warns(latest, expec
         (doc(cities=[]), "generated_at 를 읽을 수 없다"),
         (forecast("garbage"), "generated_at 를 읽을 수 없다"),
         (forecast(12), "generated_at 를 읽을 수 없다"),
-        (bg.FetchError("aq-data/forecast.json: URLError"), "URLError"),
+        (cc.SourceError("aq-data/forecast.json: URLError"), "URLError"),
     ],
 )
 @pytest.mark.parametrize("mode", ["production", "candidate"])
@@ -444,7 +278,7 @@ def test_candidate_check_runs_when_the_stamped_file_is_missing():
 
 def test_candidate_check_runs_and_warns_when_the_existence_check_fails():
     # Arrange
-    client = FakeClient({bg.FORECAST_PATH: forecast(), CANDIDATE_PATH: bg.FetchError(f"{CANDIDATE_PATH}: TimeoutError")})
+    client = FakeClient({bg.FORECAST_PATH: forecast(), CANDIDATE_PATH: cc.SourceError(f"{CANDIDATE_PATH}: TimeoutError")})
 
     # Act
     decision, warnings = bg.check("candidate", False, client)
@@ -522,7 +356,7 @@ def test_check_command_appends_to_an_existing_output_file(tmp_path, capsys):
 
 def test_check_command_prints_warnings_as_annotations_and_still_exits_zero(tmp_path, capsys):
     # Arrange
-    client = FakeClient({bg.FORECAST_PATH: bg.FetchError("aq-data/forecast.json: URLError")})
+    client = FakeClient({bg.FORECAST_PATH: cc.SourceError("aq-data/forecast.json: URLError")})
 
     # Act
     code, stdout, output, _ = run_main(["check", "--mode", "production", "--force", "false"], client, tmp_path, capsys)
@@ -607,7 +441,7 @@ def test_snapshot_in_production_mode_does_nothing_and_never_touches_the_network(
     ("latest", "expected"),
     [
         (None, "아직 없다"),
-        (bg.FetchError(f"{pt.BAND_LATEST}: HTTPError status=500"), "받지 못해"),
+        (cc.SourceError(f"{pt.BAND_LATEST}: HTTPError status=500"), "받지 못해"),
         (b"<html>", "받지 못해"),
         (band(schema_version="w3-band-v0"), "모양이 아니라"),
         (band(schema_version=None), "모양이 아니라"),
@@ -630,7 +464,7 @@ def test_snapshot_without_a_usable_latest_leaves_no_file_and_never_fails_the_ste
 
 def test_snapshot_still_writes_when_the_existence_check_fails_and_says_so(tmp_path, capsys):
     # Arrange
-    client = FakeClient({pt.BAND_LATEST: band(), PROD_COPY_PATH: bg.FetchError(f"{PROD_COPY_PATH}: TimeoutError")})
+    client = FakeClient({pt.BAND_LATEST: band(), PROD_COPY_PATH: cc.SourceError(f"{PROD_COPY_PATH}: TimeoutError")})
     dest = tmp_path / "prod_latest.json"
 
     # Act

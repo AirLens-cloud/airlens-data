@@ -13,6 +13,7 @@ band job 은 예보 수집(forecast-collect) 직후와 백업 스케줄에 모�
   --force true 는 어느 쪽이든 건너뛰지 않는다.
 
 시각 문자열은 출처마다 모양이 다르다(`...Z` ↔ `...+00:00`). 문자열이 아니라 파싱한 시각으로 비교한다.
+공개 저장소 조회(재시도·404·오류 문구)는 `compare_candidate.HttpSource` 를 그대로 쓴다 — 조회 코드를 두 벌 두지 않는다.
 
 CLI (워크플로가 쓴다):
     band_guard.py check    --mode M --force true|false   → $GITHUB_OUTPUT 에 `skip=true|false`
@@ -25,28 +26,18 @@ CLI (워크플로가 쓴다):
 from __future__ import annotations
 
 import argparse
-import http.client
-import json
 import os
 import sys
-import time
-import urllib.error
-import urllib.request
-from collections.abc import Callable, Mapping
+from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
+import compare_candidate as cc
 import publish_targets as pt
 
-DATASET = "Robeedau/airlens-live"  # 공개 dataset
-RESOLVE_BASE = f"https://huggingface.co/datasets/{DATASET}/resolve/main"
 FORECAST_PATH = "aq-data/forecast.json"  # 예보 수집이 덮어쓰는 최신 예보
 BAND_SCHEMA = "w3-band-v1"  # 사본으로 남길 운영 latest 의 계약 버전
-USER_AGENT = "airlens-data-band-guard"
-FETCH_TIMEOUT_S = 30
-FETCH_RETRIES = 3
-RETRY_STATUS = (429, 500, 502, 503, 504)
 
 
 @dataclass(frozen=True)
@@ -62,10 +53,6 @@ class Facts:
     issue: datetime | None
     published_issue: datetime | None = None  # production 전용: 운영 latest 의 issue_time
     candidate_exists: bool = False  # candidate 전용
-
-
-class FetchError(Exception):
-    """조회 실패. 메시지에는 URL·응답 본문을 싣지 않는다(경로·오류 종류·상태 코드만)."""
 
 
 def parse_time(value: object) -> datetime:
@@ -104,57 +91,7 @@ def decide(mode: str, force: bool, facts: Facts) -> Decision:
     return Decision(False, f"후보 발행물 band_{stamp_of(facts.issue)}.json 이 없다 — 예보 발행 {issue} 을(를) 돌린다")
 
 
-class PublicClient:
-    """공개 dataset 조회. 토큰을 보내지 않는다. `_open` 만 바꾸면 시험에서 네트워크가 0 이다."""
-
-    def __init__(self, sleep: Callable[[float], None] = time.sleep) -> None:
-        self.sleep = sleep
-
-    def _open(self, url: str):
-        req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
-        return urllib.request.urlopen(req, timeout=FETCH_TIMEOUT_S)  # noqa: S310 — 고정 https 호스트
-
-    def _fetch(self, rel_path: str, *, read_body: bool) -> bytes | None:
-        """본문(read_body=False 면 b""). 404 는 None. 429·5xx·연결 오류는 재시도한다."""
-        url = f"{RESOLVE_BASE}/{rel_path}"
-        for attempt in range(1, FETCH_RETRIES + 1):
-            try:
-                with self._open(url) as resp:
-                    return resp.read() if read_body else b""
-            except urllib.error.HTTPError as exc:
-                if exc.code == 404:
-                    return None
-                if exc.code not in RETRY_STATUS or attempt == FETCH_RETRIES:
-                    raise FetchError(f"{rel_path}: HTTPError status={exc.code}") from None
-            except (OSError, http.client.HTTPException) as exc:  # URLError·타임아웃·SSLError·IncompleteRead 포함
-                if attempt == FETCH_RETRIES:
-                    raise FetchError(f"{rel_path}: {type(exc).__name__}") from None
-            self.sleep(2.0 * attempt)
-        raise AssertionError("unreachable")
-
-    def read_bytes(self, rel_path: str) -> bytes | None:
-        return self._fetch(rel_path, read_body=True)
-
-    def exists(self, rel_path: str) -> bool:
-        """본문을 읽지 않고 열어 보기만 한다."""
-        return self._fetch(rel_path, read_body=False) is not None
-
-    def read_json(self, rel_path: str) -> dict | None:
-        body = self.read_bytes(rel_path)
-        return None if body is None else json_object(body, rel_path)
-
-
-def json_object(body: bytes, what: str) -> dict:
-    try:
-        data = json.loads(body)
-    except ValueError:  # JSONDecodeError · UnicodeDecodeError
-        raise FetchError(f"{what}: JSON 아님") from None
-    if not isinstance(data, dict):
-        raise FetchError(f"{what}: JSON 객체 아님")
-    return data
-
-
-def _read_instant(client: PublicClient, rel_path: str, key: str, warnings: list[str], *, missing_ok: bool = False) -> datetime | None:
+def _read_instant(client: cc.HttpSource, rel_path: str, key: str, warnings: list[str], *, missing_ok: bool = False) -> datetime | None:
     """`rel_path` 의 JSON 에서 `key` 시각을 읽는다. 못 읽으면 경고를 모으고 None (missing_ok 면 파일 없음은 조용히)."""
     try:
         doc = client.read_json(rel_path)
@@ -163,14 +100,14 @@ def _read_instant(client: PublicClient, rel_path: str, key: str, warnings: list[
                 warnings.append(f"{rel_path}: 파일이 없다")
             return None
         return parse_time(doc.get(key))
-    except FetchError as exc:
+    except cc.SourceError as exc:
         warnings.append(str(exc))
     except ValueError as exc:
         warnings.append(f"{rel_path}: {key} 를 읽을 수 없다 ({exc})")
     return None
 
 
-def observe(mode: str, client: PublicClient, warnings: list[str]) -> Facts:
+def observe(mode: str, client: cc.HttpSource, warnings: list[str]) -> Facts:
     """판정에 필요한 사실을 공개 저장소에서 읽는다. 실패는 경고로 모으고 모르는 값으로 둔다."""
     issue = _read_instant(client, FORECAST_PATH, "generated_at", warnings)
     if issue is None:
@@ -180,19 +117,19 @@ def observe(mode: str, client: PublicClient, warnings: list[str]) -> Facts:
     candidate_path = pt.band_history_dest(stamp_of(issue))
     try:
         return Facts(issue, candidate_exists=client.exists(candidate_path))
-    except FetchError as exc:
+    except cc.SourceError as exc:
         warnings.append(str(exc))
         return Facts(issue)
 
 
-def check(mode: str, force: bool, client: PublicClient) -> tuple[Decision, list[str]]:
+def check(mode: str, force: bool, client: cc.HttpSource) -> tuple[Decision, list[str]]:
     """(판정, 경고들). `--force` 면 공개 저장소를 조회하지 않는다."""
     warnings: list[str] = []
     facts = Facts(None) if force else observe(mode, client, warnings)
     return decide(mode, force, facts), warnings
 
 
-def snapshot(client: PublicClient, dest: Path, warnings: list[str]) -> str:
+def snapshot(client: cc.HttpSource, dest: Path, warnings: list[str]) -> str:
     """지금의 운영 latest 원문을 dest 로 저장한다(후보 모드). 결과 설명 한 줄을 돌려준다.
 
     같은 issue 의 사본이 이미 있으면 쓰지 않는다. 운영 latest 를 못 받거나 band 계약 모양이 아니면 쓰지 않고 경고만 남긴다 —
@@ -202,8 +139,8 @@ def snapshot(client: PublicClient, dest: Path, warnings: list[str]) -> str:
         body = client.read_bytes(pt.BAND_LATEST)
         if body is None:
             return "운영 latest 가 아직 없다 — 사본을 남기지 않는다"
-        doc = json_object(body, pt.BAND_LATEST)
-    except FetchError as exc:
+        doc = cc.parse_json_object(body, pt.BAND_LATEST)
+    except cc.SourceError as exc:
         warnings.append(str(exc))
         return "운영 latest 를 받지 못해 사본을 남기지 않는다"
     try:
@@ -216,7 +153,7 @@ def snapshot(client: PublicClient, dest: Path, warnings: list[str]) -> str:
     try:
         if client.exists(pt.band_prod_copy_dest(stamp)):
             return f"issue {stamp} 의 운영 사본이 이미 있다 — 쓰지 않는다"
-    except FetchError as exc:  # 확인을 못 했으면 쓴다. 같은 issue 의 운영 latest 는 덮어써도 비교에 해가 없다
+    except cc.SourceError as exc:  # 확인을 못 했으면 쓴다. 같은 issue 의 운영 latest 는 덮어써도 비교에 해가 없다
         warnings.append(str(exc))
     dest.parent.mkdir(parents=True, exist_ok=True)
     dest.write_bytes(body)
@@ -231,7 +168,7 @@ def _append(env: Mapping[str, str], key: str, text: str) -> None:
             fh.write(text)
 
 
-def main(argv: list[str] | None = None, *, client: PublicClient | None = None, env: Mapping[str, str] | None = None) -> int:
+def main(argv: list[str] | None = None, *, client: cc.HttpSource | None = None, env: Mapping[str, str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = parser.add_subparsers(dest="cmd", required=True)
 
@@ -244,7 +181,7 @@ def main(argv: list[str] | None = None, *, client: PublicClient | None = None, e
     p_snap.add_argument("--dest", required=True, type=Path)
 
     args = parser.parse_args(argv)
-    client = client or PublicClient()
+    client = client or cc.HttpSource()
     env = os.environ if env is None else env
     warnings: list[str] = []
 

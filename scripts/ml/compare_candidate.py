@@ -139,6 +139,15 @@ def _json_object(data: object, rel_path: str) -> dict:
     return data
 
 
+def parse_json_object(body: bytes, rel_path: str) -> dict:
+    """본문 → JSON 객체. JSON 이 아니거나 객체가 아니면 SourceError."""
+    try:
+        data = json.loads(body)
+    except ValueError:  # JSONDecodeError · UnicodeDecodeError
+        raise SourceError(f"{rel_path}: JSON 아님") from None
+    return _json_object(data, rel_path)
+
+
 # ── 순수 판정 함수 ───────────────────────────────────────────────────────────
 def _num(value: object) -> float | None:
     """유한한 숫자만 돌려준다. bool·문자열·NaN·inf 는 None — NaN 과의 비교는 늘 False 라 허용오차 판정을 조용히 통과한다."""
@@ -595,7 +604,7 @@ class LocalSource:
 
 
 class HttpSource:
-    """공개 저장소. 토큰을 보내지 않는다."""
+    """공개 저장소. 토큰을 보내지 않는다. `band_guard.py` 도 이 클래스로 읽는다."""
 
     def __init__(self, sleep: Callable[[float], None] = time.sleep) -> None:
         self.sleep = sleep
@@ -604,12 +613,12 @@ class HttpSource:
         req = urllib.request.Request(url, headers={"User-Agent": "airlens-data-compare-candidate"})
         return urllib.request.urlopen(req, timeout=FETCH_TIMEOUT_S)  # noqa: S310 — 고정 https 호스트
 
-    def _get(self, url: str, what: str):
-        """(본문 bytes, Link 헤더). 404 는 (None, '')."""
+    def _get(self, url: str, what: str, *, read_body: bool = True):
+        """(본문 bytes, Link 헤더). 404 는 (None, ''). read_body=False 면 열어 보기만 한다(본문 b"")."""
         for attempt in range(1, FETCH_RETRIES + 1):
             try:
                 with self._open(url) as resp:
-                    return resp.read(), resp.headers.get("Link") or ""
+                    return (resp.read() if read_body else b""), resp.headers.get("Link") or ""
             except urllib.error.HTTPError as exc:
                 if exc.code == 404:
                     return None, ""
@@ -642,15 +651,17 @@ class HttpSource:
             url = nxt.group(1) if nxt else None
         return sorted(stamps)
 
+    def read_bytes(self, rel_path: str) -> bytes | None:
+        """본문 그대로. 없으면(404) None."""
+        return self._get(f"{RESOLVE_BASE}/{rel_path}", rel_path)[0]
+
+    def exists(self, rel_path: str) -> bool:
+        """본문을 읽지 않고 열어 보기만 한다."""
+        return self._get(f"{RESOLVE_BASE}/{rel_path}", rel_path, read_body=False)[0] is not None
+
     def read_json(self, rel_path: str) -> dict | None:
-        body, _ = self._get(f"{RESOLVE_BASE}/{rel_path}", rel_path)
-        if body is None:
-            return None
-        try:
-            data = json.loads(body)
-        except ValueError:
-            raise SourceError(f"{rel_path}: JSON 아님") from None
-        return _json_object(data, rel_path)
+        body = self.read_bytes(rel_path)
+        return None if body is None else parse_json_object(body, rel_path)
 
 
 def _contract_validator() -> Callable[[dict], str | None]:
