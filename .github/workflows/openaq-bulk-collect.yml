@@ -63,8 +63,12 @@ jobs:
         with:
           python-version: '3.11'
 
-      - name: Install huggingface_hub
-        run: python3 -m pip install --quiet "huggingface_hub>=0.34,<2"
+      # HF 쓰기 토큰이 있는 잡 — 해시 고정본만 깐다(scripts/etl/test_publish_install_lock.py 가 지킨다).
+      - name: Install huggingface_hub (hash-locked)
+        run: |
+          python3 -m pip install --no-cache-dir --require-hashes --no-deps --only-binary :all: \
+            -r scripts/etl/requirements-publish.lock.txt
+          python3 -m pip check
 
       # 신규 pip dep 0(stdlib urllib only) — 수집기 본문은 scripts/etl/collect_openaq_bulk.py,
       # 시험은 scripts/etl/test_collect_openaq_bulk.py(CI: pr-check etl-tests). OPENAQ_API_KEY

@@ -77,8 +77,12 @@ jobs:
             python3 scripts/etl/collect_news.py --out articles.json
           fi
 
-      - name: Install huggingface_hub
-        run: python3 -m pip install --quiet "huggingface_hub>=0.34,<2"
+      # HF 쓰기 토큰이 있는 잡 — 해시 고정본만 깐다(scripts/etl/test_publish_install_lock.py 가 지킨다).
+      - name: Install huggingface_hub (hash-locked)
+        run: |
+          python3 -m pip install --no-cache-dir --require-hashes --no-deps --only-binary :all: \
+            -r scripts/etl/requirements-publish.lock.txt
+          python3 -m pip check
 
       # hf_publish.py 는 빈 파일 업로드를 거부한다. collect_news.py 는 수집 0건이면
       # articles.json 자체를 쓰지 않고 exit 1 하므로(이전 발행본을 덮지 않기 위해),

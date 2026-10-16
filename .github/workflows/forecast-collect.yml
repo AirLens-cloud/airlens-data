@@ -42,8 +42,12 @@ jobs:
         with:
           python-version: '3.11'
 
-      - name: Install huggingface_hub
-        run: pip install "huggingface_hub>=0.34,<2"
+      # HF 쓰기 토큰이 있는 잡 — 해시 고정본만 깐다(scripts/etl/test_publish_install_lock.py 가 지킨다).
+      - name: Install huggingface_hub (hash-locked)
+        run: |
+          python3 -m pip install --no-cache-dir --require-hashes --no-deps --only-binary :all: \
+            -r scripts/etl/requirements-publish.lock.txt
+          python3 -m pip check
 
       - name: Collect Open-Meteo CAMS forecast
         run: |
