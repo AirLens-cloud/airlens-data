@@ -63,8 +63,7 @@ jobs:
         with:
           python-version: '3.11'
 
-      # 이 잡은 HF 쓰기 토큰을 쓴다 — 범위 지정 설치(`>=0.34,<2`) 대신 해시 고정본만 깐다(sdist 빌드·미고정 전이 의존 없음).
-      # 고정 설치 줄은 scripts/etl/test_publish_install_lock.py 가 지킨다.
+      # HF 쓰기 토큰이 있는 잡 — 해시 고정본만 깐다(scripts/etl/test_publish_install_lock.py 가 지킨다).
       - name: Install huggingface_hub (hash-locked)
         run: |
           python3 -m pip install --no-cache-dir --require-hashes --no-deps --only-binary :all: \
