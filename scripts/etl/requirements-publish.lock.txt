@@ -1,7 +1,9 @@
-# 해시 고정본 — publish 잡이 설치하는 huggingface_hub 와 그 의존성 전부(전이 포함)의 정확한 버전에 파일 해시를 더한 것.
-# 이 잡은 HF 쓰기 토큰을 받는 스텝이 있어서 범위 지정 설치(`>=0.34,<2`)를 쓰지 않는다.
-# 발행기를 쓰는 다른 워크플로가 같은 고정본을 쓰도록 scripts/etl/ 에 둔다(CPython 3.11 기준 — 지금 쓰는 곳은 ml-predict 의 publish 잡).
-# 설치(publish job):
+# 해시 고정본 — 발행기(scripts/etl/hf_publish.py)가 쓰는 huggingface_hub 와 그 의존성 전부(전이 포함)의 정확한 버전에 파일 해시를 더한 것.
+# 이 파일을 쓰는 잡은 HF 쓰기 토큰을 받는 스텝이 있어서 범위 지정 설치(`>=0.34,<2`)를 쓰지 않는다.
+# 발행기를 쓰는 워크플로가 같은 고정본을 쓰도록 scripts/etl/ 에 둔다(CPython 3.11 기준). 쓰는 곳: ml-predict 의 publish 잡,
+# data-collect-hourly, firms-collect, forecast-collect, hf-live-squash, news-collect, openaq-bulk-collect, shadow-retention, timeline-collect.
+# 토큰이 있는 잡의 설치 줄은 scripts/etl/test_publish_install_lock.py 가 지킨다. 이 파일만으로 모자란 워크플로(의존성이 더 있는 것)는 자기 고정본을 따로 둔다.
+# 설치(HF 쓰기 토큰이 있는 잡):
 #   python3 -m pip install --no-cache-dir --require-hashes --no-deps --only-binary :all: -r scripts/etl/requirements-publish.lock.txt
 #   python3 -m pip check
 # 점검(2026-10-16, PyPI): 전부 출시 7일 이상 경과(`--exclude-newer 2026-10-09`), 전부 CPython 3.11 / manylinux_2_28

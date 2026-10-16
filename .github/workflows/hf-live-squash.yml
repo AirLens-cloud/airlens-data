@@ -31,7 +31,12 @@ jobs:
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
         with:
           python-version: '3.11'
-      - name: Install huggingface_hub
-        run: pip install "huggingface_hub>=0.34,<2"
+      # 이 잡은 HF 쓰기 토큰을 쓴다 — 범위 지정 설치(`>=0.34,<2`) 대신 해시 고정본만 깐다(sdist 빌드·미고정 전이 의존 없음).
+      # 고정 설치 줄은 scripts/etl/test_publish_install_lock.py 가 지킨다.
+      - name: Install huggingface_hub (hash-locked)
+        run: |
+          python3 -m pip install --no-cache-dir --require-hashes --no-deps --only-binary :all: \
+            -r scripts/etl/requirements-publish.lock.txt
+          python3 -m pip check
       - name: Squash history
         run: python3 scripts/etl/hf_publish.py squash

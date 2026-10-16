@@ -42,10 +42,14 @@ jobs:
 
       # hosted 는 매 run 새 VM — apt install 을 재시도 포함해 먼저 시도하고, 실패할 때만
       # update 후 재설치한다(매번 update 하면 미러 동기화 중 "File has unexpected size" 위험).
-      - name: Install eccodes (GRIB decode) + huggingface_hub
+      # 이 잡은 HF 쓰기 토큰을 쓴다 — huggingface_hub 는 범위 지정 설치(`>=0.34,<2`) 대신 해시 고정본만 깐다(sdist 빌드·미고정 전이 의존 없음).
+      # 고정 설치 줄은 scripts/etl/test_publish_install_lock.py 가 지킨다.
+      - name: Install eccodes (GRIB decode) + huggingface_hub (hash-locked)
         run: |
           command -v grib_get_data >/dev/null || sudo apt-get install -y -qq -o Acquire::Retries=3 libeccodes-tools || { sudo apt-get update -qq -o Acquire::Retries=3 && sudo apt-get install -y -qq -o Acquire::Retries=3 libeccodes-tools; }
-          pip install "huggingface_hub>=0.34,<2"
+          python3 -m pip install --no-cache-dir --require-hashes --no-deps --only-binary :all: \
+            -r scripts/etl/requirements-publish.lock.txt
+          python3 -m pip check
 
       - name: Collect GEFS timeline frames (PM2.5 ±24h, 3h step)
         run: python3 scripts/etl/collect_gefs_timeline.py

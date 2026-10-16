@@ -48,8 +48,13 @@ jobs:
           NASA_FIRMS_MAP_KEY: ${{ secrets.NASA_FIRMS_MAP_KEY }}
         run: python3 scripts/etl/collect_firms.py --out active-fires.json
 
-      - name: Install huggingface_hub
-        run: python3 -m pip install --quiet "huggingface_hub>=0.34,<2"
+      # 이 잡은 HF 쓰기 토큰을 쓴다 — 범위 지정 설치(`>=0.34,<2`) 대신 해시 고정본만 깐다(sdist 빌드·미고정 전이 의존 없음).
+      # 고정 설치 줄은 scripts/etl/test_publish_install_lock.py 가 지킨다.
+      - name: Install huggingface_hub (hash-locked)
+        run: |
+          python3 -m pip install --no-cache-dir --require-hashes --no-deps --only-binary :all: \
+            -r scripts/etl/requirements-publish.lock.txt
+          python3 -m pip check
 
       # Supabase Storage(wind-data 버킷) 업로드였다가 HF dataset repo 로 전환
       # (2026-08-20, Supabase 402 Storage 탈출 Track 1 W1). frontend-data-sync.yml 은
