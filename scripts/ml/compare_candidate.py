@@ -23,11 +23,15 @@ predictions(grid + DQSS, 기본)와 band(예측 밴드, `--product band`)를 다
 band — 후보 `_candidate/forecast-band/history/band_<STAMP>` ↔ 같은 STAMP 의 운영 사본 `_candidate/forecast-band/prod/`
 (운영 band 는 latest 하나만 덮어써서 이력이 없다. 후보 잡이 그 시점 운영 latest 를 옮겨 둔다). STAMP = 발행물 `issue_time` 의
 UTC 시. 값은 도시·지평(lead_hours) 셀 단위로 비교한다.
-  엄격 짝 = `issue_time`(시각으로 비교) · `model` · 지평별 `n_holdout`(uncertainty.picp80_claim_by_horizon) 이 모두 같은 쌍.
-  `n_holdout` 이 다르면 보정(CQR) 표본이 달라 p10/p90 이 정당하게 달라지므로 엄격 비교하지 않는다(INPUT-DIFF).
+  엄격 짝 = `issue_time`(시각으로 비교) · `model` 이 모두 같은 쌍. 입력이 같으니 p50 은 같아야 한다.
+  p10/p90 은 보정(CQR) 표본 수 `n_holdout`(uncertainty.picp80_claim_by_horizon)에 달려 있다 — 운영과 후보가 다른 시각에 돌면
+  표본이 달라 p10/p90 이 정당하게 달라진다. 그래서 `n_holdout` 이 양쪽 정수로 읽히고 같은 지평에서만 p10/p90 을 엄격 비교하고,
+  나머지 지평의 p10/p90 은 INPUT-DIFF(판정에서 뺀다, 보고만)다. p50 은 모든 지평을 판정한다.
     · 도시 집합 동일, 도시별 지평 집합 동일, 키 중복 없음 (필수)
-    · p10/p50/p90 |Δ| ≤ 0.01 인 셀 ≥ 95%, 지평별 최대 |Δ| ≤ 0.5   (p50 은 반올림 없이 float 로 나온다)
+    · p50 |Δ| ≤ 0.01 인 셀 ≥ 95% (공통 셀 전부), p10/p90 |Δ| ≤ 0.01 인 셀 ≥ 95% (엄격 지평의 셀),
+      분위수별 최대 |Δ| ≤ 0.5   (p50 은 반올림 없이 float 로 나온다)
   이 값은 첫 엄격 짝을 본 뒤 보정한다. 계약 위반은 INPUT-DIFF 여도 FAIL 이다.
+  요약에 p10/p90 을 엄격 비교한 지평 수와 뺀 지평 수를 적는다 — 엄격 비교한 지평이 0 이면 p50 만 검증된 것이다.
 
 판정: PASS / FAIL / INPUT-DIFF(입력이 달라 엄격 비교 불가) / UNPAIRED(한쪽에 파일 없음).
 종료 코드: 0 = FAIL 없음 + 엄격 PASS ≥ 최소(predictions 3, band 2) / 1 = FAIL 있음 / 2 = 엄격 PASS 부족 또는 읽기 실패.
@@ -115,6 +119,8 @@ class PairResult:
     checks: list[Check] = field(default_factory=list)
     max_delta: dict[str, float] = field(default_factory=dict)
     worst_rows: list[dict] = field(default_factory=list)
+    tail_judged: list[str] = field(default_factory=list)  # band: p10/p90 을 엄격 비교한 지평(lead_hours)
+    tail_skipped: list[str] = field(default_factory=list)  # band: n_holdout 이 달라(또는 읽을 수 없어) p10/p90 판정에서 뺀 지평
 
 
 class SourceError(Exception):
@@ -338,18 +344,15 @@ def _instant(value: object) -> datetime | None:
     return parsed.astimezone(timezone.utc) if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
 
 
-def _holdout_counts(payload: dict) -> dict[str, int] | None:
-    """지평(문자열 키) → n_holdout. 하나라도 정수가 아니거나 비어 있으면 None(같다고 말할 수 없다)."""
+def _holdout_counts(payload: dict) -> dict[str, int]:
+    """지평(문자열 키) → n_holdout. 정수로 읽히는 지평만 담는다 — 읽을 수 없는 지평은 같다고 말할 수 없다."""
     uncertainty = payload.get("uncertainty")
     claims = uncertainty.get("picp80_claim_by_horizon") if isinstance(uncertainty, dict) else None
-    if not isinstance(claims, dict) or not claims:
-        return None
     counts: dict[str, int] = {}
-    for horizon, claim in claims.items():
+    for horizon, claim in claims.items() if isinstance(claims, dict) else ():
         n = claim.get("n_holdout") if isinstance(claim, dict) else None
-        if isinstance(n, bool) or not isinstance(n, int):
-            return None
-        counts[str(horizon)] = n
+        if isinstance(n, int) and not isinstance(n, bool):
+            counts[str(horizon)] = n
     return counts
 
 
@@ -361,9 +364,6 @@ def band_identity_mismatches(prod: dict, cand: dict) -> list[str]:
         out.append("issue_time")
     if prod.get("model") != cand.get("model"):
         out.append("model")
-    p_counts, c_counts = _holdout_counts(prod), _holdout_counts(cand)
-    if p_counts is None or p_counts != c_counts:
-        out.append("n_holdout")
     return out
 
 
@@ -388,8 +388,22 @@ def _leads_by_city(cells: dict[tuple, dict]) -> dict[object, set]:
     return out
 
 
+def _lead_order(horizon: str) -> tuple[int, str]:
+    return len(horizon), horizon  # "1" < "6" < "24"
+
+
+def band_tail_split(prod: dict, cand: dict) -> tuple[list[str], list[str]]:
+    """공통 지평(lead_hours 문자열)을 (p10/p90 을 엄격 비교하는 지평, 판정에서 뺀 지평)으로 나눈다.
+    양쪽 n_holdout 이 정수로 읽히고 같은 지평만 엄격 비교한다(없음 == 없음 은 같은 것이 아니다)."""
+    p_counts, c_counts = _holdout_counts(prod), _holdout_counts(cand)
+    common = {str(lead) for _name, lead in set(_band_cells(prod)[0]) & set(_band_cells(cand)[0])}
+    strict = {h for h in common if h in p_counts and p_counts[h] == c_counts.get(h)}
+    return sorted(strict, key=_lead_order), sorted(common - strict, key=_lead_order)
+
+
 def compare_band(prod: dict, cand: dict) -> tuple[list[Check], dict[str, float], list[dict]]:
-    """엄격 짝의 band 비교. (checks, 분위수별 최대 |Δ|, 실패 셀 상위)."""
+    """엄격 짝의 band 비교. p50 은 공통 셀 전부, p10/p90 은 n_holdout 이 같은 지평의 셀만 판정한다.
+    (checks, 분위수별 최대 |Δ|(판정한 셀 기준), 실패 셀 상위)."""
     p_cells, p_dups = _band_cells(prod)
     c_cells, c_dups = _band_cells(cand)
     p_leads, c_leads = _leads_by_city(p_cells), _leads_by_city(c_cells)
@@ -406,31 +420,52 @@ def compare_band(prod: dict, cand: dict) -> tuple[list[Check], dict[str, float],
         checks.append(Check("비교할 셀", "공통 셀 없음", False))
         return checks, {}, []
 
-    deltas: dict[str, list[float | None]] = {q: [] for q in BAND_QUANTILES}
+    tail_judged, tail_skipped = band_tail_split(prod, cand)
+    judged_leads = set(tail_judged)
+    deltas: dict[str, list[float | None]] = {q: [] for q in BAND_QUANTILES}  # 판정한 셀만 담는다
     worst: list[dict] = []
-    within = 0
+    within_p50 = within_tail = tail_cells = 0
     for key in common:
-        cell_ok = True
+        in_tail = str(key[1]) in judged_leads
+        p50_ok = tail_ok = True
         cell_worst: tuple[float, str, object, object] | None = None
         for q in BAND_QUANTILES:
+            if q != "p50" and not in_tail:
+                continue  # n_holdout 이 다른 지평의 p10/p90 — 판정에서 뺀다
             a, b = _num(p_cells[key].get(q)), _num(c_cells[key].get(q))
             if a is None or b is None:
                 deltas[q].append(None)
-                cell_ok = False
+                good = False
                 cell_worst = (float("inf"), q, _shown(p_cells[key].get(q)), _shown(c_cells[key].get(q)))
-                continue
-            d = abs(a - b)
-            deltas[q].append(d)
-            if d > BAND_TOL + EPS:
-                cell_ok = False
-            if cell_worst is None or d > cell_worst[0]:
-                cell_worst = (d, q, a, b)
-        within += cell_ok
-        if not cell_ok and cell_worst is not None:
+            else:
+                d = abs(a - b)
+                deltas[q].append(d)
+                good = d <= BAND_TOL + EPS
+                if cell_worst is None or d > cell_worst[0]:
+                    cell_worst = (d, q, a, b)
+            if not good:
+                if q == "p50":
+                    p50_ok = False
+                else:
+                    tail_ok = False
+        within_p50 += p50_ok
+        tail_cells += in_tail
+        within_tail += in_tail and tail_ok
+        if not (p50_ok and tail_ok) and cell_worst is not None:
             worst.append({"name": key[0], "field": f"h{key[1]} {cell_worst[1]}", "prod": cell_worst[2], "cand": cell_worst[3],
                           "abs_delta": None if cell_worst[0] == float("inf") else round(cell_worst[0], 6)})
-    frac = _fraction(within, len(common))
-    checks.append(Check(f"p10/p50/p90 |Δ|≤{BAND_TOL:g}", f"{within}/{len(common)} ({_pct(frac)})", frac >= BAND_TOL_FRACTION))
+    frac = _fraction(within_p50, len(common))
+    checks.append(Check(f"p50 |Δ|≤{BAND_TOL:g}", f"{within_p50}/{len(common)} ({_pct(frac)})", frac >= BAND_TOL_FRACTION))
+    if tail_cells:
+        tail_frac = _fraction(within_tail, tail_cells)
+        checks.append(Check(f"p10/p90 |Δ|≤{BAND_TOL:g}", f"{within_tail}/{tail_cells} ({_pct(tail_frac)}) — 지평 {', '.join(tail_judged)}",
+                            tail_frac >= BAND_TOL_FRACTION))
+    else:
+        checks.append(Check(f"p10/p90 |Δ|≤{BAND_TOL:g}", "엄격 비교할 지평 없음 — n_holdout 이 모든 지평에서 다르거나 읽을 수 없다", None))
+    if tail_skipped:
+        p_counts, c_counts = _holdout_counts(prod), _holdout_counts(cand)
+        checks.append(Check("p10/p90 판정 제외(INPUT-DIFF)", ", ".join(
+            f"h{h}(n_holdout 운영 {p_counts.get(h, '?')} / 후보 {c_counts.get(h, '?')})" for h in tail_skipped), None))
 
     max_delta: dict[str, float] = {}
     for q in BAND_QUANTILES:
@@ -438,7 +473,7 @@ def compare_band(prod: dict, cand: dict) -> tuple[list[Check], dict[str, float],
         max_delta[q] = round(max(finite), 6) if finite else 0.0
     unreadable = sum(d is None for q in BAND_QUANTILES for d in deltas[q])
     over = max(max_delta.values()) > BAND_MAX + EPS or unreadable > 0
-    checks.append(Check(f"최대 |Δ|≤{BAND_MAX}", ", ".join(f"{q} {max_delta[q]}" for q in BAND_QUANTILES)
+    checks.append(Check(f"최대 |Δ|≤{BAND_MAX}", ", ".join(f"{q} {max_delta[q]}" if deltas[q] else f"{q} (판정 없음)" for q in BAND_QUANTILES)
                         + (f" (숫자 아님 {unreadable})" if unreadable else ""), not over))
 
     worst.sort(key=lambda r: (r["abs_delta"] is not None, -(r["abs_delta"] or 0)))
@@ -474,7 +509,8 @@ def classify_band_pair(
     checks, max_delta, worst = compare_band(prod, cand)
     checks.append(Check("후보 계약", error or "통과", error is None))
     reasons = [f"{c.name}: {c.detail}" for c in checks if c.ok is False]
-    return PairResult(stamp, FAIL if reasons else PASS, True, reasons, checks, max_delta, worst)
+    tail_judged, tail_skipped = band_tail_split(prod, cand)
+    return PairResult(stamp, FAIL if reasons else PASS, True, reasons, checks, max_delta, worst, tail_judged, tail_skipped)
 
 
 def parse_since(value: str) -> str:
@@ -508,6 +544,8 @@ def render_markdown(results: list[PairResult], summary: dict, product: str = "pr
         f" (후보 시간대의 운영 STAMP 중 후보 없음 {summary['prod_only_stamps']})",
         f"엄격 PASS {summary['strict_pass']} (필요 ≥ {summary['min_strict_pairs']}) · "
         "최대 |Δ| " + ", ".join(f"{q.removeprefix('predicted_')} {v}" for q, v in summary["max_delta"].items()),
+        *([f"p10/p90 엄격 비교 지평 {summary['tail_horizons_judged']}곳 · n_holdout 이 달라 판정에서 뺀 지평 {summary['tail_horizons_skipped']}곳"
+           " (p50 은 모든 지평을 판정한다)"] if "tail_horizons_judged" in summary else []),
         "",
         "| STAMP | 판정 | 엄격 | 사유 |",
         "|---|---|---|---|",
@@ -662,7 +700,10 @@ def run_band(source: Source, validate: Callable[[dict], str | None], since: str 
     results = [classify_band_pair(stamp, source.read_json(f"{PROD_BAND_DIR}/band_{stamp}.json"),
                                   source.read_json(f"{CAND_BAND_DIR}/band_{stamp}.json"), validate)
                for stamp in cand_stamps]
-    return results, summarize(results, _prod_only_count(source, PROD_BAND_DIR, "band", cand_stamps), min_strict, BAND_QUANTILES)
+    summary = summarize(results, _prod_only_count(source, PROD_BAND_DIR, "band", cand_stamps), min_strict, BAND_QUANTILES)
+    summary["tail_horizons_judged"] = sum(len(r.tail_judged) for r in results)  # 지평을 채우는 것은 엄격 짝(PASS·FAIL)뿐이다
+    summary["tail_horizons_skipped"] = sum(len(r.tail_skipped) for r in results)
+    return results, summary
 
 
 def main(argv: list[str] | None = None, validate: Callable[[dict], str | None] | None = None) -> int:

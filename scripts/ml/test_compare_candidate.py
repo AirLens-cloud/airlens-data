@@ -1325,7 +1325,7 @@ def test_three_of_sixty_cells_over_tolerance_still_passes_at_the_95_percent_boun
 
     # Assert
     assert result.verdict == cc.PASS
-    assert check(result, "p10/p50/p90").detail == "57/60 (95.0%)"
+    assert check(result, "p50 |Δ|").detail == "57/60 (95.0%)"
 
 
 def test_four_of_sixty_cells_over_tolerance_fails_the_95_percent_rule():
@@ -1337,13 +1337,13 @@ def test_four_of_sixty_cells_over_tolerance_fails_the_95_percent_rule():
 
     # Assert
     assert result.verdict == cc.FAIL
-    assert check(result, "p10/p50/p90").ok is False
+    assert check(result, "p50 |Δ|").ok is False
     assert len(result.worst_rows) == 4
 
 
 @pytest.mark.parametrize("quantile", ["p10", "p50", "p90"])
 def test_every_quantile_counts_toward_the_cell_rule(quantile):
-    # Arrange — 한 셀의 한 분위수만 어긋나도 그 셀은 어긋난 셀이다
+    # Arrange — 보정 표본이 같은 지평(h1)에서는 세 분위수 모두 판정한다. 한 분위수만 어긋나도 어긋난 셀이다
     cand = band_shift(band(), [(c, 0) for c in range(4)], quantile, 0.05)
 
     # Act
@@ -1488,17 +1488,116 @@ def test_different_model_makes_the_pair_input_diff():
     assert "model" in result.reasons[0]
 
 
-def test_n_holdout_difference_in_any_horizon_makes_the_pair_input_diff():
-    # Arrange — 보정(CQR) 표본이 다르면 p10/p90 이 정당하게 달라진다. 한 지평만 달라도 엄격 비교하지 않는다.
-    cand = band()
-    cand["uncertainty"]["picp80_claim_by_horizon"]["24"]["n_holdout"] += 1
+def with_n_holdout(payload: dict, by_horizon: dict[str, object]) -> dict:
+    """지평(문자열 키)별 n_holdout 을 바꾼 사본."""
+    out = copy.deepcopy(payload)
+    for horizon, n in by_horizon.items():
+        out["uncertainty"]["picp80_claim_by_horizon"][horizon]["n_holdout"] = n
+    return out
+
+
+ALL_HORIZONS = {h: n + 1 for h, n in N_HOLDOUT.items()}  # 세 지평 모두 보정 표본이 다르다
+
+
+def test_n_holdout_difference_keeps_the_pair_strict_and_leaves_only_that_horizon_out_of_the_p10_p90_judgement():
+    # Arrange — 지평 24 의 보정(CQR) 표본만 다르다. 그 지평의 p10/p90 은 크게 달라도 정당하다.
+    cand = band_shift(band_shift(band(), [(c, 2) for c in range(20)], "p10", 3.0), [(c, 2) for c in range(20)], "p90", -3.0)
+    cand = with_n_holdout(cand, {"24": N_HOLDOUT["24"] + 1})
+
+    # Act
+    result = classify_band(band(), cand)
+
+    # Assert — 짝은 엄격 짝으로 남고(p50 은 판정한다), 뺀 지평의 큰 차이는 최대 |Δ| 에도 들어가지 않는다
+    assert (result.verdict, result.strict, result.reasons) == (cc.PASS, True, [])
+    assert (result.tail_judged, result.tail_skipped) == (["1", "6"], ["24"])
+    assert check(result, "p10/p90 |Δ|").detail == "40/40 (100.0%) — 지평 1, 6"
+    assert check(result, "판정 제외").detail == "h24(n_holdout 운영 469 / 후보 470)"
+    assert check(result, "판정 제외").ok is None
+    assert result.max_delta == {"p10": 0.0, "p50": 0.0, "p90": 0.0}
+
+
+def test_p50_is_judged_on_every_horizon_even_when_n_holdout_differs_everywhere():
+    # Arrange — 보정 표본이 모든 지평에서 달라도 p50 은 보정과 무관하다
+    cand = with_n_holdout(band_shift(band(), [(c, 2) for c in range(20)], "p50", 0.2), ALL_HORIZONS)
 
     # Act
     result = classify_band(band(), cand)
 
     # Assert
-    assert (result.verdict, result.strict) == (cc.INPUT_DIFF, False)
-    assert "n_holdout" in result.reasons[0]
+    assert (result.verdict, result.strict) == (cc.FAIL, True)
+    assert check(result, "p50 |Δ|").detail == "40/60 (66.7%)"
+    assert check(result, "p50 |Δ|").ok is False
+    assert {w["field"] for w in result.worst_rows} == {"h24 p50"}
+
+
+def test_p10_p90_are_judged_on_the_horizons_whose_n_holdout_matches():
+    # Arrange — 지평 24 는 표본이 달라 빼고, 표본이 같은 지평 1 의 p10 이 네 도시에서 어긋난다
+    cand = with_n_holdout(band_shift(band(), [(c, 0) for c in range(4)], "p10", 0.05), {"24": N_HOLDOUT["24"] + 1})
+
+    # Act
+    result = classify_band(band(), cand)
+
+    # Assert — 엄격 지평의 셀 40 개 중 36 개(90%)만 맞아 95% 규칙에 걸린다
+    assert (result.verdict, result.strict) == (cc.FAIL, True)
+    assert check(result, "p10/p90 |Δ|").detail == "36/40 (90.0%) — 지평 1, 6"
+    assert check(result, "p10/p90 |Δ|").ok is False
+    assert check(result, "p50 |Δ|").ok is True
+    assert [w["field"] for w in result.worst_rows] == ["h1 p10"] * 4
+
+
+def test_every_horizon_with_a_different_n_holdout_leaves_p10_p90_unjudged_but_the_pair_stays_strict():
+    # Arrange — 세 지평 모두 표본이 다르다. p10/p90 이 어디서 얼마나 달라도 판정하지 않는다.
+    cand = band_shift(band_shift(band(), [(c, h) for c in range(20) for h in range(3)], "p10", 4.0),
+                      [(c, h) for c in range(20) for h in range(3)], "p90", 4.0)
+    cand = with_n_holdout(cand, ALL_HORIZONS)
+
+    # Act
+    result = classify_band(band(), cand)
+
+    # Assert — p50 만 검증된 엄격 PASS 다. 무엇이 검증되지 않았는지 검사 표에 그대로 적힌다.
+    assert (result.verdict, result.strict, result.reasons) == (cc.PASS, True, [])
+    assert (result.tail_judged, result.tail_skipped) == ([], ["1", "6", "24"])
+    assert check(result, "p10/p90 |Δ|").ok is None
+    assert "엄격 비교할 지평 없음" in check(result, "p10/p90 |Δ|").detail
+    assert check(result, "최대").detail == "p10 (판정 없음), p50 0.0, p90 (판정 없음)"
+    assert check(result, "판정 제외").detail == "h1(n_holdout 운영 1144 / 후보 1145), h6(n_holdout 운영 1146 / 후보 1147), h24(n_holdout 운영 469 / 후보 470)"
+
+
+def test_identical_payloads_judge_p10_p90_on_every_horizon_and_list_no_excluded_horizon():
+    # Act
+    result = classify_band(band(), band())
+
+    # Assert
+    assert (result.tail_judged, result.tail_skipped) == (["1", "6", "24"], [])
+    assert check(result, "p10/p90 |Δ|").detail == "60/60 (100.0%) — 지평 1, 6, 24"
+    assert not [c for c in result.checks if "판정 제외" in c.name]
+
+
+def test_a_horizon_that_exists_on_one_side_only_is_neither_judged_nor_listed_as_left_out():
+    # Arrange — 후보에 지평 24 가 통째로 없다(지평 집합 검사가 FAIL 로 잡는다). 비교하는 지평은 양쪽에 있는 것뿐이다.
+    cand = band()
+    for city in cand["cities"]:
+        del city["horizons"][2]
+
+    # Act
+    result = classify_band(band(), cand)
+
+    # Assert
+    assert result.verdict == cc.FAIL and check(result, "지평 집합").ok is False
+    assert (result.tail_judged, result.tail_skipped) == (["1", "6"], [])
+
+
+def test_a_horizon_left_out_of_the_p10_p90_judgement_is_still_covered_by_the_contract_check():
+    # Arrange — 비교가 읽지 않는 지평의 p90 이 숫자가 아니어도 후보 계약 검사가 잡는다(실제 계약 검증기)
+    cand = with_n_holdout(band_set(band(), 3, 2, p90="x"), {"24": N_HOLDOUT["24"] + 1})
+
+    # Act
+    result = classify_band(band(), cand, cc._contract_validator())
+
+    # Assert
+    assert result.verdict == cc.FAIL
+    assert check(result, "후보 계약").ok is False
+    assert check(result, "최대").ok is True  # 비교는 그 셀의 p90 을 읽지 않았다
 
 
 def _drop_claims(payload: dict) -> None:
@@ -1517,6 +1616,10 @@ def _bool_n_holdout(payload: dict) -> None:
     payload["uncertainty"]["picp80_claim_by_horizon"]["1"]["n_holdout"] = True
 
 
+def _float_n_holdout(payload: dict) -> None:
+    payload["uncertainty"]["picp80_claim_by_horizon"]["1"]["n_holdout"] = 1144.0
+
+
 def _claim_not_object(payload: dict) -> None:
     payload["uncertainty"]["picp80_claim_by_horizon"]["1"] = 1144
 
@@ -1525,10 +1628,17 @@ def _uncertainty_not_object(payload: dict) -> None:
     payload["uncertainty"] = []
 
 
-@pytest.mark.parametrize("mutate", [_drop_claims, _empty_claims, _null_n_holdout, _bool_n_holdout, _claim_not_object, _uncertainty_not_object])
+EVERY_HORIZON = ["1", "6", "24"]
+
+
+@pytest.mark.parametrize(
+    ("mutate", "unreadable"),
+    [(_drop_claims, EVERY_HORIZON), (_empty_claims, EVERY_HORIZON), (_uncertainty_not_object, EVERY_HORIZON),
+     (_null_n_holdout, ["1"]), (_bool_n_holdout, ["1"]), (_float_n_holdout, ["1"]), (_claim_not_object, ["1"])],
+)
 @pytest.mark.parametrize("side", ["prod", "cand"])
-def test_n_holdout_that_cannot_be_read_is_never_treated_as_equal(mutate, side):
-    # Arrange — 양쪽이 똑같이 망가져도 "같다" 고 말할 수 없다(없음 == 없음 이 엄격 짝이 되면 안 된다)
+def test_n_holdout_that_cannot_be_read_is_never_treated_as_equal(mutate, unreadable, side):
+    # Arrange — 양쪽이 똑같이 망가져도 "같다" 고 말할 수 없다(없음 == 없음 이 엄격 지평이 되면 안 된다)
     broken = band()
     mutate(broken)
     prod, cand = (broken, band()) if side == "prod" else (band(), broken)
@@ -1537,9 +1647,25 @@ def test_n_holdout_that_cannot_be_read_is_never_treated_as_equal(mutate, side):
     both_broken = classify_band(broken, copy.deepcopy(broken))
     one_broken = classify_band(prod, cand)
 
-    # Assert
-    assert (both_broken.verdict, one_broken.verdict) == (cc.INPUT_DIFF, cc.INPUT_DIFF)
-    assert "n_holdout" in both_broken.reasons[0]
+    # Assert — 읽을 수 없는 지평만 p10/p90 판정에서 빠진다. 짝은 그대로 엄격 짝이다(p50 은 판정한다).
+    for result in (both_broken, one_broken):
+        assert (result.verdict, result.strict) == (cc.PASS, True)
+        assert result.tail_skipped == unreadable
+        assert result.tail_judged == [h for h in EVERY_HORIZON if h not in unreadable]
+    for h in unreadable:  # 읽을 수 없는 쪽은 `?` 로 적힌다
+        prod_n, cand_n = ("?", N_HOLDOUT[h]) if side == "prod" else (N_HOLDOUT[h], "?")
+        assert f"h{h}(n_holdout 운영 {prod_n} / 후보 {cand_n})" in check(one_broken, "판정 제외").detail
+        assert f"h{h}(n_holdout 운영 ? / 후보 ?)" in check(both_broken, "판정 제외").detail
+
+
+def test_holdout_counts_keep_only_the_horizons_read_as_integers_keyed_by_string():
+    # Arrange
+    payload = band()
+    payload["uncertainty"]["picp80_claim_by_horizon"]["6"]["n_holdout"] = "1146"
+
+    # Act / Assert
+    assert cc._holdout_counts(payload) == {"1": 1144, "24": 469}
+    assert cc._holdout_counts({}) == {}
 
 
 def test_input_diff_pair_ignores_value_differences_but_reports_city_overlap():
@@ -1646,6 +1772,7 @@ def test_render_markdown_names_the_product_and_shows_band_labels():
     assert "## 후보 ↔ 운영 비교 (band)" in text
     assert "| city-00 | h1 p50 |" in text
     assert "최대 |Δ| p10 0.0, p50 0.2, p90 0.0" in text
+    assert "p10/p90 엄격 비교 지평" not in text  # 이 줄은 run_band 가 채우는 요약에만 있다
 
 
 def band_tree(stamps_prod: list[str], stamps_cand: list[str]) -> dict[str, dict]:
@@ -1669,6 +1796,35 @@ def test_run_band_pairs_candidate_stamps_with_the_same_stamp_in_the_production_s
     assert summary["exit_code"] == 0
     assert source.reads == [f"{cc.PROD_BAND_DIR}/band_2026101506.json", f"{cc.CAND_BAND_DIR}/band_2026101506.json",
                             f"{cc.PROD_BAND_DIR}/band_2026101512.json", f"{cc.CAND_BAND_DIR}/band_2026101512.json"]
+
+
+def test_run_band_summary_counts_the_p10_p90_horizons_judged_and_left_out_over_strict_pairs_only():
+    # Arrange — 06시 짝은 지평 24 의 보정 표본만 다르고, 12시 짝은 issue_time 이 달라 엄격 짝이 아니다(지평을 세지 않는다)
+    files = band_tree(["2026101506", "2026101512"], ["2026101506", "2026101512"])
+    files[f"{cc.CAND_BAND_DIR}/band_2026101506.json"] = with_n_holdout(band(), {"24": N_HOLDOUT["24"] + 1})
+    files[f"{cc.CAND_BAND_DIR}/band_2026101512.json"] = band(issue_time="2026-10-15T07:00:00+00:00")
+
+    # Act
+    results, summary = cc.run_band(MemorySource(files), ok, since=None, min_strict=1)
+    text = cc.render_markdown(results, summary, "band")
+
+    # Assert
+    assert [(r.stamp, r.verdict, r.strict) for r in results] == [("2026101506", cc.PASS, True), ("2026101512", cc.INPUT_DIFF, False)]
+    assert results[1].tail_judged == results[1].tail_skipped == []
+    assert (summary["tail_horizons_judged"], summary["tail_horizons_skipped"]) == (2, 1)
+    assert "p10/p90 엄격 비교 지평 2곳 · n_holdout 이 달라 판정에서 뺀 지평 1곳 (p50 은 모든 지평을 판정한다)" in text
+
+
+def test_the_predictions_summary_has_no_p10_p90_horizon_line():
+    # Arrange
+    results = [_result(cc.PASS)]
+
+    # Act
+    summary = cc.summarize(results, prod_only=0, min_strict=1)
+
+    # Assert — 지평별 보정 표본은 band 의 사정이다
+    assert "tail_horizons_judged" not in summary
+    assert "p10/p90" not in cc.render_markdown(results, summary)
 
 
 def test_run_band_marks_a_candidate_without_a_snapshot_unpaired_and_counts_snapshot_only_stamps():
@@ -1754,6 +1910,8 @@ def test_main_band_json_output_names_the_product_and_stays_strict_json_with_nan(
     assert code == 1
     assert data["product"] == "band"
     assert (worst["name"], worst["field"], worst["cand"], worst["abs_delta"]) == ("city-02", "h6 p50", "nan", None)
+    assert data["pairs"][0]["tail_judged"] == ["1", "6", "24"] and data["pairs"][0]["tail_skipped"] == []
+    assert (data["summary"]["tail_horizons_judged"], data["summary"]["tail_horizons_skipped"]) == (3, 0)
 
 
 def test_main_band_uses_the_real_contract_validator_when_none_is_injected(tmp_path, capsys, monkeypatch):
