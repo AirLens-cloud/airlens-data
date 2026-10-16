@@ -8,6 +8,7 @@ from __future__ import annotations
 import importlib.util
 import json
 import re
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -134,6 +135,78 @@ def test_parse_stamp_accepts_real_hours(value):
 def test_parse_stamp_rejects_wrong_shapes_and_impossible_times(value):
     with pytest.raises(ValueError):
         pt.parse_stamp(value)
+
+
+ISSUE_UTC = datetime(2026, 10, 15, 6, 15, 42, tzinfo=timezone.utc)
+
+
+@pytest.mark.parametrize(
+    "value",
+    ["2026-10-15T06:15:42Z", "2026-10-15T06:15:42+00:00", "2026-10-15T15:15:42+09:00", "2026-10-15T06:15:42", " 2026-10-15T06:15:42Z "],
+)
+def test_parse_utc_maps_every_notation_of_one_instant_to_the_same_value(value):
+    # Act / Assert — `Z` · 오프셋 · 오프셋 없음(UTC) 은 같은 시각이다
+    assert pt.parse_utc(value) == ISSUE_UTC
+    assert pt.parse_utc(value).utcoffset().total_seconds() == 0
+
+
+@pytest.mark.parametrize(
+    "value",
+    ["", "   ", "not-a-time", "2026-13-01T00:00:00Z", "2026-10-15T25:00:00Z", "0001-01-01T00:00:00+14:00", None, 1, 1.5, ["2026-10-15T06:15:42Z"], {},
+     20261015, ISSUE_UTC],
+)
+def test_parse_utc_rejects_anything_that_is_not_an_iso_time_string_with_value_error(value):
+    # Act / Assert — 범위 밖 시각(UTC 로 바꾸면 0000년)도 OverflowError 가 아니라 ValueError 다: 호출부가 한 종류만 잡는다.
+    # 정수 20261015 와 datetime 은 str() 로 바꾸면 읽히는 값이다 — 문자열이 아니면 읽히는 값이어도 거부한다
+    with pytest.raises(ValueError):
+        pt.parse_utc(value)
+
+
+@pytest.mark.skipif(not hasattr(time, "tzset"), reason="time.tzset 이 없다")
+@pytest.mark.parametrize("zone", ["UTC0", "KST-9", "PST8PDT"])
+def test_parse_utc_reads_a_time_without_an_offset_as_utc_whatever_the_machines_time_zone(monkeypatch, zone):
+    # Arrange — 오프셋 없는 시각을 이 기계의 현지 시각으로 읽으면 UTC 러너에서만 우연히 맞는다
+    monkeypatch.setenv("TZ", zone)
+    time.tzset()
+    try:
+        # Act
+        parsed = pt.parse_utc("2026-10-15T06:15:42")
+        stamp = pt.utc_stamp("2026-10-15T06:15:42")
+    finally:
+        monkeypatch.undo()
+        time.tzset()
+
+    # Assert
+    assert parsed == ISSUE_UTC
+    assert stamp == "2026101506"
+
+
+@pytest.mark.parametrize(
+    "hostile",
+    ["x\n::error::injected" + "y" * 500, "\n" * 500, ["\n::error::injected" + "y" * 500]],
+    ids=["not-a-time-string", "blank-string", "not-a-string"],
+)
+def test_parse_utc_error_message_shows_a_bounded_repr_of_the_value(hostile):
+    # Arrange — 줄바꿈이 섞인 값이 그대로 로그에 나가면 워크플로 명령(`::...`)을 흉내 낼 수 있다. 오류 문구가 두 갈래(시각이 아닌 문자열 /
+    # 문자열이 아니거나 빈 값)라 둘 다 본다
+
+    # Act
+    with pytest.raises(ValueError) as caught:
+        pt.parse_utc(hostile)
+
+    # Assert
+    assert "\n" not in str(caught.value)
+    assert len(str(caught.value)) < 200
+
+
+def test_stamp_of_converts_to_utc_before_cutting_to_the_hour():
+    # Arrange — 한국 시각 15:59 는 UTC 06:59 다
+    local = datetime.fromisoformat("2026-10-15T15:59:59+09:00")
+
+    # Act / Assert
+    assert pt.stamp_of(local) == "2026101506"
+    assert pt.stamp_of(ISSUE_UTC) == "2026101506"
+    assert pt.stamp_of(datetime(2026, 10, 15, 23, 59, tzinfo=timezone.utc)) == "2026101523"
 
 
 @pytest.mark.parametrize(
@@ -290,3 +363,226 @@ def test_cli_rejects_unknown_mode(capsys):
     with pytest.raises(SystemExit) as exc:
         pt.main(["prune", "--mode", "prod"])
     assert exc.value.code == 2
+
+
+# ── 예측 밴드 ────────────────────────────────────────────────────────────────
+PROD_STAMP = "2026101506"
+BAND_PRODUCTION_PATH = "aq-data/forecast-band/latest.json"
+
+
+def _band(mode: str, prod_stamp: str | None = None) -> list[tuple[str, str, str, bool]]:
+    return [(t.group, t.src, t.dest, t.required) for t in pt.band_targets(mode, STAMP, prod_stamp)]
+
+
+def test_band_candidate_destinations_live_under_the_candidate_root_with_ten_digit_stamps():
+    # Act
+    dests = [dest for _g, _s, dest, _r in _band("candidate", PROD_STAMP)]
+
+    # Assert — 후보 모드는 운영 경로(latest 포함)에 쓰지 않는다. 이름이 `band_<10자리>.json` 이라 기존 prune 에 걸린다.
+    assert dests == [f"aq-data/_candidate/forecast-band/history/band_{STAMP}.json",
+                     f"aq-data/_candidate/forecast-band/prod/band_{PROD_STAMP}.json"]
+    assert all(d.startswith("aq-data/_candidate/") for d in dests)
+    assert all(re.fullmatch(r".+/band_\d{10}\.json", d) for d in dests)
+    assert BAND_PRODUCTION_PATH not in dests
+
+
+def test_band_candidate_without_a_production_snapshot_writes_only_its_own_file():
+    # Act
+    rows = _band("candidate")
+
+    # Assert
+    assert rows == [("band", "forecast_band_latest.json", f"aq-data/_candidate/forecast-band/history/band_{STAMP}.json", True)]
+
+
+def test_band_production_snapshot_is_advisory_and_the_candidate_file_is_required():
+    # Act
+    required = {src: req for _g, src, _d, req in _band("candidate", PROD_STAMP)}
+
+    # Assert — 운영 사본이 없거나 못 만들어도 후보 발행은 막지 않는다
+    assert required == {"forecast_band_latest.json": True, "prod_latest.json": False}
+
+
+def test_band_production_writes_only_the_latest_file_and_ignores_the_snapshot_stamp():
+    # Act / Assert — 운영 band 는 latest 하나만 덮어쓴다(이력 없음). 후보 전용 사본은 운영 모드에 새지 않는다
+    expected = [("band", "forecast_band_latest.json", BAND_PRODUCTION_PATH, True)]
+    assert _band("production") == expected
+    assert _band("production", PROD_STAMP) == expected
+
+
+def test_band_candidate_names_are_recognised_by_the_existing_prune_regex():
+    # Arrange — 컷오버 뒤 후보를 비울 때 새 코드가 필요 없어야 한다 (`prune --keep-days 0`)
+    dests = [dest for _g, _s, dest, _r in _band("candidate", PROD_STAMP)]
+
+    # Act
+    stale, skipped_bad_ts, skipped_backfill = hf_publish._stale_files(dests, "aq-data/_candidate/", datetime(2100, 1, 1, tzinfo=timezone.utc))
+    untouched, _, _ = hf_publish._stale_files([BAND_PRODUCTION_PATH], "aq-data/_candidate/", datetime(2100, 1, 1, tzinfo=timezone.utc))
+
+    # Assert
+    assert sorted(stale) == sorted(dests)
+    assert (skipped_bad_ts, skipped_backfill) == (0, 0)
+    assert untouched == []
+
+
+@pytest.mark.parametrize("stamp", ["", "20261015", "2026131512", "abcdefghij"])
+def test_band_targets_reject_bad_stamps_on_either_side(stamp):
+    # Act / Assert — 파일명에 들어가는 값이라 모양이 틀리면 만들지 않는다
+    with pytest.raises(ValueError):
+        pt.band_targets("candidate", stamp)
+    with pytest.raises(ValueError):
+        pt.band_targets("candidate", STAMP, stamp)
+
+
+def test_band_targets_reject_an_unknown_mode():
+    # Act / Assert — 오타(`prod`)가 조용히 어느 한쪽 모드로 해석되면 안 된다
+    with pytest.raises(ValueError, match="mode"):
+        pt.band_targets("prod", STAMP)
+
+
+@pytest.mark.parametrize(
+    ("issue_time", "expected"),
+    [
+        ("2026-10-15T12:00:00+00:00", "2026101512"),  # 발행물이 쓰는 형태(pandas isoformat)
+        ("2026-10-15T12:00:00Z", "2026101512"),
+        ("2026-10-15T12:30:59+00:00", "2026101512"),  # 시 단위로 자른다
+        ("2026-10-15T12:00:00+09:00", "2026101503"),  # 오프셋이 있으면 UTC 로 바꾼다
+        ("2026-10-15T23:59:59-02:00", "2026101601"),
+    ],
+)
+def test_stamp_from_band_uses_the_issue_time_in_utc(issue_time, expected):
+    assert pt.stamp_from_band({"issue_time": issue_time}) == expected
+
+
+def test_stamp_from_band_ignores_the_run_time():
+    # Arrange — 실행(generated_at)은 13:41 에 끝났지만 예보 발행(issue_time)은 12시다. 운영 사본과 같은 issue 끼리 짝지어야 한다.
+    payload = {"generated_at": "2026-10-15T13:41:07+00:00", "issue_time": "2026-10-15T12:00:00+00:00"}
+
+    # Act / Assert
+    assert pt.stamp_from_band(payload) == "2026101512"
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [{}, {"issue_time": ""}, {"issue_time": None}, {"issue_time": 20261015}, {"issue_time": "not-a-time"}, {"issue_time": "0001-01-01T00:00:00+14:00"}],
+)
+def test_stamp_from_band_without_a_usable_issue_time_fails(payload):
+    with pytest.raises((ValueError, KeyError)):
+        pt.stamp_from_band(payload)
+
+
+@pytest.fixture
+def band_dir(tmp_path: Path) -> Path:
+    out = tmp_path / "pub"
+    out.mkdir()
+    (out / "forecast_band_latest.json").write_text(json.dumps({"issue_time": "2026-10-15T12:00:00+00:00"}), encoding="utf-8")
+    return out
+
+
+@pytest.fixture
+def prod_snapshot(tmp_path: Path) -> Path:
+    path = tmp_path / "prod" / "prod_latest.json"
+    path.parent.mkdir()
+    path.write_text(json.dumps({"issue_time": "2026-10-15T06:00:00+00:00"}), encoding="utf-8")
+    return path
+
+
+def test_cli_band_candidate_maps_the_candidate_file_and_the_production_snapshot(band_dir, prod_snapshot, capsys):
+    # Act
+    code, out, _ = _run(capsys, "maps", "--mode", "candidate", "--dir", str(band_dir), "--group", "band",
+                        "--prod-snapshot", str(prod_snapshot))
+
+    # Assert — 사본은 artifact 디렉터리가 아니라 `--prod-snapshot` 이 가리키는 파일에서 온다
+    parsed = hf_publish._parse_map(out.splitlines())
+    assert code == 0
+    assert parsed == [(band_dir / "forecast_band_latest.json", f"aq-data/_candidate/forecast-band/history/band_{STAMP}.json"),
+                      (prod_snapshot, f"aq-data/_candidate/forecast-band/prod/band_{PROD_STAMP}.json")]
+
+
+def test_cli_band_candidate_without_a_snapshot_file_maps_only_the_candidate(band_dir, tmp_path, capsys):
+    # Act — 경로를 줬어도 파일이 없으면(받기 실패·이미 있음) 건너뛴다
+    code, out, _ = _run(capsys, "maps", "--mode", "candidate", "--dir", str(band_dir), "--group", "band",
+                        "--prod-snapshot", str(tmp_path / "prod" / "missing.json"))
+    code_none, out_none, _ = _run(capsys, "maps", "--mode", "candidate", "--dir", str(band_dir), "--group", "band")
+
+    # Assert
+    assert (code, code_none) == (0, 0)
+    assert out == out_none
+    assert [line.split("=", 1)[1] for line in out.splitlines()] == [f"aq-data/_candidate/forecast-band/history/band_{STAMP}.json"]
+
+
+def test_cli_band_production_maps_only_latest_even_when_a_snapshot_is_given(band_dir, prod_snapshot, capsys):
+    # Act
+    code, out, _ = _run(capsys, "maps", "--mode", "production", "--dir", str(band_dir), "--group", "band",
+                        "--prod-snapshot", str(prod_snapshot))
+
+    # Assert
+    assert code == 0
+    assert [line.split("=", 1)[1] for line in out.splitlines()] == [BAND_PRODUCTION_PATH]
+
+
+def test_cli_band_ignores_a_file_named_like_the_snapshot_inside_the_artifact_directory(band_dir, capsys):
+    # Arrange — artifact 는 신뢰하지 않는다: 같은 이름의 파일이 있어도 `--prod-snapshot` 없이는 사본으로 쓰지 않는다
+    (band_dir / "prod_latest.json").write_text(json.dumps({"issue_time": "2026-10-15T06:00:00+00:00"}), encoding="utf-8")
+
+    # Act
+    code, out, _ = _run(capsys, "maps", "--mode", "candidate", "--dir", str(band_dir), "--group", "band")
+
+    # Assert
+    assert code == 0
+    assert "forecast-band/prod/" not in out
+
+
+def test_cli_band_without_the_artifact_file_fails_in_one_line(band_dir, capsys):
+    # Arrange
+    (band_dir / "forecast_band_latest.json").unlink()
+
+    # Act
+    code, out, err = _run(capsys, "maps", "--mode", "candidate", "--dir", str(band_dir), "--group", "band")
+
+    # Assert — 빈 출력으로 발행기가 도는 것을 막는다
+    assert (code, out) == (1, "")
+    assert err.startswith("publish_targets: FileNotFoundError") and len(err.splitlines()) == 1
+
+
+@pytest.mark.parametrize(
+    ("text", "error_class"),
+    [("{not json", "JSONDecodeError"), ("[]", "TypeError"), ("{}", "KeyError"), ('{"issue_time": "x"}', "ValueError"), ('{"issue_time": 1}', "ValueError"),
+     ('{"issue_time": "0001-01-01T00:00:00+14:00"}', "ValueError")],
+)
+@pytest.mark.parametrize("target", ["artifact", "snapshot"])
+def test_cli_band_with_a_broken_payload_fails_with_class_and_message_not_a_traceback(text, error_class, target, band_dir, prod_snapshot, capsys):
+    # Arrange
+    (band_dir / "forecast_band_latest.json" if target == "artifact" else prod_snapshot).write_text(text, encoding="utf-8")
+
+    # Act
+    code, out, err = _run(capsys, "maps", "--mode", "candidate", "--dir", str(band_dir), "--group", "band", "--prod-snapshot", str(prod_snapshot))
+
+    # Assert
+    assert (code, out) == (1, "")
+    assert err.startswith(f"publish_targets: {error_class}")
+    assert "Traceback" not in err and len(err.splitlines()) == 1
+
+
+def test_cli_band_candidate_and_production_prune_lines_follow_the_predictions_rule(capsys):
+    # Act — band 는 자동 prune 이 없다(운영은 latest 하나, 후보는 컷오버 뒤 한 번에). prune 출력은 predictions 용 그대로다.
+    code, out, _ = _run(capsys, "prune", "--mode", "candidate")
+
+    # Assert
+    assert (code, out) == (0, "")
+
+
+# ── band 경로 헬퍼: band_guard 가 같은 경로를 쓴다 ───────────────────────────
+def test_band_path_helpers_are_the_single_source_of_the_band_paths():
+    # Act / Assert
+    assert pt.band_history_dest(STAMP) == f"aq-data/_candidate/forecast-band/history/band_{STAMP}.json"
+    assert pt.band_prod_copy_dest(PROD_STAMP) == f"aq-data/_candidate/forecast-band/prod/band_{PROD_STAMP}.json"
+    assert pt.BAND_LATEST == BAND_PRODUCTION_PATH
+    assert [t.dest for t in pt.band_targets("candidate", STAMP, PROD_STAMP)] == [pt.band_history_dest(STAMP), pt.band_prod_copy_dest(PROD_STAMP)]
+    assert [t.dest for t in pt.band_targets("production", STAMP)] == [pt.BAND_LATEST]
+
+
+@pytest.mark.parametrize("bad", ["", "202610150", "20261015066", "2026-10-15", "2026131506", "abcdefghij"])
+@pytest.mark.parametrize("helper", ["band_history_dest", "band_prod_copy_dest"])
+def test_band_path_helpers_reject_stamps_that_are_not_real_ten_digit_hours(helper, bad):
+    # Act / Assert
+    with pytest.raises(ValueError):
+        getattr(pt, helper)(bad)

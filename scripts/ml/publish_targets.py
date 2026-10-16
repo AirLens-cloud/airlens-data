@@ -12,8 +12,13 @@ STAMP 는 예측 내부 timestamp(정각)의 `%Y%m%d%H` 다. 같은 실행의 gr
 짝지으려면 실행 시각이 아니라 이 값을 써야 한다(시각 경계를 넘는 실행에서 파일명 ≠ 내부 timestamp 가 되어
 이력 짝짓기가 깨진다).
 
+예측 밴드(band 그룹)의 STAMP 는 발행물의 `issue_time`(예보 발행 시각)의 UTC `%Y%m%d%H` 다. 운영은 `latest.json`
+하나만 덮어써서 이력이 없으므로, 후보 모드는 후보 파일과 함께 **그 시점의 운영 latest 사본**(`--prod-snapshot`)을
+같은 접두 아래 `prod/` 에 남긴다. 둘이 같은 STAMP 일 때 `compare_candidate.py --product band` 가 짝짓는다.
+
 CLI (워크플로의 발행 job 이 쓴다 — 출력은 줄 단위라 `mapfile` 로 받는다):
-    publish_targets.py maps  --mode M --dir DIR --group G    → `SRC=DEST` 줄들 (G: grid | dqss | shadow)
+    publish_targets.py maps  --mode M --dir DIR --group G [--prod-snapshot FILE]
+                                                             → `SRC=DEST` 줄들 (G: grid | dqss | shadow | band)
     publish_targets.py prune --mode M                        → `PREFIX KEEP_DAYS` 줄들 (candidate 는 없음)
 """
 from __future__ import annotations
@@ -27,7 +32,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 MODES = ("candidate", "production")
-GROUPS = ("grid", "dqss", "shadow")
+GROUPS = ("grid", "dqss", "shadow", "band")
 CANDIDATE_ROOT = "aq-data/_candidate"
 HISTORY_KEEP_DAYS = 30
 STAMP_RE = re.compile(r"\d{10}")
@@ -36,6 +41,9 @@ STAMP_RE = re.compile(r"\d{10}")
 GRID_FILE = "grid_latest.json"
 DQSS_FILE = "data_quality.json"
 SHADOW_FILE = "shadow_stations.json"
+BAND_FILE = "forecast_band_latest.json"  # 예측 밴드 산출물(artifact 디렉터리 기준)
+BAND_PROD_SNAPSHOT = "prod_latest.json"  # 같은 시점 운영 latest 사본 — `--prod-snapshot` 이 가리키는 파일의 역할 이름
+BAND_LATEST = "aq-data/forecast-band/latest.json"  # 운영 경로 — 운영 band 는 이 파일 하나만 덮어쓴다
 
 
 @dataclass(frozen=True)
@@ -54,6 +62,31 @@ def parse_stamp(value: str) -> str:
     return value
 
 
+def parse_utc(value: object) -> datetime:
+    """ISO 8601 시각 문자열 → UTC 시각(tz 있음). `Z`·오프셋·오프셋 없음(UTC 로 본다)을 받는다. 시각이 아니면 ValueError.
+
+    STAMP 를 만드는 `utc_stamp` 와 `band_guard.py` 의 "같은 시각인가" 비교가 이 한 곳을 쓴다 — 한쪽만 받아 주는 값이
+    생기지 않는다. 오류 메시지는 값을 잘라 담는다(표준 메시지는 값 전체를 싣는다).
+    """
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"시각 문자열이 아니다: {value!r:.80}")
+    try:
+        parsed = datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
+        return parsed.astimezone(timezone.utc) if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+    except (ValueError, OverflowError):  # 범위 밖 시각(`0001-01-01T00:00:00+14:00`)은 UTC 로 바꾸다 OverflowError
+        raise ValueError(f"ISO 시각이 아니다: {value!r:.80}") from None
+
+
+def stamp_of(moment: datetime) -> str:
+    """시각(tz 있음) → UTC `%Y%m%d%H`. 후보 발행물 파일명 STAMP 의 규칙이다."""
+    return moment.astimezone(timezone.utc).strftime("%Y%m%d%H")
+
+
+def utc_stamp(ts: object) -> str:
+    """ISO 시각 문자열 → UTC `%Y%m%d%H`. 오프셋이 붙은 값은 UTC 로 바꾼 뒤 자른다(오프셋 없는 값은 UTC 로 본다)."""
+    return stamp_of(parse_utc(ts))
+
+
 def stamp_from_grid(grid: dict) -> str:
     """`predictions[0].timestamp`(없으면 `generated_at`)를 `%Y%m%d%H`(UTC)로.
 
@@ -64,10 +97,15 @@ def stamp_from_grid(grid: dict) -> str:
     ts = predictions[0]["timestamp"] if predictions else grid.get("generated_at")
     if not ts:
         raise ValueError("grid 에 timestamp/generated_at 이 없다")
-    parsed = datetime.fromisoformat(str(ts).replace("Z", "+00:00"))
-    if parsed.tzinfo is not None:
-        parsed = parsed.astimezone(timezone.utc)
-    return parsed.strftime("%Y%m%d%H")
+    return utc_stamp(ts)
+
+
+def stamp_from_band(payload: dict) -> str:
+    """예측 밴드 발행물의 `issue_time`(예보 발행 시각)을 `%Y%m%d%H`(UTC)로. `generated_at`(실행 시각)은 쓰지 않는다."""
+    ts = payload["issue_time"]
+    if not isinstance(ts, str) or not ts:
+        raise ValueError("band 에 issue_time 이 없다")
+    return utc_stamp(ts)
 
 
 def predictions_targets(mode: str, stamp: str) -> list[Target]:
@@ -91,6 +129,29 @@ def predictions_targets(mode: str, stamp: str) -> list[Target]:
     ]
 
 
+def band_history_dest(stamp: str) -> str:
+    """후보 모드의 band 발행물 경로(타임스탬프 파일). STAMP = 후보 발행물의 issue_time."""
+    return f"{CANDIDATE_ROOT}/forecast-band/history/band_{parse_stamp(stamp)}.json"
+
+
+def band_prod_copy_dest(stamp: str) -> str:
+    """후보 모드에서 그 시점 운영 latest 사본을 두는 경로. STAMP = 운영 latest 의 issue_time."""
+    return f"{CANDIDATE_ROOT}/forecast-band/prod/band_{parse_stamp(stamp)}.json"
+
+
+def band_targets(mode: str, stamp: str, prod_stamp: str | None = None) -> list[Target]:
+    """예측 밴드 발행 대상. `prod_stamp` 는 후보 모드에서 운영 latest 사본을 같이 남길 때만 준다(운영 모드는 무시)."""
+    if mode not in MODES:
+        raise ValueError(f"mode 는 {MODES} 중 하나여야 한다: {mode!r}")
+    stamp = parse_stamp(stamp)
+    if mode == "candidate":
+        targets = [Target("band", BAND_FILE, band_history_dest(stamp), True)]
+        if prod_stamp is not None:
+            targets.append(Target("band", BAND_PROD_SNAPSHOT, band_prod_copy_dest(prod_stamp), False))
+        return targets
+    return [Target("band", BAND_FILE, BAND_LATEST, True)]
+
+
 def prune_prefixes(mode: str) -> list[tuple[str, int]]:
     """(prefix, keep_days). candidate 는 자동 정리가 없다."""
     if mode not in MODES:
@@ -108,6 +169,10 @@ def _load_stamp(directory: Path) -> str:
     return stamp_from_grid(grid)
 
 
+def _band_stamp(path: Path) -> str:
+    return stamp_from_band(json.loads(path.read_text(encoding="utf-8")))
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = parser.add_subparsers(dest="cmd", required=True)
@@ -116,6 +181,8 @@ def main(argv: list[str] | None = None) -> int:
     p_maps.add_argument("--mode", required=True, choices=MODES)
     p_maps.add_argument("--dir", required=True, type=Path)
     p_maps.add_argument("--group", required=True, choices=GROUPS)
+    p_maps.add_argument("--prod-snapshot", type=Path, default=None,
+                        help="band 후보 모드에서 같이 남길 운영 latest 사본(없는 파일이면 건너뛴다)")
 
     p_prune = sub.add_parser("prune", help="`PREFIX KEEP_DAYS` 줄을 낸다")
     p_prune.add_argument("--mode", required=True, choices=MODES)
@@ -124,11 +191,17 @@ def main(argv: list[str] | None = None) -> int:
 
     try:
         if args.cmd == "maps":
-            stamp = _load_stamp(args.dir)
-            for target in predictions_targets(args.mode, stamp):
+            prod: Path | None = None  # band 후보 모드에서만 쓰는 운영 latest 사본
+            if args.group == "band":
+                if args.prod_snapshot is not None and args.prod_snapshot.is_file():
+                    prod = args.prod_snapshot
+                targets = band_targets(args.mode, _band_stamp(args.dir / BAND_FILE), _band_stamp(prod) if prod else None)
+            else:
+                targets = predictions_targets(args.mode, _load_stamp(args.dir))
+            for target in targets:
                 if target.group != args.group:
                     continue
-                src = args.dir / target.src
+                src = prod if prod and target.src == BAND_PROD_SNAPSHOT else args.dir / target.src
                 if not src.is_file():
                     # shadow 는 advisory 라 파일이 없을 수 있다 — 호출부가 빈 출력으로 판단한다.
                     if target.required:
