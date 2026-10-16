@@ -610,14 +610,6 @@ class LocalSource:
         return _json_object(data, rel_path)
 
 
-def _declared_length(headers) -> int | None:
-    """응답 헤더가 알린 본문 길이(Content-Length). 없거나 정수로 읽을 수 없으면 None — http.client 도 그런 값은 길이 모름으로 본다."""
-    try:
-        return int(headers.get("Content-Length") or "")
-    except ValueError:  # 깨진 값 · `int()` 가 못 읽는 숫자 모양 문자(²) · 자릿수 한도(기본 4300자리) 초과
-        return None
-
-
 class HttpSource:
     """공개 저장소. 토큰을 보내지 않는다. `band_guard.py` 도 이 클래스로 읽는다."""
 
@@ -636,10 +628,11 @@ class HttpSource:
                     body = resp.read(MAX_RESPONSE_BYTES + 1)  # 상한보다 한 바이트 더 읽어 넘었는지만 본다
                     if len(body) > MAX_RESPONSE_BYTES:
                         raise SourceError(f"{what}: 응답 크기 상한 초과")
-                    declared = _declared_length(resp.headers)
-                    if declared is not None and len(body) < declared:
-                        # 크기를 주고 읽으면 Content-Length 보다 짧게 끊겨도 예외가 없다(그냥 읽을 때는 IncompleteRead) — 같은 재시도로 보낸다
-                        raise http.client.IncompleteRead(body, declared - len(body))
+                    # 크기를 주고 읽으면 Content-Length 보다 짧게 끊겨도 예외가 없다(그냥 읽을 때는 IncompleteRead). http.client 가 Content-Length 로
+                    # 센 남은 바이트 `length` 가 0 이 아니면(길이 모름·chunked 는 None) 같은 재시도로 보낸다. 문서화된 속성이 아니라서
+                    # test_compare_candidate.py 가 진짜 HTTPResponse 로 동작을 고정한다
+                    if resp.length:
+                        raise http.client.IncompleteRead(body, resp.length)
                     return body, resp.headers.get("Link") or ""
             except urllib.error.HTTPError as exc:
                 if exc.code == 404:

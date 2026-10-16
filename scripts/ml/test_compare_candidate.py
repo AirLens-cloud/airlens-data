@@ -12,7 +12,6 @@ import io
 import json
 import re
 import ssl
-import sys
 import time
 import urllib.error
 from pathlib import Path
@@ -783,13 +782,16 @@ class FakeResponse:
         self._body = body
         self._read_error = read_error  # 연결은 됐는데 본문을 읽다 끊기는 경우
         self.headers = {"Link": link} if link else {}
-        if content_length is not None:
-            self.headers["Content-Length"] = str(content_length)  # 본문보다 크게 주면 "Content-Length 만큼 오기 전에 끊긴" 응답
+        # http.client.HTTPResponse.length 처럼 Content-Length 로 센 남은 바이트(모르면 None). 본문보다 크게 주면 "Content-Length 만큼 오기 전에 끊긴" 응답
+        self.length = content_length
 
     def read(self, amt: int | None = None) -> bytes:
         if self._read_error is not None:
             raise self._read_error
-        return self._body if amt is None else self._body[:amt]  # 실제 응답처럼 요청한 크기까지만 준다
+        data = self._body if amt is None else self._body[:amt]  # 실제 응답처럼 요청한 크기까지만 준다
+        if self.length is not None:
+            self.length -= len(data)  # 읽은 만큼 남은 바이트가 준다
+        return data
 
     def __enter__(self) -> "FakeResponse":
         return self
@@ -1043,34 +1045,71 @@ def test_http_persistent_short_body_ends_as_source_error_with_class_name_only(mo
     assert len(calls) == cc.FETCH_RETRIES
 
 
-@pytest.mark.parametrize("content_length", [None, 8, "not-a-number", "", "²"], ids=["absent", "exact", "garbage", "empty", "superscript-digit"])
-def test_http_body_that_matches_or_does_not_declare_its_length_is_accepted(monkeypatch, content_length):
-    # Arrange — 길이를 알 수 없거나(없음·깨진 값·`int()` 가 못 읽는 숫자 모양 문자) 정확히 맞으면 그대로 받는다
-    response = FakeResponse(b'{"x": 1}', content_length=8 if content_length == 8 else None)
-    if isinstance(content_length, str):
-        response.headers["Content-Length"] = content_length
-    source, calls, _ = scripted_source(monkeypatch, {"a.json": [response]})
+def test_http_body_that_fills_its_declared_length_is_accepted(monkeypatch):
+    # Arrange — Content-Length 만큼 다 왔으면(남은 바이트 0) 끊긴 응답이 아니다
+    source, calls, _ = scripted_source(monkeypatch, {"a.json": [FakeResponse(b'{"x": 1}', content_length=8)]})
 
     # Act / Assert
     assert source.read_json("dir/a.json") == {"x": 1}
     assert len(calls) == 1
 
 
-def test_http_content_length_beyond_the_int_digit_limit_is_treated_as_unknown(monkeypatch):
-    # Arrange — int() 는 자릿수 한도를 넘는 문자열에 ValueError 를 낸다. http.client 는 그런 값을 길이 모름으로 보고 응답을 그냥
-    # 읽는다(루프백 서버로 실측). 한도를 최소로 낮춰서 한도가 다른 환경에서도 같은 경로를 탄다
-    previous = sys.get_int_max_str_digits()
-    sys.set_int_max_str_digits(640)
-    try:
-        response = FakeResponse(b'{"x": 1}')
-        response.headers["Content-Length"] = "9" * 1000
-        source, calls, _ = scripted_source(monkeypatch, {"a.json": [response]})
+# `_get` 은 http.client 가 Content-Length 로 센 남은 바이트(`HTTPResponse.length`)에 기댄다. 문서화된 속성이 아니라서, 원시 바이트로
+# 만든 진짜 HTTPResponse(소켓 없음)를 `_get` 에 통과시켜 CPython 의 동작을 그대로 고정한다 — 바뀌면 아래 시험이 깨진다.
+class RawSock:
+    """원시 응답 바이트만 내주는 가짜 소켓. HTTPResponse 가 읽는 데 필요한 `makefile` 만 있다."""
 
-        # Act / Assert
-        assert source.read_json("dir/a.json") == {"x": 1}
-        assert len(calls) == 1
-    finally:
-        sys.set_int_max_str_digits(previous)
+    def __init__(self, raw: bytes) -> None:
+        self._file = io.BytesIO(raw)
+
+    def makefile(self, *args: object, **kwargs: object) -> io.BytesIO:
+        return self._file
+
+
+def real_response(headers: bytes, body: bytes) -> http.client.HTTPResponse:
+    """`headers`(줄마다 CRLF 로 끝낸다)와 `body` 로 만든 진짜 HTTPResponse."""
+    response = http.client.HTTPResponse(RawSock(b"HTTP/1.1 200 OK\r\n" + headers + b"\r\n" + body))
+    response.begin()
+    return response
+
+
+CHUNKED_PAYLOAD = b'8\r\n{"x": 1}\r\n0\r\n\r\n'
+CUT_OFF_RAW = {
+    "short-content-length": (b"Content-Length: 8\r\n", b'{"x"'),
+    "empty-body-with-content-length": (b"Content-Length: 8\r\n", b""),
+    "chunked-cut": (b"Transfer-Encoding: chunked\r\n", b'8\r\n{"x"'),
+}
+COMPLETE_RAW = {
+    "exact-content-length": (b"Content-Length: 8\r\n", b'{"x": 1}'),
+    "no-content-length": (b"Connection: close\r\n", b'{"x": 1}'),
+    "garbage-content-length": (b"Content-Length: abc\r\n", b'{"x": 1}'),
+    "superscript-content-length": (b"Content-Length: \xb2\r\n", b'{"x": 1}'),
+    "chunked": (b"Transfer-Encoding: chunked\r\n", CHUNKED_PAYLOAD),
+    "chunked-with-content-length": (b"Transfer-Encoding: chunked\r\nContent-Length: 99\r\n", CHUNKED_PAYLOAD),
+}
+
+
+@pytest.mark.parametrize(("headers", "body"), list(CUT_OFF_RAW.values()), ids=list(CUT_OFF_RAW))
+def test_http_response_cut_off_before_its_end_is_retried_with_the_real_http_client(monkeypatch, headers, body):
+    # Arrange — 첫 응답은 끊겼고 두 번째는 온전하다
+    source, calls, sleeps = scripted_source(monkeypatch, {"a.json": [real_response(headers, body), real_response(*COMPLETE_RAW["exact-content-length"])]})
+
+    # Act
+    payload = source.read_json("dir/a.json")
+
+    # Assert
+    assert payload == {"x": 1}
+    assert len(calls) == 2 and sleeps == [2.0]
+
+
+@pytest.mark.parametrize(("headers", "body"), list(COMPLETE_RAW.values()), ids=list(COMPLETE_RAW))
+def test_http_response_the_real_http_client_counts_as_complete_is_accepted_without_retry(monkeypatch, headers, body):
+    # Arrange — 길이를 모르거나(없음·정수로 읽히지 않는 값·chunked, chunked 는 Content-Length 가 있어도 무시한다) 정확히 맞는 응답
+    source, calls, sleeps = scripted_source(monkeypatch, {"a.json": [real_response(headers, body)]})
+
+    # Act / Assert
+    assert source.read_json("dir/a.json") == {"x": 1}
+    assert len(calls) == 1 and sleeps == []
 
 
 def tree_entry(rel: str, kind: str = "file") -> dict:
