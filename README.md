@@ -37,13 +37,29 @@ HF 초기 시드(hf-live-seed)는 모노레포 정적 데이터 의존이라 이
 | [`e2-sidecar/README.md`](e2-sidecar/README.md) | E2 사이드카(OpenAQ·Sensor.Community 시간별 수집, 채팅 로그 pull) |
 | [`scripts/etl/collect_policies/SOURCES.md`](scripts/etl/collect_policies/SOURCES.md) | 정책 레지스트리 수집원 |
 
-## Secrets (Actions repo-level)
+## Secrets
+
+### environment `hf-write`
+
+| 이름 | 용도 |
+|---|---|
+| `HF_TOKEN` | HF `Robeedau/airlens-live` write (HF에 쓰는 워크플로 전부) |
+
+- HF에 쓰는 잡은 `environment: {name: hf-write, deployment: false}` 를 선언하고, `scripts/etl/test_publish_install_lock.py` 가 그 선언을 확인한다. 배포 브랜치 규칙과 secret 위치는 GitHub 설정이라 이 레포의 시험이 확인하지 못한다.
+- 이 environment 는 쓰기 토큰이 있는 잡만 쓴다 — 토큰 없는 잡을 넣지 않는다(시험이 확인한다).
+- 보호는 두 설정이 함께 있을 때만 성립한다: (가) 이 environment 의 배포 브랜치 규칙이 `main` 하나, (나) 레포 secret 에 `HF_TOKEN` 이 없음. 그러면 main 이 아닌 ref 에서 돈 잡은 쓰기 토큰을 받지 못한다. 레포 secret 에 같은 이름을 다시 두면 environment 를 선언하지 않은 잡과 다른 브랜치가 그 값을 받는다.
+- (가)(나)가 갖춰지면 이 잡들은 main 에서만 수동 실행된다. 다른 브랜치에서 dispatch 하면 environment 규칙에서 거부된다.
+- `deployment: false` 라 실행마다 배포 기록을 만들지 않는다.
+- 없는 environment 를 참조하면 GitHub 가 규칙 없는 environment 를 새로 만든다. 이름을 바꿀 때는 새 environment(규칙 포함)를 먼저 만든 뒤 워크플로를 고치고, 지울 때는 워크플로에서 참조를 먼저 뺀다.
+- GitHub Free 에서는 environment secret 이 공개 레포에서만 동작한다. 레포를 비공개로 바꾸면 이 잡들이 토큰을 받지 못한다.
+- 등록: Settings → Environments → `hf-write` → Environment secrets
+
+### repo-level
 
 등록: Settings → Secrets and variables → Actions → New repository secret
 
 | 이름 | 용도 |
 |---|---|
-| `HF_TOKEN` | HF `Robeedau/airlens-live` write (HF에 쓰는 워크플로 전부) |
 | `NASA_FIRMS_MAP_KEY` | firms-collect |
 | `CDS_API_KEY` | mac-data-publish (Copernicus ADS — CAMS. `CDS_API_URL`은 워크플로에 하드코딩) |
 | `AIRKOREA_API_KEY` | mac-data-publish (공공데이터포털 에어코리아) |
