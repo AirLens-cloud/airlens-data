@@ -1539,7 +1539,7 @@ def test_band_closure_has_no_gpu_stack_package():
     # Arrange / Act
     names = set(_constraint_pins(BAND_CONSTRAINTS)) | {entry.partition("==")[0] for lock in (BAND_TORCH_LOCK, BAND_LOCK) for entry in _lock_entries(lock)}
 
-    # Assert — xgboost·PyPI 의 torch 가 끌어오는 CUDA 계열이 고정본에 들어오면 GPU 없는 러너에 수 GB 가 깔린다
+    # Assert — xgboost·PyPI 의 torch 가 끌어오는 CUDA 계열이 고정본에 들어오면 CPU 로만 도는 러너에 수 GB 가 깔린다
     assert not [name for name in names if name.startswith(("nvidia-", "cuda-")) or name == "triton"]
 
 
