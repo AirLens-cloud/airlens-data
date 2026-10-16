@@ -1811,7 +1811,7 @@ def test_render_markdown_names_the_product_and_shows_band_labels():
     assert "## 후보 ↔ 운영 비교 (band)" in text
     assert "| city-00 | h1 p50 |" in text
     assert "최대 |Δ| p10 0.0, p50 0.2, p90 0.0" in text
-    assert "p10/p90 엄격 비교 지평" not in text  # 이 줄은 run_band 가 채우는 요약에만 있다
+    assert "p10/p90 엄격 비교" not in text  # 이 줄은 run_band 가 채우는 요약에만 있다
 
 
 def band_tree(stamps_prod: list[str], stamps_cand: list[str]) -> dict[str, dict]:
@@ -1851,7 +1851,40 @@ def test_run_band_summary_counts_the_p10_p90_horizons_judged_and_left_out_over_s
     assert [(r.stamp, r.verdict, r.strict) for r in results] == [("2026101506", cc.PASS, True), ("2026101512", cc.INPUT_DIFF, False)]
     assert results[1].tail_judged == results[1].tail_skipped == []
     assert (summary["tail_horizons_judged"], summary["tail_horizons_skipped"]) == (2, 1)
-    assert "p10/p90 엄격 비교 지평 2곳 · n_holdout 이 달라 판정에서 뺀 지평 1곳 (p50 은 모든 지평을 판정한다)" in text
+    assert "p10/p90 엄격 비교 쌍·지평 2개 · n_holdout 이 달라 판정에서 뺀 쌍·지평 1개 (p50 은 모든 지평을 판정한다)" in text
+    assert summary["max_delta"] == {"p10": 0.0, "p50": 0.0, "p90": 0.0}  # 판정한 지평이 있으면 최대 |Δ| 를 비우지 않는다
+
+
+def test_run_band_summary_has_no_p10_p90_maximum_when_no_horizon_was_judged():
+    # Arrange — 후보의 보정 표본이 모든 지평에서 다르다: 엄격 짝이고 p50 은 통과하지만 p10/p90 은 한 지평도 판정하지 못했다
+    files = band_tree(["2026101506"], ["2026101506"])
+    files[f"{cc.CAND_BAND_DIR}/band_2026101506.json"] = with_n_holdout(band(), ALL_HORIZONS)
+
+    # Act
+    results, summary = cc.run_band(MemorySource(files), ok, since=None, min_strict=1)
+    text = cc.render_markdown(results, summary, "band")
+
+    # Assert — 최대 |Δ| 0.0 은 "같다" 로 읽힌다. 보지 않은 값은 "판정 없음" 으로 적고, p50 만으로 종료 코드는 0 이 된다
+    assert [(r.stamp, r.verdict, r.strict) for r in results] == [("2026101506", cc.PASS, True)]
+    assert (summary["tail_horizons_judged"], summary["tail_horizons_skipped"]) == (0, 3)
+    assert summary["max_delta"] == {"p10": None, "p50": 0.0, "p90": None}
+    assert summary["exit_code"] == 0
+    assert "최대 |Δ| p10 (판정 없음), p50 0.0, p90 (판정 없음)" in text
+    assert "p10/p90 엄격 비교 쌍·지평 0개 · n_holdout 이 달라 판정에서 뺀 쌍·지평 3개" in text
+
+
+def test_run_band_without_any_strict_pair_has_no_p10_p90_maximum_either():
+    # Arrange — issue_time 이 달라 엄격 짝이 없다(지평을 세지 않는다)
+    files = band_tree(["2026101506"], ["2026101506"])
+    files[f"{cc.CAND_BAND_DIR}/band_2026101506.json"] = band(issue_time="2026-10-15T07:00:00+00:00")
+
+    # Act
+    _results, summary = cc.run_band(MemorySource(files), ok, since=None, min_strict=1)
+
+    # Assert
+    assert summary["tail_horizons_judged"] == 0
+    assert summary["max_delta"]["p10"] is None and summary["max_delta"]["p90"] is None
+    assert summary["exit_code"] == 2
 
 
 def test_the_predictions_summary_has_no_p10_p90_horizon_line():
@@ -1951,6 +1984,21 @@ def test_main_band_json_output_names_the_product_and_stays_strict_json_with_nan(
     assert (worst["name"], worst["field"], worst["cand"], worst["abs_delta"]) == ("city-02", "h6 p50", "nan", None)
     assert data["pairs"][0]["tail_judged"] == ["1", "6", "24"] and data["pairs"][0]["tail_skipped"] == []
     assert (data["summary"]["tail_horizons_judged"], data["summary"]["tail_horizons_skipped"]) == (3, 0)
+
+
+def test_main_band_json_keeps_exit_zero_and_null_p10_p90_maximum_when_no_horizon_was_judged(tmp_path, capsys, monkeypatch):
+    # Arrange — 모든 지평의 보정 표본이 달라 p10/p90 판정이 0건이어도 p50 이 통과하면 끝난다
+    build_band_tree(tmp_path, ["2026101500", "2026101506"], mutate_candidate=lambda p: with_n_holdout(p, ALL_HORIZONS))
+    monkeypatch.delenv("GITHUB_STEP_SUMMARY", raising=False)
+
+    # Act
+    code = cc.main(["--product", "band", "--local", str(tmp_path), "--json"], validate=ok)
+
+    # Assert — 종료 코드만으로는 이 사실을 알 수 없다. 요약의 null 과 개수가 남긴다
+    summary = json.loads(capsys.readouterr().out)["summary"]
+    assert code == 0
+    assert summary["max_delta"] == {"p10": None, "p50": 0.0, "p90": None}
+    assert (summary["tail_horizons_judged"], summary["tail_horizons_skipped"]) == (0, 6)
 
 
 def test_main_band_uses_the_real_contract_validator_when_none_is_injected(tmp_path, capsys, monkeypatch):

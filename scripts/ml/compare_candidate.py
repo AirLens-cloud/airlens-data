@@ -31,7 +31,9 @@ UTC 시. 값은 도시·지평(lead_hours) 셀 단위로 비교한다.
     · p50 |Δ| ≤ 0.01 인 셀 ≥ 95% (공통 셀 전부), p10/p90 |Δ| ≤ 0.01 인 셀 ≥ 95% (엄격 지평의 셀),
       분위수별 최대 |Δ| ≤ 0.5   (p50 은 반올림 없이 float 로 나온다)
   이 값은 첫 엄격 짝을 본 뒤 보정한다. 계약 위반은 INPUT-DIFF 여도 FAIL 이다.
-  요약에 p10/p90 을 엄격 비교한 지평 수와 뺀 지평 수를 적는다 — 엄격 비교한 지평이 0 이면 p50 만 검증된 것이다.
+  요약에 p10/p90 을 엄격 비교한 쌍·지평 수와 뺀 쌍·지평 수를 적는다(엄격 짝마다 지평을 세어 더한 값이다). 엄격 비교한 쌍·지평이
+  0 이면 p50 만 검증된 것이고, 요약의 p10/p90 최대 |Δ| 는 0 이 아니라 "(판정 없음)"(JSON 은 null)이다. p10/p90 판정이 0건이어도
+  종료 코드는 0 일 수 있다 — 컷오버를 승인할 때 요약 줄을 본다.
 
 판정: PASS / FAIL / INPUT-DIFF(입력이 달라 엄격 비교 불가) / UNPAIRED(한쪽에 파일 없음).
 종료 코드: 0 = FAIL 없음 + 엄격 PASS ≥ 최소(predictions 3, band 2) / 1 = FAIL 있음 / 2 = 엄격 PASS 부족 또는 읽기 실패.
@@ -556,8 +558,8 @@ def render_markdown(results: list[PairResult], summary: dict, product: str = "pr
         f"짝 {summary['pairs']}개 — PASS {c[PASS]} · FAIL {c[FAIL]} · INPUT-DIFF {c[INPUT_DIFF]} · UNPAIRED {c[UNPAIRED]}"
         f" (후보 시간대의 운영 STAMP 중 후보 없음 {summary['prod_only_stamps']})",
         f"엄격 PASS {summary['strict_pass']} (필요 ≥ {summary['min_strict_pairs']}) · "
-        "최대 |Δ| " + ", ".join(f"{q.removeprefix('predicted_')} {v}" for q, v in summary["max_delta"].items()),
-        *([f"p10/p90 엄격 비교 지평 {summary['tail_horizons_judged']}곳 · n_holdout 이 달라 판정에서 뺀 지평 {summary['tail_horizons_skipped']}곳"
+        "최대 |Δ| " + ", ".join(f"{q.removeprefix('predicted_')} {'(판정 없음)' if v is None else v}" for q, v in summary["max_delta"].items()),
+        *([f"p10/p90 엄격 비교 쌍·지평 {summary['tail_horizons_judged']}개 · n_holdout 이 달라 판정에서 뺀 쌍·지평 {summary['tail_horizons_skipped']}개"
            " (p50 은 모든 지평을 판정한다)"] if "tail_horizons_judged" in summary else []),
         "",
         "| STAMP | 판정 | 엄격 | 사유 |",
@@ -718,6 +720,8 @@ def run_band(source: Source, validate: Callable[[dict], str | None], since: str 
     summary = summarize(results, _prod_only_count(source, PROD_BAND_DIR, "band", cand_stamps), min_strict, BAND_QUANTILES)
     summary["tail_horizons_judged"] = sum(len(r.tail_judged) for r in results)  # 지평을 채우는 것은 엄격 짝(PASS·FAIL)뿐이다
     summary["tail_horizons_skipped"] = sum(len(r.tail_skipped) for r in results)
+    if summary["tail_horizons_judged"] == 0:  # 판정한 p10/p90 셀이 없으면 최대 |Δ| 0 은 "같다" 가 아니라 "보지 않았다" 이다
+        summary["max_delta"].update({q: None for q in BAND_QUANTILES if q != "p50"})
     return results, summary
 
 
