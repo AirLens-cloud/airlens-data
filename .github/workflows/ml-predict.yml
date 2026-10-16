@@ -177,8 +177,8 @@ jobs:
             exit 0
           fi
           # 불리언이 아니면 값을 옮기지 않는다(리포트의 임의 값이 로그로 새지 않게).
-          DRIFT=$(python3 -c "import json;v=json.load(open('output/drift_report.json')).get('overall_drift');print(v if isinstance(v,bool) else 'unknown')" 2>/dev/null || echo unknown)
-          DUAL=$(python3 -c "import json;v=json.load(open('output/drift_report.json')).get('predictions_drift',{}).get('dual_metrics_present');print(v if isinstance(v,bool) else 'unknown')" 2>/dev/null || echo unknown)
+          DRIFT=$(python3 -I -c "import json;v=json.load(open('output/drift_report.json')).get('overall_drift');print(v if isinstance(v,bool) else 'unknown')" 2>/dev/null || echo unknown)
+          DUAL=$(python3 -I -c "import json;v=json.load(open('output/drift_report.json')).get('predictions_drift',{}).get('dual_metrics_present');print(v if isinstance(v,bool) else 'unknown')" 2>/dev/null || echo unknown)
           echo "drift summary: overall_drift=$DRIFT dual_metrics_present=$DUAL"
           {
             echo '### Drift monitor (advisory)'

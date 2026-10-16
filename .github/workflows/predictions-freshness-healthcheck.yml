@@ -91,9 +91,10 @@ jobs:
           # --search 대신 정확 일치로 고른다(검색 토크나이징에 제목을 맡기지 않는다). 작성자도 본다 — 공개 레포라 제3자가
           # 같은 제목으로 연 이슈를 이 워크플로가 덮어쓰거나 닫지 않게, github-actions 가 만든 이슈만 고른다. 서버 쪽
           # `--author`·`--app` 은 쓰지 않는다: 봇 표기가 맞지 않으면 조용히 0건이 되어 경보가 쌓인다(gh 2.102 에서
-          # `--author app/github-actions` 가 봇이 만든 이슈에 0건이었다). 응답의 author.login 을 직접 본다.
+          # `--author app/github-actions` 가 봇이 만든 이슈에 0건이었다). 응답의 author.login 을 직접 보고, 봇 표기 차이
+          # (`app/` 접두, `[bot]` 접미)는 떼고 비교한다.
           NUM=$(gh issue list --state open --limit 100 --json number,title,author \
-                  --jq '[.[] | select(.title == env.TITLE and ((.author.login // "") | sub("^app/"; "")) == "github-actions")] | .[0].number // ""')
+                  --jq '[.[] | select(.title == env.TITLE and ((.author.login // "") | sub("^app/"; "") | sub("\\[bot\\]$"; "")) == "github-actions")] | .[0].number // ""')
 
           if [ "$HEALTHY" = "true" ]; then
             if [ -n "$NUM" ]; then

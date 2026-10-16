@@ -708,6 +708,20 @@ def test_drift_step_hides_python_tracebacks_for_unreadable_reports(tmp_path, pre
     assert (proc.returncode, proc.stderr) == (0, "")
 
 
+def test_drift_step_reads_the_report_with_the_stdlib_json_even_if_the_work_dir_has_a_json_py(tmp_path, predict):
+    # Arrange — 추론 스텝이 남긴 파일이 스텝의 cwd(작업 폴더)에 있다고 가정한다. 격리 모드(-I)가 아니면 import json 이 이 파일을 집는다
+    work = tmp_path / "work"
+    work.mkdir()
+    (work / "json.py").write_text("raise SystemExit('작업 폴더의 json.py 를 import 했다')\n", encoding="utf-8")
+
+    # Act
+    proc, _summary = run_drift_step(tmp_path, predict, report=_report(overall_drift=True))
+
+    # Assert
+    assert proc.returncode == 0
+    assert "drift summary: overall_drift=True dual_metrics_present=True" in proc.stdout
+
+
 def test_drift_step_failing_monitor_writes_no_summary_and_no_derived_values(tmp_path, predict):
     # Arrange / Act
     proc, summary = run_drift_step(tmp_path, predict, stub_rc=1, report=_report(overall_drift=True))
@@ -1155,11 +1169,13 @@ _BOT = {"login": "app/github-actions", "is_bot": True}
         ([{"number": 7, "title": "other", "author": _BOT}], ""),  # 봇이 만들었어도 제목이 다르면 아니다
         ([{"number": 7, "title": "T", "author": {"login": "github-actions"}}], "7"),  # `app/` 접두가 없는 표기도 같은 봇이다
         ([{"number": 7, "title": "T", "author": {"login": "app/other-bot"}}], ""),  # 다른 앱
+        ([{"number": 7, "title": "T", "author": {"login": "github-actions[bot]"}}], "7"),  # `[bot]` 접미 표기도 같은 봇이다
+        ([{"number": 7, "title": "T", "author": {"login": "someone[bot]"}}], ""),  # 접미를 떼도 다른 봇이다
         ([{"number": 7, "title": "T", "author": None}, {"number": 8, "title": "T"}], ""),  # 삭제된 사용자 · author 없음 — 오류 없이 건너뜀
         ([], ""),
     ],
     ids=["bot", "two-bots-newest-first", "bot-and-newer-squatter", "squatter-only", "bot-other-title", "bare-login", "other-app",
-         "null-author", "none"],
+         "bracket-bot", "other-bracket-bot", "null-author", "none"],
 )
 def test_alert_issue_lookup_picks_only_the_issue_this_workflow_created(probe_workflow, issues, expected):
     # Arrange — 워크플로가 쓰는 --jq 식을 그대로 jq 로 돌린다(gh 는 같은 식을 응답 JSON 에 적용한다)
