@@ -32,7 +32,8 @@ name: Band Forecast → HF
 #   ② 추론 wheel `--no-deps` (받을 때 sha256 핀으로 검증)
 #   ③ `[band]` extra 의 나머지 폐포를 PyPI 에서(`requirements-band.lock.txt`, 해시 고정)
 # 그다음 `scripts/ml/check_band_env.py` 가 설치 결과를 검사한다 — GPU 스택 없음, CPU 빌드 torch, 그리고 `pip check`
-# 가 낸 줄이 허용 목록(`BAND_SKIPPED_BASE_DEPS`, 일부러 깔지 않은 기본 의존성)의 정확한 줄뿐인지.
+# 가 낸 줄의 집합이 기대 목록(`BAND_SKIPPED_BASE_DEPS`, 일부러 깔지 않은 기본 의존성마다 한 줄)과 정확히 같은지. 기대한
+# 줄이 없거나 다른 줄이 있거나 출력이 비었거나 `No broken requirements found.` 면 실패다.
 #
 # ── 공개 레포라서 ───────────────────────────────────────────────────────────────
 # · 시크릿은 쓰는 스텝의 env 에만. 두 잡은 main 에서만 돈다(`github.ref` 가드).
@@ -73,7 +74,7 @@ env:
   PUBLISH_MODE: candidate  # candidate | production — 컷오버는 이 줄을 바꾸는 PR
   INFERENCE_VERSION: '0.3.0'  # wheel 버전 핀
   INFERENCE_WHEEL_SHA256: '63eed042320a0ddfe69c695c74b1ebb4cf80b90966e976dbb76728c430910a3c'  # 위 버전 wheel 의 sha256 핀
-  BAND_SKIPPED_BASE_DEPS: 'joblib,lightgbm,python-dotenv,scikit-learn,scipy,xgboost'  # wheel 기본 의존성 중 일부러 깔지 않는 것(pip check 에 남는 줄)
+  BAND_SKIPPED_BASE_DEPS: 'joblib,lightgbm,python-dotenv,scikit-learn,scipy,xgboost'  # wheel 기본 의존성 중 일부러 깔지 않는 것(pip check 가 정확히 이 줄들만 낸다)
 
 defaults:
   run:
@@ -164,7 +165,8 @@ jobs:
           "$VENV/bin/python" -m pip install --no-cache-dir --require-hashes --no-deps --only-binary :all: \
             -r scripts/ml/requirements-band.lock.txt
 
-      # `pip check` 는 일부러 깔지 않은 기본 의존성 줄을 낸다. 통째로 무시하지 않고 허용 목록의 정확한 줄만 통과시킨다.
+      # `pip check` 는 일부러 깔지 않은 기본 의존성마다 한 줄을 낸다. 종료 코드는 그 줄 때문에 늘 실패라 삼키고(`|| true`), 출력이
+      # 기대한 줄과 정확히 같을 때만 통과시킨다(기대한 줄이 없거나, 다른 줄이 있거나, 빈 출력이거나, 문제 없음 메시지면 실패).
       # 같은 스텝에서 GPU 스택(nvidia-*, cuda-*, triton)이 없는지, torch 가 CPU 빌드인지(`torch.version.cuda` 가 None)
       # 도 본다. 설치가 끝난 뒤, 추론을 돌리기 전이다. `pip list` 는 끝에 pip 새 버전을 확인하러 PyPI 에 나가므로(`pip check` 는
       # 아니다) 다른 pip 스텝처럼 그 확인을 끈다.
@@ -180,7 +182,7 @@ jobs:
           TORCH_CUDA=$("$VENV/bin/python" -I -c 'import torch; print(torch.version.cuda)')
           python3 scripts/ml/check_band_env.py \
             --pip-check "$WORK/pip-check.txt" --pip-list "$WORK/pip-list.txt" --torch-cuda "$TORCH_CUDA" \
-            --project airlens-inference --version "$INFERENCE_VERSION" --allow-missing "$BAND_SKIPPED_BASE_DEPS"
+            --project airlens-inference --version "$INFERENCE_VERSION" --expect-missing "$BAND_SKIPPED_BASE_DEPS"
 
       # 신선 관측 시계열을 만든다(공개 HF 의 OpenAQ 슬롯). 경로 플래그를 전부 명시한다.
       - name: Build fresh OpenAQ series

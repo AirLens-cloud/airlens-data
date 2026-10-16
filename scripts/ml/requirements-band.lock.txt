@@ -3,7 +3,7 @@
 #   python -m pip install --no-cache-dir --require-hashes --no-deps --only-binary :all: -r scripts/ml/requirements-band.lock.txt
 # wheel 의 `[band]` extra 요구의 전이 폐포 전부다. wheel 의 기본 의존성 중 band 가 쓰지 않는 것(joblib · lightgbm ·
 # python-dotenv · scikit-learn · scipy · xgboost)은 일부러 넣지 않았다 — xgboost 가 nvidia-nccl-cu12 를 끌어온다.
-# 그래서 설치 뒤 `pip check` 는 그 여섯 줄을 낸다. check_band_env.py 가 허용 목록의 정확한 줄만 통과시킨다.
+# 그래서 설치 뒤 `pip check` 는 그 여섯 줄을 낸다. check_band_env.py 가 그 여섯 줄과 정확히 같을 때만 통과시킨다.
 # 점검(2026-10-16): `[band]` extra 요구 + torch 2.13.0+cpu 를 constraints-band.txt 로 해석한 폐포가 constraints-band.txt
 # 32줄과 한 줄도 다르지 않다(CUDA 계열 없음). 같은 명령으로 Python 3.11 을 주면 해석이 실패하고, 요구를 하나 더하면
 # 차이가 나온다(점검이 실제로 걸러 낸다는 대조). 저장소 루트에서:

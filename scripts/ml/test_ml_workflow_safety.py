@@ -1165,7 +1165,7 @@ def test_band_pins_are_exact_never_latest_and_the_same_wheel_as_predict(band, pr
     assert VERSION_RE.fullmatch(str(env["INFERENCE_VERSION"]))
     assert "latest" not in json.dumps(env).lower()
     # 같은 wheel 이라 핀을 함께 바꾼다(워크플로 머리 주석). 따로 가려면 이 단언을 고치고 이유를 남긴다 — band 쪽은 새 wheel 의
-    # `[band]` 폐포와 pip check 허용 목록을 다시 확인해야 한다
+    # `[band]` 폐포와 pip check 기대 목록을 다시 확인해야 한다
     assert (env["INFERENCE_VERSION"], env["INFERENCE_WHEEL_SHA256"]) == (predict_env["INFERENCE_VERSION"], predict_env["INFERENCE_WHEEL_SHA256"])
 
 
@@ -1451,8 +1451,8 @@ def test_band_workflow_arguments_are_accepted_by_the_scripts_they_call(band, mon
     assert (snapshot.mode, maps.mode, maps.group) == (mode, mode, "band")
     assert snapshot.dest == maps.prod_snapshot  # 내려받은 사본을 발행 매핑이 같은 파일로 읽는다
     assert (env_check.project, env_check.version) == ("airlens-inference", band["env"]["INFERENCE_VERSION"])
-    assert env_check.allow_missing == band["env"]["BAND_SKIPPED_BASE_DEPS"]
-    assert check_band_env.parse_allow_missing(env_check.allow_missing)  # 비거나 빈 항목이 아니다
+    assert env_check.expect_missing == band["env"]["BAND_SKIPPED_BASE_DEPS"]
+    assert check_band_env.parse_expect_missing(env_check.expect_missing)  # 비거나 빈 항목이 아니다
 
 
 # ── D. 환경 고정 파일 ────────────────────────────────────────────────────────
@@ -1524,14 +1524,14 @@ def test_band_closure_has_no_gpu_stack_package():
     assert not [name for name in names if name.startswith(("nvidia-", "cuda-")) or name == "triton"]
 
 
-def test_band_pip_check_allow_list_is_exactly_the_base_dependencies_the_closure_leaves_out(band):
+def test_band_pip_check_expected_list_is_exactly_the_base_dependencies_the_closure_leaves_out(band):
     # Arrange
-    allowed = set(band["env"]["BAND_SKIPPED_BASE_DEPS"].split(","))
+    expected = set(band["env"]["BAND_SKIPPED_BASE_DEPS"].split(","))
 
     # Act / Assert — 0.3.0 wheel 을 실측한 6개다(wheel 핀을 올리면 다시 잰다). 설치되는 패키지는 pip check 에 "미설치" 로 나오지 않으므로
-    # 고정본에 있는 이름은 허용 목록에 없어야 하고, 허용 목록이 실측보다 넓으면 정말 빠진 의존성이 숨는다
-    assert allowed == PIP_EXPECTED_MISSING
-    assert not allowed & set(_constraint_pins(BAND_CONSTRAINTS))
+    # 고정본에 있는 이름은 기대 목록에 없어야 한다. 목록이 실측과 다르면 check_band_env 가 실패한다(넓으면 없는 줄, 좁으면 예상 밖 줄)
+    assert expected == PIP_EXPECTED_MISSING
+    assert not expected & set(_constraint_pins(BAND_CONSTRAINTS))
 
 
 @pytest.mark.parametrize(
