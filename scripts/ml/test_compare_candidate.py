@@ -869,33 +869,6 @@ def test_http_read_bytes_returns_the_body_untouched_and_none_for_404(monkeypatch
     assert calls[0] == f"{cc.RESOLVE_BASE}/dir/a.json"
 
 
-class UnreadableResponse(FakeResponse):
-    """열기만 해야 한다 — 본문을 읽으면 시험이 실패한다."""
-
-    def read(self) -> bytes:
-        raise AssertionError("exists() 는 본문을 읽으면 안 된다")
-
-
-def test_http_exists_opens_the_file_without_reading_the_body_and_is_false_for_404(monkeypatch):
-    # Arrange
-    source, calls, _ = scripted_source(monkeypatch, {"here.json": [UnreadableResponse(b"")], "missing.json": [http_error(404)]})
-
-    # Act / Assert
-    assert source.exists("dir/here.json") is True
-    assert source.exists("dir/missing.json") is False
-    assert calls == [f"{cc.RESOLVE_BASE}/dir/here.json", f"{cc.RESOLVE_BASE}/dir/missing.json"]
-
-
-def test_http_exists_retries_and_reports_a_persistent_failure_as_source_error(monkeypatch):
-    # Arrange
-    source, calls, sleeps = scripted_source(monkeypatch, {"a.json": [http_error(503)]})
-
-    # Act / Assert — 확인을 못 한 것과 없는 것은 다르다
-    with pytest.raises(cc.SourceError, match="status=503"):
-        source.exists("dir/a.json")
-    assert len(calls) == cc.FETCH_RETRIES and sleeps == [2.0, 4.0]
-
-
 def test_http_retries_503_then_succeeds(monkeypatch):
     # Arrange
     source, calls, sleeps = scripted_source(monkeypatch, {"a.json": [http_error(503), http_error(503), FakeResponse(b"{}")]})
@@ -1066,10 +1039,9 @@ def test_http_requests_share_one_timeout_that_is_not_shorter_than_band_guard_use
     # Act
     source.read_json("dir/a.json")
     source.read_bytes("dir/a.json")
-    source.exists("dir/a.json")
 
     # Assert
-    assert seen == [cc.FETCH_TIMEOUT_S] * 3
+    assert seen == [cc.FETCH_TIMEOUT_S] * 2
     assert cc.FETCH_TIMEOUT_S >= 30
 
 

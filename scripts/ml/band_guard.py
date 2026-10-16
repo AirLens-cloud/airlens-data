@@ -12,6 +12,10 @@ band job 은 예보 수집(forecast-collect) 직후와 백업 스케줄에 모�
   candidate   후보 발행물(`band_<issue 의 UTC %Y%m%d%H>.json`)이 이미 있으면 건너뛴다
   --force true 는 어느 쪽이든 건너뛰지 않는다.
 
+"이미 있다" 는 파일이 응답한다(200)는 뜻이 아니라 본문이 그 issue 의 band 발행물이라는 뜻이다 — JSON 객체이고 `schema_version`
+이 `w3-band-v1` 이고 `issue_time` 의 STAMP 가 같을 때만. 점검 페이지 같은 200 응답이나 다른 issue 의 파일 때문에 후보 발행이
+빠지면 안 된다. 아니면 경고를 남기고 돈다. snapshot 이 "같은 issue 의 사본이 이미 있나" 를 보는 것도 같은 확인이다.
+
 시각 문자열은 출처마다 모양이 다르다(`...Z` ↔ `...+00:00`). 문자열이 아니라 파싱한 시각으로 비교한다. 파서는
 `publish_targets.parse_utc` 하나다 — snapshot 이 받은 `issue_time` 은 발행 매핑(`publish_targets.py maps`)도 받는다.
 공개 저장소 조회(재시도·404·오류 문구)는 `compare_candidate.HttpSource` 를 그대로 쓴다 — 조회 코드를 두 벌 두지 않는다.
@@ -53,7 +57,7 @@ class Facts:
 
     issue: datetime | None
     published_issue: datetime | None = None  # production 전용: 운영 latest 의 issue_time
-    candidate_exists: bool = False  # candidate 전용
+    candidate_exists: bool = False  # candidate 전용: 같은 issue 의 후보 발행물이 실제로 있다(본문 확인)
 
 
 def decide(mode: str, force: bool, facts: Facts) -> Decision:
@@ -73,7 +77,7 @@ def decide(mode: str, force: bool, facts: Facts) -> Decision:
         return Decision(False, f"새 예보 발행 {issue} (운영 latest 는 {facts.published_issue.isoformat()})")
     if facts.candidate_exists:
         return Decision(True, f"후보 발행물 band_{pt.stamp_of(facts.issue)}.json 이 이미 있다")
-    return Decision(False, f"후보 발행물 band_{pt.stamp_of(facts.issue)}.json 이 없다 — 예보 발행 {issue} 을(를) 돌린다")
+    return Decision(False, f"후보 발행물 band_{pt.stamp_of(facts.issue)}.json 이 없거나 그 issue 의 발행물이 아니다 — 예보 발행 {issue} 을(를) 돌린다")
 
 
 def _read_instant(client: cc.HttpSource, rel_path: str, key: str, warnings: list[str], *, missing_ok: bool = False) -> datetime | None:
@@ -92,6 +96,38 @@ def _read_instant(client: cc.HttpSource, rel_path: str, key: str, warnings: list
     return None
 
 
+def _band_stamp(doc: dict) -> str:
+    """band 발행물(`w3-band-v1`)이면 `issue_time` 의 STAMP. 아니면 ValueError."""
+    if doc.get("schema_version") != BAND_SCHEMA:
+        raise ValueError(f"schema_version 이 {BAND_SCHEMA} 가 아니다")
+    try:
+        return pt.utc_stamp(doc.get("issue_time"))
+    except ValueError as exc:
+        raise ValueError(f"issue_time 를 읽을 수 없다 ({exc})") from None
+
+
+def _has_issue(client: cc.HttpSource, rel_path: str, stamp: str, warnings: list[str]) -> bool:
+    """`rel_path` 에 issue `stamp` 의 band 발행물이 실제로 있나. 없거나 읽지 못했거나 본문이 그 발행물이 아니면 False.
+
+    404 는 조용히 False 다. 그 밖의 이유(200 인데 JSON 이 아님, 다른 schema·issue, 조회 실패)는 경고를 모은다.
+    """
+    try:
+        doc = client.read_json(rel_path)
+        if doc is None:
+            return False
+        found = _band_stamp(doc)
+    except cc.SourceError as exc:
+        warnings.append(str(exc))
+        return False
+    except ValueError as exc:
+        warnings.append(f"{rel_path}: band 발행물 모양이 아니다 ({exc})")
+        return False
+    if found != stamp:
+        warnings.append(f"{rel_path}: issue {found} 의 발행물이다 — issue {stamp} 의 발행물로 보지 않는다")
+        return False
+    return True
+
+
 def observe(mode: str, client: cc.HttpSource, warnings: list[str]) -> Facts:
     """판정에 필요한 사실을 공개 저장소에서 읽는다. 실패는 경고로 모으고 모르는 값으로 둔다."""
     issue = _read_instant(client, FORECAST_PATH, "generated_at", warnings)
@@ -99,12 +135,8 @@ def observe(mode: str, client: cc.HttpSource, warnings: list[str]) -> Facts:
         return Facts(None)
     if mode == "production":
         return Facts(issue, published_issue=_read_instant(client, pt.BAND_LATEST, "issue_time", warnings, missing_ok=True))
-    candidate_path = pt.band_history_dest(pt.stamp_of(issue))
-    try:
-        return Facts(issue, candidate_exists=client.exists(candidate_path))
-    except cc.SourceError as exc:
-        warnings.append(str(exc))
-        return Facts(issue)
+    stamp = pt.stamp_of(issue)
+    return Facts(issue, candidate_exists=_has_issue(client, pt.band_history_dest(stamp), stamp, warnings))
 
 
 def check(mode: str, force: bool, client: cc.HttpSource) -> tuple[Decision, list[str]]:
@@ -117,9 +149,10 @@ def check(mode: str, force: bool, client: cc.HttpSource) -> tuple[Decision, list
 def snapshot(client: cc.HttpSource, dest: Path, warnings: list[str], validate: Callable[[dict], str | None]) -> str:
     """지금의 운영 latest 원문을 dest 로 저장한다(후보 모드). 결과 설명 한 줄을 돌려준다.
 
-    같은 issue 의 사본이 이미 있으면 쓰지 않는다. 운영 latest 를 못 받거나 band 모양이 아니거나 계약 검증(`validate`)에
-    걸리면 쓰지 않고 경고만 남긴다 — 사본은 비교용 보조 자료라 후보 발행을 막지 않는다. 계약 검증은 발행기의
-    `batch --schema auto` 와 같은 검증기다: 거르지 않으면 계약을 어긴 사본 하나가 batch 전체(후보 발행물까지)를 멈춘다.
+    같은 issue 의 사본이 이미 있으면(본문이 그 issue 의 band 발행물일 때만) 쓰지 않는다. 운영 latest 를 못 받거나 band 모양이
+    아니거나 계약 검증(`validate`)에 걸리면 쓰지 않고 경고만 남긴다 — 사본은 비교용 보조 자료라 후보 발행을 막지 않는다.
+    계약 검증은 발행기의 `batch --schema auto` 와 같은 검증기다: 거르지 않으면 계약을 어긴 사본 하나가 batch 전체
+    (후보 발행물까지)를 멈춘다.
     """
     try:
         body = client.read_bytes(pt.BAND_LATEST)
@@ -130,9 +163,7 @@ def snapshot(client: cc.HttpSource, dest: Path, warnings: list[str], validate: C
         warnings.append(str(exc))
         return "운영 latest 를 받지 못해 사본을 남기지 않는다"
     try:
-        if doc.get("schema_version") != BAND_SCHEMA:
-            raise ValueError(f"schema_version 이 {BAND_SCHEMA} 가 아니다")
-        stamp = pt.utc_stamp(doc.get("issue_time"))
+        stamp = _band_stamp(doc)
     except ValueError as exc:
         warnings.append(f"{pt.BAND_LATEST}: band 발행물 모양이 아니다 ({exc})")
         return "운영 latest 가 band 발행물 모양이 아니라 사본을 남기지 않는다"
@@ -140,11 +171,9 @@ def snapshot(client: cc.HttpSource, dest: Path, warnings: list[str], validate: C
     if error is not None:
         warnings.append(f"{pt.BAND_LATEST}: band 계약을 어겼다 ({error!r:.300})")  # repr: 줄바꿈이 섞여도 로그 한 줄, 길이도 제한
         return "운영 latest 가 band 계약을 어겨 사본을 남기지 않는다"
-    try:
-        if client.exists(pt.band_prod_copy_dest(stamp)):
-            return f"issue {stamp} 의 운영 사본이 이미 있다 — 쓰지 않는다"
-    except cc.SourceError as exc:  # 확인을 못 했으면 쓴다. 같은 issue 의 운영 latest 는 덮어써도 비교에 해가 없다
-        warnings.append(str(exc))
+    if _has_issue(client, pt.band_prod_copy_dest(stamp), stamp, warnings):
+        return f"issue {stamp} 의 운영 사본이 이미 있다 — 쓰지 않는다"
+    # 확인을 못 했거나 본문이 그 발행물이 아니면 쓴다. 같은 issue 의 운영 latest 는 덮어써도 비교에 해가 없다
     dest.parent.mkdir(parents=True, exist_ok=True)
     dest.write_bytes(body)
     return f"issue {stamp} 의 운영 latest 를 {dest.name} 로 저장했다"

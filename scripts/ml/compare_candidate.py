@@ -619,12 +619,12 @@ class HttpSource:
         req = urllib.request.Request(url, headers={"User-Agent": "airlens-data-compare-candidate"})
         return urllib.request.urlopen(req, timeout=FETCH_TIMEOUT_S)  # noqa: S310 — 고정 https 호스트
 
-    def _get(self, url: str, what: str, *, read_body: bool = True):
-        """(본문 bytes, Link 헤더). 404 는 (None, ''). read_body=False 면 열어 보기만 한다(본문 b"")."""
+    def _get(self, url: str, what: str):
+        """(본문 bytes, Link 헤더). 404 는 (None, '')."""
         for attempt in range(1, FETCH_RETRIES + 1):
             try:
                 with self._open(url) as resp:
-                    return (resp.read() if read_body else b""), resp.headers.get("Link") or ""
+                    return resp.read(), resp.headers.get("Link") or ""
             except urllib.error.HTTPError as exc:
                 if exc.code == 404:
                     return None, ""
@@ -660,10 +660,6 @@ class HttpSource:
     def read_bytes(self, rel_path: str) -> bytes | None:
         """본문 그대로. 없으면(404) None."""
         return self._get(f"{RESOLVE_BASE}/{rel_path}", rel_path)[0]
-
-    def exists(self, rel_path: str) -> bool:
-        """본문을 읽지 않고 열어 보기만 한다."""
-        return self._get(f"{RESOLVE_BASE}/{rel_path}", rel_path, read_body=False)[0] is not None
 
     def read_json(self, rel_path: str) -> dict | None:
         body = self.read_bytes(rel_path)

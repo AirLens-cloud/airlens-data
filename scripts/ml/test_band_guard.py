@@ -91,31 +91,19 @@ def test_unknown_mode_is_a_programming_error(mode):
 # ── check: 사실 수집 + 판정 ──────────────────────────────────────────────────
 class FakeClient(cc.HttpSource):
     """공개 저장소 대역(`read_json` 은 `HttpSource` 것 그대로). files = 경로 → bytes | 예외 (없으면 404).
-    조회한 (경로, 본문을 읽었나) 를 기록한다. 재시도·상태 코드·헤더는 test_compare_candidate.py 가 `HttpSource` 로 시험한다."""
+    조회한 경로를 기록한다. 재시도·상태 코드·헤더는 test_compare_candidate.py 가 `HttpSource` 로 시험한다."""
 
     def __init__(self, files: dict[str, object] | None = None) -> None:
         super().__init__(sleep=lambda _s: None)
         self.files = files or {}
-        self.calls: list[tuple[str, bool]] = []
+        self.paths: list[str] = []
 
-    def _lookup(self, rel_path: str, *, read_body: bool) -> bytes | None:
-        self.calls.append((rel_path, read_body))
+    def read_bytes(self, rel_path: str) -> bytes | None:
+        self.paths.append(rel_path)
         value = self.files.get(rel_path)
         if isinstance(value, BaseException):
             raise value
-        if value is None:
-            return None
-        return value if read_body else b""  # type: ignore[return-value]
-
-    def read_bytes(self, rel_path: str) -> bytes | None:
-        return self._lookup(rel_path, read_body=True)
-
-    def exists(self, rel_path: str) -> bool:
-        return self._lookup(rel_path, read_body=False) is not None
-
-    @property
-    def paths(self) -> list[str]:
-        return [path for path, _ in self.calls]
+        return value  # type: ignore[return-value]
 
 
 def doc(**fields: object) -> bytes:
@@ -214,7 +202,7 @@ def test_production_check_with_an_unreadable_latest_runs_and_warns(latest, expec
 @pytest.mark.parametrize("mode", ["production", "candidate"])
 def test_unreadable_forecast_means_run_with_a_warning_and_no_further_requests(mode, forecast_file, expected):
     # Arrange — 이 파일 하나를 못 읽으면 어떤 판정도 할 수 없다
-    client = FakeClient({bg.FORECAST_PATH: forecast_file, pt.BAND_LATEST: band(), CANDIDATE_PATH: b"{}"})
+    client = FakeClient({bg.FORECAST_PATH: forecast_file, pt.BAND_LATEST: band(), CANDIDATE_PATH: band()})
 
     # Act
     decision, warnings = bg.check(mode, False, client)
@@ -225,16 +213,53 @@ def test_unreadable_forecast_means_run_with_a_warning_and_no_further_requests(mo
     assert client.paths == [bg.FORECAST_PATH]
 
 
-def test_candidate_check_skips_when_the_stamped_file_exists():
-    # Arrange
-    client = FakeClient({bg.FORECAST_PATH: forecast(), CANDIDATE_PATH: b"{}"})
+@pytest.mark.parametrize(
+    "issue_time",
+    ["2026-10-15T06:15:42+00:00", "2026-10-15T06:15:42Z", "2026-10-15T15:15:42+09:00", "2026-10-15T06:40:00+00:00"],
+    ids=["offset-zero", "z-suffix", "kst-offset", "same-hour-other-minute"],
+)
+def test_candidate_check_skips_when_the_stamped_file_is_that_issues_band_payload(issue_time):
+    # Arrange — 판정 단위는 issue_time 의 UTC 시(STAMP)다. 표기가 달라도, 같은 시 안의 다른 분이어도 같은 발행으로 본다
+    client = FakeClient({bg.FORECAST_PATH: forecast(), CANDIDATE_PATH: band(issue_time)})
 
     # Act
     decision, warnings = bg.check("candidate", False, client)
 
-    # Assert — 후보 모드는 운영 latest 를 조회하지 않고, 후보 파일은 열어 보기만 한다
+    # Assert — 후보 모드는 운영 latest 를 조회하지 않고, 후보 파일은 본문을 읽어 확인한다
     assert (decision.skip, warnings) == (True, [])
-    assert client.calls == [(bg.FORECAST_PATH, True), (CANDIDATE_PATH, False)]
+    assert client.paths == [bg.FORECAST_PATH, CANDIDATE_PATH]
+
+
+@pytest.mark.parametrize(
+    ("candidate_file", "expected"),
+    [
+        (b"<html>maintenance</html>", "JSON 아님"),  # 200 인데 점검 페이지
+        (b"", "JSON 아님"),
+        (b"[]", "JSON 객체 아님"),
+        (b"\x80abc", "JSON 아님"),
+        (doc(schema_version="w3-band-v1"), "issue_time"),  # schema 는 맞는데 issue_time 이 없다
+        (band(issue_time="garbage"), "garbage"),
+        (band(issue_time=None), "issue_time"),
+        (band(schema_version="w3-band-v0"), "schema_version"),
+        (band(schema_version=None), "schema_version"),
+        (doc(issue_time="2026-10-15T06:15:42+00:00"), "schema_version"),  # issue 는 맞는데 band 발행물이 아니다
+        (band("2026-10-15T00:15:40+00:00"), "issue 2026101500 의 발행물이다"),  # 다른 issue
+        (band("2026-10-15T06:15:42+09:00"), "issue 2026101421 의 발행물이다"),  # 같은 시각 표기라도 UTC 로 바꾸면 다른 시
+    ],
+    ids=["html", "empty", "array", "not-utf8", "no-issue-time", "garbage-issue-time", "null-issue-time", "other-schema", "null-schema",
+         "no-schema", "other-issue", "other-hour-in-utc"],
+)
+def test_candidate_check_runs_and_warns_when_the_stamped_file_is_not_that_issues_band_payload(candidate_file, expected):
+    # Arrange — 파일이 응답해도(200) 그 issue 의 발행물이 아니면 "있다" 가 아니다: 건너뛰면 그 issue 의 후보 발행이 빠진다
+    client = FakeClient({bg.FORECAST_PATH: forecast(), CANDIDATE_PATH: candidate_file})
+
+    # Act
+    decision, warnings = bg.check("candidate", False, client)
+
+    # Assert
+    assert decision.skip is False
+    assert len(warnings) == 1 and warnings[0].startswith(f"{CANDIDATE_PATH}: ") and expected in warnings[0]
+    assert "발행물이 아니다" in decision.reason
 
 
 def test_candidate_check_runs_when_the_stamped_file_is_missing():
@@ -249,7 +274,7 @@ def test_candidate_check_runs_when_the_stamped_file_is_missing():
     assert client.paths == [bg.FORECAST_PATH, CANDIDATE_PATH]
 
 
-def test_candidate_check_runs_and_warns_when_the_existence_check_fails():
+def test_candidate_check_runs_and_warns_when_the_lookup_fails():
     # Arrange
     client = FakeClient({bg.FORECAST_PATH: forecast(), CANDIDATE_PATH: cc.SourceError(f"{CANDIDATE_PATH}: TimeoutError")})
 
@@ -275,13 +300,13 @@ def test_candidate_path_uses_the_utc_hour_of_the_forecast_issue():
 @pytest.mark.parametrize("mode", ["production", "candidate"])
 def test_force_does_not_touch_the_network(mode):
     # Arrange
-    client = FakeClient({bg.FORECAST_PATH: forecast(), pt.BAND_LATEST: band(), CANDIDATE_PATH: b"{}"})
+    client = FakeClient({bg.FORECAST_PATH: forecast(), pt.BAND_LATEST: band(), CANDIDATE_PATH: band()})
 
     # Act
     decision, warnings = bg.check(mode, True, client)
 
     # Assert
-    assert (decision.skip, warnings, client.calls) == (False, [], [])
+    assert (decision.skip, warnings, client.paths) == (False, [], [])
 
 
 def test_paths_come_from_publish_targets():
@@ -303,7 +328,7 @@ def run_main(argv, client, tmp_path, capsys, *, with_files=True):
 
 @pytest.mark.parametrize(
     ("files", "skip"),
-    [({bg.FORECAST_PATH: forecast(), CANDIDATE_PATH: b"{}"}, "true"), ({bg.FORECAST_PATH: forecast()}, "false")],
+    [({bg.FORECAST_PATH: forecast(), CANDIDATE_PATH: band()}, "true"), ({bg.FORECAST_PATH: forecast()}, "false")],
 )
 def test_check_command_writes_the_skip_output_and_a_summary(tmp_path, capsys, files, skip):
     # Act
@@ -347,7 +372,7 @@ def test_check_command_force_true_runs_without_any_request(tmp_path, capsys):
     code, _, output, summary = run_main(["check", "--mode", "production", "--force", "true"], client, tmp_path, capsys)
 
     # Assert
-    assert (code, output, client.calls) == (0, "skip=false\n", [])
+    assert (code, output, client.paths) == (0, "skip=false\n", [])
     assert "force=true" in summary
 
 
@@ -382,12 +407,12 @@ def test_snapshot_saves_the_published_latest_byte_for_byte(tmp_path, capsys):
     # Assert
     assert code == 0 and dest.read_bytes() == raw
     assert f"issue {STAMP}" in stdout and "저장했다" in stdout and str(tmp_path) not in stdout
-    assert client.calls == [(pt.BAND_LATEST, True), (PROD_COPY_PATH, False)]
+    assert client.paths == [pt.BAND_LATEST, PROD_COPY_PATH]
 
 
 def test_snapshot_does_not_write_when_the_copy_for_that_issue_already_exists(tmp_path, capsys):
     # Arrange
-    client = FakeClient({pt.BAND_LATEST: band(), PROD_COPY_PATH: b"{}"})
+    client = FakeClient({pt.BAND_LATEST: band(), PROD_COPY_PATH: band()})
     dest = tmp_path / "prod_latest.json"
 
     # Act
@@ -395,7 +420,33 @@ def test_snapshot_does_not_write_when_the_copy_for_that_issue_already_exists(tmp
 
     # Assert
     assert code == 0 and not dest.exists()
-    assert "이미 있다" in stdout
+    assert "이미 있다" in stdout and "::warning::" not in stdout
+
+
+@pytest.mark.parametrize(
+    ("copy_file", "expected"),
+    [
+        (b"<html>maintenance</html>", "JSON 아님"),  # 200 인데 점검 페이지
+        (b"[]", "JSON 객체 아님"),
+        (band(schema_version="w3-band-v0"), "schema_version"),
+        (band(issue_time="garbage"), "garbage"),
+        (band("2026-10-15T00:15:40+00:00"), "issue 2026101500 의 발행물이다"),  # 다른 issue 의 사본
+    ],
+    ids=["html", "array", "other-schema", "garbage-issue-time", "other-issue"],
+)
+def test_snapshot_writes_when_the_file_at_the_copy_path_is_not_that_issues_band_payload(tmp_path, capsys, copy_file, expected):
+    # Arrange — 사본 경로가 응답해도 그 issue 의 발행물이 아니면 "이미 있다" 가 아니다: 건너뛰면 그 issue 는 짝이 영영 만들어지지 않는다
+    client = FakeClient({pt.BAND_LATEST: band(), PROD_COPY_PATH: copy_file})
+    dest = tmp_path / "prod_latest.json"
+
+    # Act
+    code, stdout, _, _ = run_main(["snapshot", "--mode", "candidate", "--dest", str(dest)], client, tmp_path, capsys)
+
+    # Assert
+    assert code == 0 and dest.read_bytes() == band()
+    warnings = [line for line in stdout.splitlines() if line.startswith("::warning::")]
+    assert len(warnings) == 1 and warnings[0].startswith(f"::warning::band_guard: {PROD_COPY_PATH}: ") and expected in warnings[0]
+    assert "저장했다" in stdout
 
 
 def test_snapshot_in_production_mode_does_nothing_and_never_touches_the_network(tmp_path, capsys):
@@ -407,7 +458,7 @@ def test_snapshot_in_production_mode_does_nothing_and_never_touches_the_network(
     code, stdout, _, _ = run_main(["snapshot", "--mode", "production", "--dest", str(dest)], client, tmp_path, capsys)
 
     # Assert
-    assert (code, client.calls, dest.exists()) == (0, [], False)
+    assert (code, client.paths, dest.exists()) == (0, [], False)
     assert "필요 없다" in stdout
 
 
@@ -459,7 +510,7 @@ def test_snapshot_does_not_keep_a_copy_that_breaks_the_band_contract_and_still_e
     assert code == 0 and not dest.exists()
     assert f"::warning::band_guard: {pt.BAND_LATEST}: band 계약을 어겼다" in stdout
     assert "계약을 어겨 사본을 남기지 않는다" in stdout
-    assert client.calls == [(pt.BAND_LATEST, True)]
+    assert client.paths == [pt.BAND_LATEST]
 
 
 def test_snapshot_warning_for_a_contract_violation_is_one_bounded_line(tmp_path, capsys):
@@ -476,7 +527,7 @@ def test_snapshot_warning_for_a_contract_violation_is_one_bounded_line(tmp_path,
     assert len(commands) == 1 and commands[0].startswith("::warning::band_guard: ") and len(commands[0]) < 500
 
 
-def test_snapshot_still_writes_when_the_existence_check_fails_and_says_so(tmp_path, capsys):
+def test_snapshot_still_writes_when_the_copy_lookup_fails_and_says_so(tmp_path, capsys):
     # Arrange
     client = FakeClient({pt.BAND_LATEST: band(), PROD_COPY_PATH: cc.SourceError(f"{PROD_COPY_PATH}: TimeoutError")})
     dest = tmp_path / "prod_latest.json"
