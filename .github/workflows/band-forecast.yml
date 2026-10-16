@@ -9,6 +9,9 @@ name: Band Forecast → HF
 #               운영 band 는 latest 하나만 덮어써서 이력이 없다. 그래서 같은 발행 잡이 그 시점의 운영 latest 사본도
 #               `prod/` 아래에 남긴다(같은 issue 의 사본이 이미 있으면 남기지 않는다). 같은 STAMP 끼리
 #               `scripts/ml/compare_candidate.py --product band` 로 비교한다.
+#               사본은 이 후보 발행 잡에서만 남기고(운영 모드는 남기지 않는다), 짝은 보통 한 주기 늦게 생긴다. 후보 run 이
+#               도는 시점의 운영 latest 는 그 run 의 예보 발행을 아직 반영하지 않았을 수 있고, 다음 예보 발행의 후보 run 이
+#               그 사이의 운영 latest 를 잡아야 짝이 만들어진다. 운영이 그 주기에 돌지 않으면 그 STAMP 는 UNPAIRED 로 남는다.
 #   production  `aq-data/forecast-band/latest.json` 을 덮어쓴다.
 # 컷오버 = 아래 env 의 이 줄 하나를 바꾸는 PR(main 에 머지된 값만 쓰인다). dispatch 입력으로 받지 않는다. 경로 매핑은
 # `scripts/ml/publish_targets.py` 가 한 곳에서 정한다.
@@ -40,7 +43,9 @@ name: Band Forecast → HF
 # · 경로 플래그를 전부 명시한다 — 빠진 플래그의 기본 경로에 기대지 않는다. `--issues-limit` 은 쓰지 않는다.
 #
 # wheel 은 버전 + sha256 핀으로 받는다. 배포 = 아래 두 핀을 바꾸는 PR(ml-predict.yml 과 같은 wheel 이라 함께 고친다).
-# 스텝별 소요 시간은 run 요약에 남는다 — 컷오버 조건은 hosted 합계 35분 미만이 3회 이상이다.
+# wheel 핀을 올릴 때 함께 점검한다: ml-predict.yml 과 이 파일의 핀, 아래 `BAND_SKIPPED_BASE_DEPS`, `test_ml_workflow_safety.py` 의
+# `PIP_EXPECTED_MISSING`, `test_check_band_env.py` 의 VERSION, band 고정본(`constraints-band.txt` 와 lock 두 개).
+# 컷오버 조건의 시간 기준: infer 잡 시간(run 의 잡 기록)이 35분 미만인 run 이 3회 이상이다.
 # 가드: `scripts/ml/test_ml_workflow_safety.py`.
 
 on:
@@ -115,10 +120,8 @@ jobs:
             echo "STAGE=$RUNNER_TEMP/stage"
             echo "CACHE_DIR=$RUNNER_TEMP/work/cache"
             echo "OUT_DIR=$RUNNER_TEMP/work/out"
-            echo "TIMINGS=$RUNNER_TEMP/timings.tsv"
           } >> "$GITHUB_ENV"
           mkdir -p "$RUNNER_TEMP/work/cache" "$RUNNER_TEMP/work/out" "$RUNNER_TEMP/stage"
-          : > "$RUNNER_TEMP/timings.tsv"
 
       # 읽기 전용 토큰과 저장소 id 는 이 스텝에만 있다. 토큰은 같은 origin(허브 안) 리다이렉트에만 따라가고 CDN 에는 가지 않는다.
       - name: Fetch inference wheel (pinned, sha256 verified)
@@ -131,7 +134,6 @@ jobs:
           set -euo pipefail
           python3 scripts/ml/fetch_inference_wheel.py \
             --version "$INFERENCE_VERSION" --sha256 "$INFERENCE_WHEEL_SHA256" --dest "$WHEEL_DIR"
-          printf '%s\t%s\n' 'wheel fetch' "$SECONDS" >> "$TIMINGS"
 
       # CPU torch 만 PyTorch CPU 인덱스에서 받는다. `--index-url` 은 이 스텝에만 있다(다른 설치는 PyPI).
       - name: Install CPU torch (hash-locked)
@@ -143,7 +145,6 @@ jobs:
           python3 -m venv "$VENV"
           "$VENV/bin/python" -m pip install --no-cache-dir --require-hashes --no-deps --only-binary :all: \
             --index-url https://download.pytorch.org/whl/cpu -r scripts/ml/requirements-band-torch.lock.txt
-          printf '%s\t%s\n' 'install torch (cpu)' "$SECONDS" >> "$TIMINGS"
 
       - name: Install inference wheel (no deps)
         if: steps.guard.outputs.skip != 'true'
@@ -153,7 +154,6 @@ jobs:
         run: |
           set -euo pipefail
           "$VENV/bin/python" -m pip install --no-cache-dir --no-deps "$WHEEL"
-          printf '%s\t%s\n' 'install wheel' "$SECONDS" >> "$TIMINGS"
 
       - name: Install band dependencies (hash-locked)
         if: steps.guard.outputs.skip != 'true'
@@ -163,13 +163,15 @@ jobs:
           set -euo pipefail
           "$VENV/bin/python" -m pip install --no-cache-dir --require-hashes --no-deps --only-binary :all: \
             -r scripts/ml/requirements-band.lock.txt
-          printf '%s\t%s\n' 'install band deps' "$SECONDS" >> "$TIMINGS"
 
       # `pip check` 는 일부러 깔지 않은 기본 의존성 줄을 낸다. 통째로 무시하지 않고 허용 목록의 정확한 줄만 통과시킨다.
       # 같은 스텝에서 GPU 스택(nvidia-*, cuda-*, triton)이 없는지, torch 가 CPU 빌드인지(`torch.version.cuda` 가 None)
-      # 도 본다. 설치가 끝난 뒤, 추론을 돌리기 전이다.
+      # 도 본다. 설치가 끝난 뒤, 추론을 돌리기 전이다. `pip list` 는 끝에 pip 새 버전을 확인하러 PyPI 에 나가므로(`pip check` 는
+      # 아니다) 다른 pip 스텝처럼 그 확인을 끈다.
       - name: Verify installed environment (CPU only)
         if: steps.guard.outputs.skip != 'true'
+        env:
+          PIP_DISABLE_PIP_VERSION_CHECK: '1'
         run: |
           set -euo pipefail
           "$VENV/bin/python" -m pip list --format=freeze | tee "$WORK/pip-list.txt"
@@ -179,7 +181,6 @@ jobs:
           python3 scripts/ml/check_band_env.py \
             --pip-check "$WORK/pip-check.txt" --pip-list "$WORK/pip-list.txt" --torch-cuda "$TORCH_CUDA" \
             --project airlens-inference --version "$INFERENCE_VERSION" --allow-missing "$BAND_SKIPPED_BASE_DEPS"
-          printf '%s\t%s\n' 'verify env' "$SECONDS" >> "$TIMINGS"
 
       # 신선 관측 시계열을 만든다(공개 HF 의 OpenAQ 슬롯). 경로 플래그를 전부 명시한다.
       - name: Build fresh OpenAQ series
@@ -189,7 +190,6 @@ jobs:
           cd "$WORK"
           "$VENV/bin/python" -I -u "$GITHUB_WORKSPACE/scripts/ml/run_entry.py" \
             airlens-band-fresh-openaq --cache-dir "$CACHE_DIR" --out-dir "$OUT_DIR"
-          printf '%s\t%s\n' 'fresh openaq' "$SECONDS" >> "$TIMINGS"
 
       # TimesFM 밴드 엔진 + conformal. 가장 오래 걸리는 스텝이다(모델 가중치는 공개 HF 에서 토큰 없이 받는다).
       # `--issues-limit` 은 스모크 전용이라 쓰지 않는다.
@@ -202,7 +202,6 @@ jobs:
             airlens-band-engine \
             --series-path "$OUT_DIR/fresh_openaq_series.parquet" --cities-path "$OUT_DIR/fresh_openaq_cities.parquet" \
             --cache-dir "$CACHE_DIR" --out-dir "$OUT_DIR"
-          printf '%s\t%s\n' 'band engine' "$SECONDS" >> "$TIMINGS"
 
       # 발행 페이로드(w3-band-v1)를 STAGE 에 바로 쓴다. 보정 리포트는 --out-dir 에 있어서 따로 넘기지 않는다.
       - name: Assemble band payload
@@ -214,26 +213,6 @@ jobs:
             airlens-band-publish \
             --band-predictions-path "$OUT_DIR/band_predictions.parquet" --out "$STAGE/forecast_band_latest.json"
           ls -l "$STAGE"
-          printf '%s\t%s\n' 'band payload' "$SECONDS" >> "$TIMINGS"
-
-      # 컷오버 조건(hosted 합계 35분 미만 3회 이상)을 보려고 run 마다 남긴다. 실패한 run 에서도 돈다.
-      - name: Step timings
-        if: always() && steps.guard.outputs.skip != 'true'
-        run: |
-          set -euo pipefail
-          if [ -z "${TIMINGS:-}" ] || [ ! -s "$TIMINGS" ]; then
-            echo "기록된 스텝 시간이 없다"
-            exit 0
-          fi
-          {
-            echo '### Step timings (band infer)'
-            echo
-            echo '| step | seconds |'
-            echo '|---|---|'
-            awk -F'\t' '{ printf "| %s | %d |\n", $1, $2 }' "$TIMINGS"
-            echo
-            awk -F'\t' '{ total += $2 } END { printf "recorded steps: %d s (%.1f min) — cutover criterion: hosted total under 35 min, 3 or more times\n", total, total / 60 }' "$TIMINGS"
-          } | tee -a "$GITHUB_STEP_SUMMARY"
 
       # 발행 잡으로 넘기는 것은 JSON 산출물뿐이다 (wheel·venv·캐시·로그는 올리지 않는다).
       - name: Upload JSON outputs

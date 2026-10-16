@@ -1106,11 +1106,10 @@ def test_band_guard_step_comes_first_and_every_later_infer_step_follows_its_deci
     before, after = infer[:at], infer[at + 1:]
     conditions = {step_name(s, at + 1 + i): str(s.get("if", "")) for i, s in enumerate(after)}
 
-    # Act / Assert — guard 앞에는 코드를 돌리는 스텝이 없다(체크아웃과 파이썬 설치뿐). 뒤의 모든 스텝이 skip 출력을 따른다.
-    # 타이밍 요약만 실패한 run 에서도 돌지만 건너뛴 run 에서는 돌지 않는다.
+    # Act / Assert — guard 앞에는 코드를 돌리는 스텝이 없다(체크아웃과 파이썬 설치뿐). 뒤의 모든 스텝이 skip 출력 하나만 따른다
+    # (`always()` 같은 우회 조건이 없어서 건너뛴 run 에서는 어떤 스텝도 돌지 않는다).
     assert [str(s["uses"]).split("@")[0] for s in before] == ["actions/checkout", "actions/setup-python"]
-    assert after and all(cond in (BAND_GUARD_SKIP, f"always() && {BAND_GUARD_SKIP}") for cond in conditions.values()), conditions
-    assert [name for name, cond in conditions.items() if cond.startswith("always()")] == ["Step timings"]
+    assert after and all(cond == BAND_GUARD_SKIP for cond in conditions.values()), conditions
 
 
 def test_band_guard_step_reads_public_data_only_and_passes_mode_and_force_to_the_script(band):
@@ -1228,6 +1227,42 @@ def test_band_environment_is_verified_after_the_last_install_and_before_inferenc
     assert '--torch-cuda "$TORCH_CUDA"' in judge
 
 
+# `python -m pip …` · `pip …` · `…/bin/pip …`. `pip-list.txt` 같은 파일 이름이나 `pipx` 는 아니다.
+PIP_CALL = re.compile(r"(?:-m\s+pip3?|(?:^|[\s/\"'])pip3?)(?=$|[\s\"'])")
+BAND_PIP_STEPS = {"Install CPU torch (hash-locked)", "Install inference wheel (no deps)", "Install band dependencies (hash-locked)",
+                  BAND_VERIFY_STEP, "Install pinned huggingface_hub (hash-locked)"}
+
+
+@pytest.mark.parametrize(
+    "line, calls_pip",
+    [
+        ('"$VENV/bin/python" -m pip list --format=freeze | tee "$WORK/pip-list.txt"', True),
+        ('"$VENV/bin/python" -m pip check > "$WORK/pip-check.txt" 2>&1 || true', True),
+        ("python3 -m pip check", True),
+        ('"$VENV/bin/pip" install -r requirements.txt', True),
+        ("pip3 install --no-deps wheel.whl", True),
+        ('cat "$WORK/pip-check.txt"', False),
+        ('tee "$WORK/pip-list.txt"', False),
+        ("python3 -m pipx run tool", False),
+        ("echo pipeline", False),
+    ],
+)
+def test_the_pip_call_pattern_matches_pip_commands_and_not_file_names(line, calls_pip):
+    # Act / Assert
+    assert bool(PIP_CALL.search(line)) is calls_pip
+
+
+def test_band_every_step_that_calls_pip_turns_off_its_version_check(band):
+    # Arrange
+    callers = {step_name(s, i): s for _j, i, s in all_steps(band) if any(PIP_CALL.search(line) for line in logical_lines(s.get("run", "")))}
+
+    # Act / Assert — `pip list` 같은 명령은 끝에 pip 새 버전을 확인하러 PyPI 에 나간다. pip 를 부르는 스텝(설치 3 · 환경 검사 ·
+    # 발행기 의존성)은 모두 그 확인을 끈다. 아는 스텝을 찾지 못하면 이 시험은 아무것도 보지 않은 것이다.
+    assert BAND_PIP_STEPS <= set(callers), set(callers)
+    for name, step in callers.items():
+        assert str((step.get("env") or {}).get("PIP_DISABLE_PIP_VERSION_CHECK")) == "1", name
+
+
 def test_band_commands_run_through_run_entry_in_the_venv_in_isolated_unbuffered_mode(band):
     # Arrange
     found = _band_commands(band)
@@ -1268,10 +1303,9 @@ def test_band_prepare_step_defines_every_work_folder_under_the_runner_temp_direc
     # 엔진·페이로드 스텝이 mkdir 없이 쓰는 폴더는 미리 만들어져 있다
     assert proc.returncode == 0, proc.stderr
     defined = dict(line.split("=", 1) for line in github_env.read_text(encoding="utf-8").splitlines())
-    assert set(defined) == {"WORK", "VENV", "WHEEL_DIR", "STAGE", "CACHE_DIR", "OUT_DIR", "TIMINGS"}
+    assert set(defined) == {"WORK", "VENV", "WHEEL_DIR", "STAGE", "CACHE_DIR", "OUT_DIR"}
     assert all(Path(value).is_relative_to(runner) for value in defined.values()), defined
     assert all(Path(defined[key]).is_dir() for key in ("WORK", "STAGE", "CACHE_DIR", "OUT_DIR"))
-    assert Path(defined["TIMINGS"]).is_file() and Path(defined["TIMINGS"]).stat().st_size == 0
     assert Path(defined["STAGE"]) == runner / "stage"  # 업로드 스텝의 path(`runner.temp`/stage)와 같은 폴더
 
 
@@ -1419,43 +1453,6 @@ def test_band_workflow_arguments_are_accepted_by_the_scripts_they_call(band, mon
     assert (env_check.project, env_check.version) == ("airlens-inference", band["env"]["INFERENCE_VERSION"])
     assert env_check.allow_missing == band["env"]["BAND_SKIPPED_BASE_DEPS"]
     assert check_band_env.parse_allow_missing(env_check.allow_missing)  # 비거나 빈 항목이 아니다
-
-
-@pytest.mark.skipif(shutil.which("awk") is None, reason="awk 가 없다")
-def test_band_step_timings_summarize_the_recorded_steps_in_the_run_summary(tmp_path, band):
-    # Arrange
-    timings, summary = tmp_path / "timings.tsv", tmp_path / "summary.md"
-    timings.write_text("wheel fetch\t12\nband engine\t1800\n", encoding="utf-8")
-
-    # Act
-    proc = run_step(tmp_path, band, "Step timings", {"TIMINGS": str(timings), "GITHUB_STEP_SUMMARY": str(summary)})
-
-    # Assert — 컷오버 조건(hosted 합계 35분 미만 3회 이상)을 run 요약에서 바로 읽는다
-    text = summary.read_text(encoding="utf-8")
-    assert proc.returncode == 0, proc.stderr
-    table = [line for line in text.splitlines() if line.startswith("|")]
-    assert table == ["| step | seconds |", "|---|---|", "| wheel fetch | 12 |", "| band engine | 1800 |"]  # 머리글·구분선이 없으면 표로 그려지지 않는다
-    assert "recorded steps: 1812 s (30.2 min)" in text and "35 min" in text
-
-
-@pytest.mark.skipif(shutil.which("awk") is None, reason="awk 가 없다")
-@pytest.mark.parametrize("records", ["unset", "missing-file", "empty-file"])
-def test_band_step_timings_without_records_exit_zero_and_write_no_summary(tmp_path, band, records):
-    # Arrange — guard 가 실패했거나 첫 스텝에서 죽어 기록이 없는 run: 요약 스텝이 run 을 더 망가뜨리지 않는다
-    summary, timings = tmp_path / "summary.md", tmp_path / "timings.tsv"
-    env = {"GITHUB_STEP_SUMMARY": str(summary)}
-    if records != "unset":
-        env["TIMINGS"] = str(timings)
-    if records == "empty-file":
-        timings.write_text("", encoding="utf-8")
-
-    # Act
-    proc = run_step(tmp_path, band, "Step timings", env)
-
-    # Assert
-    assert proc.returncode == 0, proc.stderr
-    assert "기록된 스텝 시간이 없다" in proc.stdout
-    assert not summary.exists()
 
 
 # ── D. 환경 고정 파일 ────────────────────────────────────────────────────────
