@@ -140,6 +140,15 @@ jobs:
             "$MODEL_GTWR_SHA256" "aod_pm25_${MODEL_VERSION}.gtwr.npz" \
             "$MODEL_METADATA_SHA256" "aod_pm25_${MODEL_VERSION}.metadata.json" \
             | sha256sum -c --strict -
+          # 폴더에는 조달기가 받는 일반 파일 네 개만 있어야 한다(`.sha256` 은 조달기가 함께 받는 매니페스트). 리더가 이
+          # 폴더에서 무엇을 여는지와 무관하게 핀 밖 파일을 막고, 검증한 바이트는 뒤 스텝이 덮어쓰지 못하게 한다.
+          expected="./aod_pm25_${MODEL_VERSION}.gtwr.npz ./aod_pm25_${MODEL_VERSION}.metadata.json ./aod_pm25_${MODEL_VERSION}.pkl ./aod_pm25_${MODEL_VERSION}.sha256"
+          if [ -n "$(find . -mindepth 1 ! -type f -print -quit)" ] \
+            || [ "$(find . -mindepth 1 -type f | LC_ALL=C sort | paste -sd ' ' -)" != "$expected" ]; then
+            echo "::error::가중치 폴더에 핀 밖 항목이 있다"
+            exit 1
+          fi
+          chmod -R a-w .
 
       # 관측 read 는 공개 GET(토큰 불요)이다. OpenAQ 슬롯 신선도 게이트(4h)에 걸리면 predict 가 fail-loud 로
       # non-zero 종료한다(무음 실패 없음). `--dqss` 는 같은 프로세스에서 data_quality.json 과 shadow_stations.json
