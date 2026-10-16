@@ -101,6 +101,7 @@ WORST_ROWS = 10
 STAMP_RE = re.compile(r"\d{10}")
 FETCH_TIMEOUT_S = 60
 FETCH_RETRIES = 3
+MAX_RESPONSE_BYTES = 32 * 1024 * 1024  # 응답 한 건의 상한. 읽는 파일은 모두 1 MB 아래라 넉넉하고, 끝없이 보내는 응답에도 메모리가 차지 않는다
 
 PASS, FAIL, INPUT_DIFF, UNPAIRED = "PASS", "FAIL", "INPUT-DIFF", "UNPAIRED"
 
@@ -620,11 +621,18 @@ class HttpSource:
         return urllib.request.urlopen(req, timeout=FETCH_TIMEOUT_S)  # noqa: S310 — 고정 https 호스트
 
     def _get(self, url: str, what: str):
-        """(본문 bytes, Link 헤더). 404 는 (None, '')."""
+        """(본문 bytes, Link 헤더). 404 는 (None, ''). 본문이 MAX_RESPONSE_BYTES 를 넘으면 SourceError(재시도하지 않는다)."""
         for attempt in range(1, FETCH_RETRIES + 1):
             try:
                 with self._open(url) as resp:
-                    return resp.read(), resp.headers.get("Link") or ""
+                    body = resp.read(MAX_RESPONSE_BYTES + 1)  # 상한보다 한 바이트 더 읽어 넘었는지만 본다
+                    if len(body) > MAX_RESPONSE_BYTES:
+                        raise SourceError(f"{what}: 응답 크기 상한 초과")
+                    declared = resp.headers.get("Content-Length") or ""
+                    if declared.isdecimal() and len(body) < int(declared):
+                        # 크기를 주고 읽으면 Content-Length 보다 짧게 끊겨도 예외가 없다(그냥 읽을 때는 IncompleteRead) — 같은 재시도로 보낸다
+                        raise http.client.IncompleteRead(body, int(declared) - len(body))
+                    return body, resp.headers.get("Link") or ""
             except urllib.error.HTTPError as exc:
                 if exc.code == 404:
                     return None, ""

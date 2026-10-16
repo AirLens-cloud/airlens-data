@@ -778,15 +778,17 @@ def test_run_without_any_candidate_is_insufficient_not_a_pass():
 
 # ── 입력 원천: 공개 저장소 (가짜 응답) ───────────────────────────────────────
 class FakeResponse:
-    def __init__(self, body: bytes, link: str = "", read_error: BaseException | None = None) -> None:
+    def __init__(self, body: bytes, link: str = "", read_error: BaseException | None = None, content_length: int | None = None) -> None:
         self._body = body
         self._read_error = read_error  # 연결은 됐는데 본문을 읽다 끊기는 경우
         self.headers = {"Link": link} if link else {}
+        if content_length is not None:
+            self.headers["Content-Length"] = str(content_length)  # 본문보다 크게 주면 "Content-Length 만큼 오기 전에 끊긴" 응답
 
-    def read(self) -> bytes:
+    def read(self, amt: int | None = None) -> bytes:
         if self._read_error is not None:
             raise self._read_error
-        return self._body
+        return self._body if amt is None else self._body[:amt]  # 실제 응답처럼 요청한 크기까지만 준다
 
     def __enter__(self) -> "FakeResponse":
         return self
@@ -946,6 +948,96 @@ def test_http_persistent_body_read_failure_ends_as_source_error_with_class_name_
         source.read_json("dir/a.json")
     assert str(exc.value) == f"dir/a.json: {type(error).__name__}"
     assert len(calls) == cc.FETCH_RETRIES
+
+
+class EndlessResponse(FakeResponse):
+    """끝없이 본문을 보내는 서버. 크기를 정해 읽지 않으면 시험이 실패한다(크기 없는 read() 는 메모리를 채운다)."""
+
+    def __init__(self) -> None:
+        super().__init__(b"")
+
+    def read(self, amt: int | None = None) -> bytes:
+        if amt is None:
+            raise AssertionError("응답을 크기 제한 없이 읽었다")
+        return b"x" * amt
+
+
+@pytest.mark.parametrize("read", [
+    lambda source: source.read_json("dir/big.json"),
+    lambda source: source.read_bytes("dir/big.json"),
+    lambda source: source.list_stamps("dir", "grid"),
+], ids=["read_json", "read_bytes", "list_stamps"])
+def test_http_response_that_never_ends_is_cut_at_the_size_limit_with_a_source_error_and_no_retry(monkeypatch, read):
+    # Arrange — 상한을 작게 줄여 시험한다. 끝없는 응답에서 크기 없이 읽으면 EndlessResponse 가 시험을 실패시킨다
+    monkeypatch.setattr(cc, "MAX_RESPONSE_BYTES", 16)
+    source, calls, sleeps = scripted_source(monkeypatch, {"big.json": [EndlessResponse()], "dir": [EndlessResponse()]})
+
+    # Act
+    with pytest.raises(cc.SourceError) as exc:
+        read(source)
+
+    # Assert — 경로와 "상한 초과" 만 싣는다(본문 조각 없음). 다시 받아도 같아서 재시도하지 않는다
+    assert str(exc.value) in {"dir/big.json: 응답 크기 상한 초과", "dir 목록: 응답 크기 상한 초과"}
+    assert "xxxx" not in str(exc.value)
+    assert len(calls) == 1 and sleeps == []
+
+
+@pytest.mark.parametrize(("size", "accepted"), [(15, True), (16, True), (17, False)], ids=["below", "at-the-limit", "one-byte-over"])
+def test_http_response_size_limit_is_inclusive(monkeypatch, size, accepted):
+    # Arrange — 상한과 같은 크기는 받고, 한 바이트라도 넘으면 받지 않는다(상한까지만 읽고 잘린 본문을 통과시키지 않는다)
+    monkeypatch.setattr(cc, "MAX_RESPONSE_BYTES", 16)
+    source, _, _ = scripted_source(monkeypatch, {"a.json": [FakeResponse(b"x" * size)]})
+
+    # Act / Assert
+    if accepted:
+        assert source.read_bytes("dir/a.json") == b"x" * size
+    else:
+        with pytest.raises(cc.SourceError, match="상한 초과"):
+            source.read_bytes("dir/a.json")
+
+
+def test_http_response_size_limit_is_far_above_the_files_that_are_read_and_still_bounded():
+    # Assert — 읽는 파일은 모두 1 MB 아래다(품질 파일이 0.4 MB 안팎, 목록 페이지는 수십 KB). 너무 작으면 정상 응답이 막히고,
+    # 너무 크면 상한이 메모리를 지키지 못한다
+    assert 4 * 1024 * 1024 <= cc.MAX_RESPONSE_BYTES <= 64 * 1024 * 1024
+
+
+def test_http_body_shorter_than_its_content_length_is_retried_then_succeeds(monkeypatch):
+    # Arrange — 크기를 주고 읽으면 연결이 끊겨 Content-Length 보다 짧게 와도 http.client 는 예외 없이 짧은 본문을 준다(실측).
+    # 그대로 두면 잘린 본문이 재시도 없이 "JSON 아님" 으로 끝난다
+    cut = FakeResponse(b'{"x"', content_length=10)
+    source, calls, sleeps = scripted_source(monkeypatch, {"a.json": [cut, FakeResponse(b'{"x": 1}', content_length=8)]})
+
+    # Act
+    payload = source.read_json("dir/a.json")
+
+    # Assert
+    assert payload == {"x": 1}
+    assert len(calls) == 2 and sleeps == [2.0]
+
+
+def test_http_persistent_short_body_ends_as_source_error_with_class_name_only(monkeypatch):
+    # Arrange
+    source, calls, _ = scripted_source(monkeypatch, {"a.json": [FakeResponse(b"{", content_length=10)]})
+
+    # Act / Assert
+    with pytest.raises(cc.SourceError) as exc:
+        source.read_bytes("dir/a.json")
+    assert str(exc.value) == "dir/a.json: IncompleteRead"
+    assert len(calls) == cc.FETCH_RETRIES
+
+
+@pytest.mark.parametrize("content_length", [None, 8, "not-a-number", ""], ids=["absent", "exact", "garbage", "empty"])
+def test_http_body_that_matches_or_does_not_declare_its_length_is_accepted(monkeypatch, content_length):
+    # Arrange — 길이를 알 수 없거나(없음·깨진 값) 정확히 맞으면 그대로 받는다
+    response = FakeResponse(b'{"x": 1}', content_length=8 if content_length == 8 else None)
+    if isinstance(content_length, str):
+        response.headers["Content-Length"] = content_length
+    source, calls, _ = scripted_source(monkeypatch, {"a.json": [response]})
+
+    # Act / Assert
+    assert source.read_json("dir/a.json") == {"x": 1}
+    assert len(calls) == 1
 
 
 def tree_entry(rel: str, kind: str = "file") -> dict:
