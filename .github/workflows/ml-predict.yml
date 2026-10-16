@@ -247,6 +247,10 @@ jobs:
     needs: infer
     if: github.repository == 'AirLens-cloud/airlens-data' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
+    # HF 쓰기 토큰은 environment `hf-write` 의 secret 이다(보호 조건은 README 「Secrets」)
+    environment:
+      name: hf-write
+      deployment: false
     timeout-minutes: 10
     permissions:
       contents: read

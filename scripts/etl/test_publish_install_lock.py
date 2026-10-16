@@ -1,4 +1,4 @@
-"""HF 쓰기 토큰이 있는 잡은 `pip install` 을 해시 고정본으로만 한다 (AAA, YAML 파싱 — 네트워크 0).
+"""HF 쓰기 토큰이 있는 잡은 `pip install` 을 해시 고정본으로만 하고 `hf-write` environment 를 선언한다 (AAA, YAML 파싱 — 네트워크 0).
 
 **왜 이 파일이 있나.** 이 레포는 공개고, `HF_TOKEN`(HF 쓰기 토큰)을 받는 잡이 여럿이다. 그런 잡이
 `pip install "huggingface_hub>=0.34,<2"` 처럼 범위로 깔면 cron 이 돌 때마다 그 시점 PyPI 의 최신 릴리스와
@@ -17,7 +17,15 @@
   4. 설치·`pip check` 의 실패를 가리지 않는다(그 줄에 `||`·`|`, 그 스텝에 `continue-on-error`),
   5. 발행기(`hf_publish.py` 등)를 돌면 고정본 설치가 있고 그 고정본에 huggingface-hub 가 들어 있으며,
   6. 해시 고정본(requirements-publish.lock.txt)은 만들어진 CPython 3.11 로 깐다(앞선 setup-python 이 3.11),
-  7. pip 밖 설치기(pipx·uv·poetry·conda·mamba·npx·`curl|sh`)로 받지 않는다.
+  7. pip 밖 설치기(pipx·uv·poetry·conda·mamba·npx·`curl|sh`)로 받지 않는다,
+  8. `environment` 가 정확히 `{name: hf-write, deployment: false}` 다(문자열 `hf-write`·다른 이름·식·`deployment` 가 없거나
+     false 가 아닌 것·다른 키는 모두 위반).
+쓰기 토큰은 레포 secret 이 아니라 environment `hf-write` 의 secret 이다. 레포 secret 은 브랜치와 상관없이 잡에 전달되므로, 막히는 것은
+그 environment 에 배포 브랜치 규칙(main 하나)이 있고 레포 secret 에 `HF_TOKEN` 이 없을 때뿐이다 — 그때만 다른 브랜치에서 고쳐 돌린 워크플로가
+쓰기 토큰을 받지 못한다. 이 시험은 잡의 선언만 본다(아래 한계). 선언한 이름의 environment 가 없으면 GitHub 가 규칙 없는 것을 새로 만들고,
+문자열 형태는 실행마다 배포 기록을 남긴다(`deployment: false` 가 끈다).
+8번의 짝: environment `hf-write` 를 쓰는 잡은 모두 토큰 잡이다 — environment 에 든 잡은 그 secret 에 닿을 수 있는 자리라, 토큰 없는 잡이
+들어오면 노출면이 조용히 넓어진다(문자열·매핑 형태 모두 보고, 이름의 대소문자는 가리지 않는다).
 토큰 범위는 `secrets.NAME`·`secrets['NAME']`(이름은 대소문자 무시)·`toJSON(secrets)`·`secrets: inherit` 로 읽는다.
 재사용 워크플로(`uses:`)로 토큰을 넘기는 잡은 안쪽을 못 보므로 그것만으로 위반이다.
 토큰이 없는 잡은 이 규칙 밖이다 — ml-predict 의 infer 잡이 받아 둔 wheel 을 `--no-deps` 로 까는 것처럼(그쪽은
@@ -26,6 +34,11 @@ sha256 핀으로 따로 검증한다).
 한계: 워크플로 `run` 스크립트 안의 설치만 본다. 스크립트 파일(`bash scripts/x.sh`)이나 액션(`uses:` 스텝, 합성 액션)
 안에서 하는 설치, 위 목록 밖 설치기, 동적 색인(`secrets[format(...)]`)은 못 본다(지금은 그런 곳이 없다 — 생기면 이
 시험도 그쪽을 읽게 넓힌다). `.github/workflows` 의 `.yml`·`.yaml` 만 읽고, 다른 이름의 파일이 생기면 시험이 실패한다.
+environment 는 잡에 선언돼 있는지만 본다 — 배포 브랜치 규칙과 environment secret 등록은 GitHub 설정이라 못 본다(README 「Secrets」).
+워크플로 수준 `env` 의 토큰은 모든 잡을 토큰 잡으로 보고 각 잡의 선언을 요구한다. 다만 environment secret 은 잡 단위라 워크플로 env 에
+두지 않는다(지금 그런 파일은 없다).
+`deployment` 는 철자 `false` 만 쓴다. PyYAML(YAML 1.1)은 `no`·`off` 도 false 로 읽지만 GitHub 는 다르게 읽을 수 있다.
+토큰 없는 잡의 environment 이름이 식(`${{ }}`)이면 `hf-write` 를 가리켜도 못 본다.
 """
 from __future__ import annotations
 
@@ -41,6 +54,9 @@ WORKFLOW_DIR = ROOT / ".github" / "workflows"
 ALL_WORKFLOWS = sorted([*WORKFLOW_DIR.glob("*.yml"), *WORKFLOW_DIR.glob("*.yaml")])
 
 WRITE_SECRET = "HF_TOKEN"
+# 쓰기 토큰이 든 environment — 워크플로에 적는 그대로의 YAML 한 곳에서 사전을 읽어 메시지와 판정이 어긋나지 않게 한다.
+WRITE_ENVIRONMENT_YAML = "{name: hf-write, deployment: false}"
+WRITE_ENVIRONMENT = yaml.safe_load(WRITE_ENVIRONMENT_YAML)
 PUBLISH_LOCK = "scripts/etl/requirements-publish.lock.txt"
 # 고정본 → 그 고정본을 만든 CPython. 새 고정본이 생기면 여기에 한 줄 더한다.
 LOCK_PYTHON = {PUBLISH_LOCK: "3.11"}
@@ -232,10 +248,38 @@ def job_violations(job_id: str, job: dict, root: Path) -> list[str]:
     return found
 
 
+def environment_violations(job_id: str, job: dict) -> list[str]:
+    """잡의 `environment` 가 정확히 `WRITE_ENVIRONMENT` 가 아니면 그 한 문장. `0 == False` 라 `deployment` 는 `is False` 로 따로 본다."""
+    environment = job.get("environment")
+    if environment == WRITE_ENVIRONMENT and environment["deployment"] is False:
+        return []
+    now = repr(environment) if "environment" in job else "없음"
+    return [f"{job_id}: environment 는 정확히 `{WRITE_ENVIRONMENT_YAML}` 여야 한다 — 지금: {now}"]
+
+
+def environment_name(job: dict) -> str | None:
+    """잡이 선언한 environment 이름 — 문자열 형태(`environment: x`)도 매핑 형태(`name: x`)도. 없거나 문자열이 아니면 None."""
+    environment = job.get("environment")
+    name = environment.get("name") if isinstance(environment, dict) else environment
+    return name if isinstance(name, str) else None
+
+
+def tokenless_environment_violations(doc: dict) -> list[str]:
+    """쓰기 토큰이 없는 잡이 `hf-write` 에 들어 있으면 그 잡마다 한 문장(8번의 짝). GitHub 는 이름의 대소문자를 가리지 않는다."""
+    holders = token_jobs(doc)
+    found: list[str] = []
+    for job_id, job in doc["jobs"].items():
+        name = environment_name(job)
+        if job_id not in holders and name is not None and name.lower() == WRITE_ENVIRONMENT["name"].lower():
+            found.append(f"{job_id}: 쓰기 토큰이 없는 잡이 environment `{name}` 에 들어 있다 — 이 environment 는 토큰 잡만 쓴다")
+    return found
+
+
 def violations(doc: dict, root: Path = ROOT) -> list[str]:
     """토큰이 있는 잡마다 규칙을 어긴 곳을 `잡 / 스텝: 이유` 문장으로 돌려준다. 비어 있으면 통과."""
     found: list[str] = []
     for job_id, job in token_jobs(doc).items():
+        found += environment_violations(job_id, job)
         if "uses" in job:
             found.append(f"{job_id}: 재사용 워크플로(`uses:`)로 토큰이 넘어가는 잡이라 안쪽 설치를 검사할 수 없다")
         else:
@@ -328,7 +372,7 @@ def test_jobs_with_the_write_token_install_only_the_hash_locked_file(path):
     # Act
     problems = violations(doc)
 
-    # Assert — 토큰이 없는 워크플로는 빈 목록으로 통과한다
+    # Assert — 토큰이 없는 워크플로는 빈 목록으로 통과한다. 설치 고정(1~7)과 environment 선언(8)을 함께 본다
     assert not problems, f"{path.name}:\n  " + "\n  ".join(problems)
 
 
@@ -348,6 +392,30 @@ def test_allowlisted_workflow_has_exactly_its_known_violations(name):
     if expected and not actual:
         report.append("위반이 하나도 없다(고쳐졌거나 토큰이 없어졌다) — UNPINNED_ALLOWLIST 에서 뺀다. 뺀 뒤엔 위 시험이 이 워크플로를 지킨다")
     assert not report, f"{name}:\n  " + "\n  ".join(report)
+
+
+@pytest.mark.parametrize("name", UNPINNED_ALLOWLIST)
+def test_allowlisted_workflow_still_declares_the_write_environment(name):
+    # Arrange
+    doc = load(WORKFLOW_DIR / name)
+
+    # Act
+    problems = [problem for job_id, job in token_jobs(doc).items() for problem in environment_violations(job_id, job)]
+
+    # Assert — 허용목록은 설치 고정의 위반만 봐준다. environment(8)는 예외 없이 지킨다(위 스냅샷에 그 문장을 적어도 여기서 걸린다)
+    assert not problems, f"{name}:\n  " + "\n  ".join(problems)
+
+
+@pytest.mark.parametrize("path", ALL_WORKFLOWS, ids=lambda p: p.name)
+def test_only_jobs_with_the_write_token_use_the_write_environment(path):
+    # Arrange
+    doc = load(path)
+
+    # Act
+    problems = tokenless_environment_violations(doc)
+
+    # Assert — 토큰 없는 잡(ml-predict·band-forecast 의 infer 등)은 environment 밖이다. 허용목록 워크플로도 예외 없다
+    assert not problems, f"{path.name}:\n  " + "\n  ".join(problems)
 
 
 def test_ml_predict_keeps_the_token_out_of_the_infer_job_whose_local_wheel_install_is_not_hash_locked():
@@ -371,6 +439,7 @@ PREP = [CHECKOUT, SETUP_PYTHON]
 LOCKED = f"python3 -m pip install --no-cache-dir --require-hashes --no-deps --only-binary :all: -r {PUBLISH_LOCK}"
 PIP_CHECK = "python3 -m pip check"
 PUBLISH_STEP = {"run": "python3 scripts/etl/hf_publish.py upload --src a.json --dest b.json"}
+OMIT = object()  # job_doc(environment=OMIT) — 잡에 environment 키를 아예 쓰지 않는다
 
 
 def run(script: str) -> dict:
@@ -382,10 +451,13 @@ def checked(script: str) -> dict:
     return run(f"{script}\n{PIP_CHECK}")
 
 
-def job_doc(*steps: dict, token: str = "job", expr: str = TOKEN) -> dict:
-    """토큰이 있는 잡 하나짜리 워크플로 — `token` 은 어디에 둘지(workflow · job · step · with), `expr` 는 어떻게 쓸지."""
+def job_doc(*steps: dict, token: str = "job", expr: str = TOKEN, environment: object = WRITE_ENVIRONMENT) -> dict:
+    """토큰이 있는 잡 하나짜리 워크플로 — `token` 은 어디에 둘지(workflow · job · step · with), `expr` 는 어떻게 쓸지,
+    `environment` 는 잡이 선언한 값(기본은 맞는 선언, `OMIT` 이면 키가 없다)."""
     publish = dict(PUBLISH_STEP)
     job: dict = {"steps": [*steps, publish]}
+    if environment is not OMIT:
+        job["environment"] = environment
     doc: dict = {"jobs": {"publish": job}}
     if token == "workflow":
         doc["env"] = {WRITE_SECRET: expr}
@@ -409,7 +481,7 @@ def root(tmp_path: Path) -> Path:
 
 def test_the_checker_accepts_a_locked_install_followed_by_pip_check(root):
     # Arrange — 한 줄이든 `\` 이음줄이든, 같은 스크립트 안이든 다음 스텝이든, `pip check` 의 어느 호출 형태든,
-    # 파이썬 버전이 3.11 계열이든, apt 설치가 곁들여졌든
+    # 파이썬 버전이 3.11 계열이든, apt 설치가 곁들여졌든, environment 의 키 순서가 다르든(그 선언은 job_doc 이 기본으로 넣는다)
     split_install = LOCKED.replace(" --no-deps", " \\\n  --no-deps")
     docs = [
         job_doc(*PREP, run(f"{LOCKED}\n{PIP_CHECK}")),
@@ -423,6 +495,7 @@ def test_the_checker_accepts_a_locked_install_followed_by_pip_check(root):
         job_doc(CHECKOUT, {**SETUP_PYTHON, "with": {"python-version": "3.11.9"}}, checked(LOCKED)),
         job_doc(CHECKOUT, {**SETUP_PYTHON, "with": {"python-version": 3.11}}, checked(LOCKED)),
         job_doc(CHECKOUT, {**SETUP_PYTHON, "with": {"python-version": "3.12"}}, SETUP_PYTHON, checked(LOCKED)),
+        job_doc(*PREP, checked(LOCKED), environment={"deployment": False, "name": "hf-write"}),
     ]
 
     # Act
@@ -493,6 +566,81 @@ def test_the_checker_flags_each_deviation_for_the_right_reason(root, steps, expe
 
     # Assert
     assert any(expected in problem for problem in problems), problems
+
+
+# 사례 이름 → (잡이 선언한 environment, 문장의 `지금:` 뒤에 그대로 나와야 할 현재 값). 설치 쪽은 다 맞아서 이 선언 하나만 틀리다.
+ENVIRONMENT_DEVIATIONS = {
+    "missing": (OMIT, "없음"),
+    "empty-value": (None, "None"),
+    "string-form": ("hf-write", "'hf-write'"),  # 이름은 맞아도 실행마다 배포 기록이 생긴다
+    "other-name": ({"name": "production", "deployment": False}, "{'name': 'production', 'deployment': False}"),
+    "expression-name": (
+        {"name": "${{ vars.HF_ENVIRONMENT }}", "deployment": False},
+        "{'name': '${{ vars.HF_ENVIRONMENT }}', 'deployment': False}",
+    ),
+    "deployment-missing": ({"name": "hf-write"}, "{'name': 'hf-write'}"),
+    "deployment-true": ({"name": "hf-write", "deployment": True}, "{'name': 'hf-write', 'deployment': True}"),
+    "deployment-string-false": ({"name": "hf-write", "deployment": "false"}, "{'name': 'hf-write', 'deployment': 'false'}"),
+    "deployment-zero": ({"name": "hf-write", "deployment": 0}, "{'name': 'hf-write', 'deployment': 0}"),  # 0 == False 라 `==` 만으로는 통과한다
+    "extra-key": (
+        {"name": "hf-write", "deployment": False, "url": "https://example.invalid"},
+        "{'name': 'hf-write', 'deployment': False, 'url': 'https://example.invalid'}",
+    ),
+}
+
+
+@pytest.mark.parametrize(("environment", "now"), ENVIRONMENT_DEVIATIONS.values(), ids=list(ENVIRONMENT_DEVIATIONS))
+def test_the_checker_flags_each_environment_deviation_for_the_right_reason(root, environment, now):
+    # Arrange
+    doc = job_doc(*PREP, checked(LOCKED), environment=environment)
+
+    # Act
+    problems = violations(doc, root)
+
+    # Assert — 그 선언 하나만, 문장 전체가 맞게(지금 값을 그대로 보여 주며) 잡힌다
+    assert problems == [f"publish: environment 는 정확히 `{{name: hf-write, deployment: false}}` 여야 한다 — 지금: {now}"]
+
+
+# 사례 이름 → (토큰 없는 잡이 선언한 environment, 문장에 나와야 할 이름). 토큰 잡 publish 는 규칙대로라 걸리지 않는다.
+STRAY_ENVIRONMENTS = {
+    "mapping": ({"name": "hf-write", "deployment": False}, "hf-write"),
+    "string-form": ("hf-write", "hf-write"),
+    "name-only-mapping": ({"name": "hf-write"}, "hf-write"),
+    "other-case": ({"name": "HF-Write", "deployment": False}, "HF-Write"),  # GitHub 는 environment 이름의 대소문자를 가리지 않는다
+}
+
+
+@pytest.mark.parametrize(("environment", "shown"), STRAY_ENVIRONMENTS.values(), ids=list(STRAY_ENVIRONMENTS))
+def test_a_job_without_the_write_token_in_the_write_environment_is_a_violation(environment, shown):
+    # Arrange — publish 는 토큰도 environment 도 규칙대로, infer 는 토큰 없이 environment 만 선언한다
+    doc = job_doc(*PREP, checked(LOCKED))
+    doc["jobs"]["infer"] = {"environment": environment, "steps": [CHECKOUT, run("echo hi")]}
+
+    # Act
+    problems = tokenless_environment_violations(doc)
+
+    # Assert
+    assert problems == [f"infer: 쓰기 토큰이 없는 잡이 environment `{shown}` 에 들어 있다 — 이 environment 는 토큰 잡만 쓴다"]
+
+
+@pytest.mark.parametrize(
+    "environment",
+    [OMIT, "production", {"name": "production", "deployment": False}],
+    ids=["none", "other-string", "other-mapping"],
+)
+def test_a_job_without_the_write_token_outside_the_write_environment_is_not_flagged(environment):
+    # Arrange
+    infer: dict = {"steps": [CHECKOUT, run("echo hi")]}
+    if environment is not OMIT:
+        infer["environment"] = environment
+    doc = job_doc(*PREP, checked(LOCKED))
+    doc["jobs"]["infer"] = infer
+
+    # Act
+    problems = tokenless_environment_violations(doc)
+
+    # Assert
+    assert problems == []
 
 
 TOKEN_FORMS = {

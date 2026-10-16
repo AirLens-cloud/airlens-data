@@ -27,6 +27,10 @@ jobs:
     # fork PR 은 schedule/dispatch 를 트리거 못하지만, 베이스 repo 한정 명시(방어).
     if: github.repository == 'AirLens-cloud/airlens-data'
     runs-on: ubuntu-latest
+    # HF 쓰기 토큰은 environment `hf-write` 의 secret 이다(보호 조건은 README 「Secrets」)
+    environment:
+      name: hf-write
+      deployment: false
     timeout-minutes: 10
     env:
       HF_TOKEN: ${{ secrets.HF_TOKEN }}

@@ -30,6 +30,10 @@ jobs:
     # (아래 setup-python 필요).
     # 2026-10-10 public 전환 → hosted 복귀 (public repo 의 hosted 분은 무료, self-hosted 러너는 fork 노출 위험).
     runs-on: ubuntu-latest
+    # HF 쓰기 토큰은 environment `hf-write` 의 secret 이다(보호 조건은 README 「Secrets」)
+    environment:
+      name: hf-write
+      deployment: false
     timeout-minutes: 10
     env:
       HF_TOKEN: ${{ secrets.HF_TOKEN }}
