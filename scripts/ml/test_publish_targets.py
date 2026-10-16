@@ -8,6 +8,7 @@ from __future__ import annotations
 import importlib.util
 import json
 import re
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -151,17 +152,43 @@ def test_parse_utc_maps_every_notation_of_one_instant_to_the_same_value(value):
 
 @pytest.mark.parametrize(
     "value",
-    ["", "   ", "not-a-time", "2026-13-01T00:00:00Z", "2026-10-15T25:00:00Z", "0001-01-01T00:00:00+14:00", None, 1, 1.5, ["2026-10-15T06:15:42Z"], {}],
+    ["", "   ", "not-a-time", "2026-13-01T00:00:00Z", "2026-10-15T25:00:00Z", "0001-01-01T00:00:00+14:00", None, 1, 1.5, ["2026-10-15T06:15:42Z"], {},
+     20261015, ISSUE_UTC],
 )
 def test_parse_utc_rejects_anything_that_is_not_an_iso_time_string_with_value_error(value):
-    # Act / Assert — 범위 밖 시각(UTC 로 바꾸면 0000년)도 OverflowError 가 아니라 ValueError 다: 호출부가 한 종류만 잡는다
+    # Act / Assert — 범위 밖 시각(UTC 로 바꾸면 0000년)도 OverflowError 가 아니라 ValueError 다: 호출부가 한 종류만 잡는다.
+    # 정수 20261015 와 datetime 은 str() 로 바꾸면 읽히는 값이다 — 문자열이 아니면 읽히는 값이어도 거부한다
     with pytest.raises(ValueError):
         pt.parse_utc(value)
 
 
-def test_parse_utc_error_message_shows_a_bounded_repr_of_the_value():
-    # Arrange — 줄바꿈이 섞인 값이 그대로 로그에 나가면 워크플로 명령(`::...`)을 흉내 낼 수 있다
-    hostile = "x\n::error::injected" + "y" * 500
+@pytest.mark.skipif(not hasattr(time, "tzset"), reason="time.tzset 이 없다")
+@pytest.mark.parametrize("zone", ["UTC0", "KST-9", "PST8PDT"])
+def test_parse_utc_reads_a_time_without_an_offset_as_utc_whatever_the_machines_time_zone(monkeypatch, zone):
+    # Arrange — 오프셋 없는 시각을 이 기계의 현지 시각으로 읽으면 UTC 러너에서만 우연히 맞는다
+    monkeypatch.setenv("TZ", zone)
+    time.tzset()
+    try:
+        # Act
+        parsed = pt.parse_utc("2026-10-15T06:15:42")
+        stamp = pt.utc_stamp("2026-10-15T06:15:42")
+    finally:
+        monkeypatch.undo()
+        time.tzset()
+
+    # Assert
+    assert parsed == ISSUE_UTC
+    assert stamp == "2026101506"
+
+
+@pytest.mark.parametrize(
+    "hostile",
+    ["x\n::error::injected" + "y" * 500, "\n" * 500, ["\n::error::injected" + "y" * 500]],
+    ids=["not-a-time-string", "blank-string", "not-a-string"],
+)
+def test_parse_utc_error_message_shows_a_bounded_repr_of_the_value(hostile):
+    # Arrange — 줄바꿈이 섞인 값이 그대로 로그에 나가면 워크플로 명령(`::...`)을 흉내 낼 수 있다. 오류 문구가 두 갈래(시각이 아닌 문자열 /
+    # 문자열이 아니거나 빈 값)라 둘 다 본다
 
     # Act
     with pytest.raises(ValueError) as caught:

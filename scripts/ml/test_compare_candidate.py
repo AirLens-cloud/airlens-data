@@ -12,6 +12,7 @@ import io
 import json
 import re
 import ssl
+import time
 import urllib.error
 from pathlib import Path
 
@@ -837,6 +838,16 @@ def test_http_read_json_with_invalid_json_raises_source_error(monkeypatch):
         source.read_json("dir/bad.json")
 
 
+@pytest.mark.parametrize("body", [b"\x80abc", b'{"a": "\xff"}'], ids=["bare-byte", "bad-byte-inside-a-string"])
+def test_http_read_json_with_a_body_that_is_not_utf8_raises_source_error(monkeypatch, body):
+    # Arrange — json.loads 는 바이트 전체를 먼저 디코딩한다. UnicodeDecodeError 가 traceback 으로 새면 band_guard 의 "조회 못 하면 경고하고 돌린다" 가 깨진다
+    source, _, _ = scripted_source(monkeypatch, {"bad.json": [FakeResponse(body)]})
+
+    # Act / Assert
+    with pytest.raises(cc.SourceError, match="JSON 아님"):
+        source.read_json("dir/bad.json")
+
+
 @pytest.mark.parametrize("body", [b"[]", b'"text"', b"1", b"null"])
 def test_http_read_json_with_non_object_json_raises_source_error(monkeypatch, body):
     # Arrange
@@ -1039,6 +1050,27 @@ def test_http_source_never_sends_credentials(monkeypatch):
 
     # Assert
     assert seen and all({name.lower() for name in headers} == {"user-agent"} for headers in seen)
+
+
+def test_http_requests_share_one_timeout_that_is_not_shorter_than_band_guard_used_to_wait(monkeypatch):
+    # Arrange — band_guard 가 이 클래스로 조회한다. 타임아웃이 짧으면 느린 날의 조회 실패가 판정 "돌린다" 로 샌다(예전 band_guard 값은 30초)
+    seen: list[float] = []
+
+    def fake_urlopen(req, timeout):
+        seen.append(timeout)
+        return FakeResponse(b"{}")
+
+    monkeypatch.setattr(cc.urllib.request, "urlopen", fake_urlopen)
+    source = cc.HttpSource()
+
+    # Act
+    source.read_json("dir/a.json")
+    source.read_bytes("dir/a.json")
+    source.exists("dir/a.json")
+
+    # Assert
+    assert seen == [cc.FETCH_TIMEOUT_S] * 3
+    assert cc.FETCH_TIMEOUT_S >= 30
 
 
 # ── main(): --local 종단 ─────────────────────────────────────────────────────
@@ -1732,7 +1764,7 @@ def test_input_diff_pair_below_the_overlap_standard_says_so():
     assert check(result, "도시 겹침").detail == "50.0% — 95.0% 미만"
 
 
-def test_input_diff_pair_with_contract_violation_is_a_fail():
+def test_band_input_diff_pair_with_contract_violation_is_a_fail():
     # Arrange
     def broken(payload: dict) -> str | None:
         return "p10: 숫자 아님" if payload.get("model") == "other model" else None
@@ -1769,7 +1801,7 @@ def test_missing_band_file_on_either_side_is_unpaired(prod, cand, side):
 @pytest.mark.parametrize(
     "value",
     ["2026-10-15T06:00:00Z", "2026-10-15T06:00:00+00:00", "2026-10-15T15:00:00+09:00", "2026-10-15T06:00:00", " 2026-10-15T06:00:00Z ",
-     "", "  ", "not-a-time", "2026-13-01T00:00:00Z", None, 1, ["2026-10-15T06:00:00Z"], "0001-01-01T00:00:00+14:00"],
+     "", "  ", "not-a-time", "2026-13-01T00:00:00Z", None, 1, ["2026-10-15T06:00:00Z"], "0001-01-01T00:00:00+14:00", 20261015],
 )
 def test_instant_agrees_with_the_shared_parser_in_publish_targets(value):
     # Arrange — 이 스크립트는 단독 실행이라 파서를 한 벌 더 둔다. 같은 입력에서 같은 시각이거나, 함께 실패해야 한다(None ↔ ValueError)
@@ -1780,6 +1812,23 @@ def test_instant_agrees_with_the_shared_parser_in_publish_targets(value):
 
     # Act / Assert
     assert cc._instant(value) == shared
+
+
+@pytest.mark.skipif(not hasattr(time, "tzset"), reason="time.tzset 이 없다")
+@pytest.mark.parametrize("zone", ["UTC0", "KST-9", "PST8PDT"])
+def test_instant_reads_a_time_without_an_offset_as_utc_whatever_the_machines_time_zone(monkeypatch, zone):
+    # Arrange — 오프셋 없는 시각을 이 기계의 현지 시각으로 읽으면 UTC 러너에서만 우연히 맞는다
+    monkeypatch.setenv("TZ", zone)
+    time.tzset()
+    try:
+        # Act
+        parsed = cc._instant("2026-10-15T06:00:00")
+    finally:
+        monkeypatch.undo()
+        time.tzset()
+
+    # Assert
+    assert parsed == pt.parse_utc("2026-10-15T06:00:00Z")
 
 
 # ── band: 요약·짝짓기·종단 ───────────────────────────────────────────────────
