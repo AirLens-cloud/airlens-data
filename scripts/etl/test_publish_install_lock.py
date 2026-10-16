@@ -52,6 +52,8 @@ PIP_INSTALL_RE = re.compile(r"\bpip3?\b[^;&|]*?\binstall\b")
 PIP_USE_RE = re.compile(r"\bpip3?\b[^;&|]*?\b(?:install|check)\b")
 PIP_CHECK_RE = re.compile(r"^(?:python[0-9.]*\s+-m\s+)?pip3?\s+check\b")
 LOCK_ARG_RE = re.compile(r"\s-r\s+(scripts/\S+\.lock\.txt)\s*$")
+NOT_LOCK = "끝이 `-r scripts/….lock.txt` 가 아니다(따옴표·리다이렉트·주석 없이 마지막 인자여야 한다)"
+EXTRA_ARGS_RE = re.compile(r"고정본 밖 인자 \[.*\]$")
 # pip 밖에서 패키지·스크립트를 받는 도구. apt 는 여기 없다(고정은 별개 문제).
 OTHER_INSTALLER_RE = re.compile(
     r"\b(?:pipx|poetry|conda|(?:micro)?mamba|npx)\b"
@@ -176,7 +178,7 @@ def install_problems(command: str, root: Path = ROOT) -> tuple[list[str], str | 
         problems.append(f"고정본 밖 인자 {options.split()}")  # 직접 이름 설치·`--index-url` 같은 것
     lock = arg.group(1) if arg else None
     if lock is None:
-        problems.append("끝이 `-r scripts/….lock.txt` 가 아니다(따옴표·리다이렉트·주석 없이 마지막 인자여야 한다)")
+        problems.append(NOT_LOCK)
     elif not (root / lock).is_file():
         problems.append(f"{lock} 이 없다")
         lock = None
@@ -251,19 +253,20 @@ HASH_LOCKED_WORKFLOWS = (
 # 자기 고정본이 아직 없는 워크플로: 발행기용 고정본 하나로는 모자라는 의존성이 더 있다(pandas·cdsapi·pyarrow·
 # jsonschema·pdfplumber 등). 값은 지금 이 워크플로가 가진 위반 문장 전부다 — 새 위반이 생기면(고친다), 위반이 줄거나
 # 사라지면(목록을 줄이거나 이 워크플로를 뺀다) 시험이 실패해 알려 준다. 각자 고정본을 만드는 후속 변경이 뺀다.
+# `고정본 밖 인자 […]` 의 인자 목록은 비교하지 않는다 — 버전 핀을 올리는 일상 갱신이 여기 걸리지 않게(새 설치 스텝·새 위반
+# 종류는 그대로 잡힌다).
 _CONTRACTS = "publish-contracts / Install dependencies"
 _MAC_DEPS = "collect-and-build / Install Python deps (versions pinned to match models/uv.lock's ubuntu-x86_64/py3.11 resolution)"
 _MAC_HUB = "collect-and-build / Install huggingface_hub"
 _POLICY = "collect-policies / Install dependencies"
-_NOT_LOCK = "끝이 `-r scripts/….lock.txt` 가 아니다(따옴표·리다이렉트·주석 없이 마지막 인자여야 한다)"
 UNPINNED_ALLOWLIST: dict[str, list[str]] = {
     "contracts-publish.yml": [
         f"{_CONTRACTS}: --no-cache-dir 없음",
         f"{_CONTRACTS}: --require-hashes 없음",
         f"{_CONTRACTS}: --no-deps 없음",
         f"{_CONTRACTS}: --only-binary :all: 없음",
-        f"{_CONTRACTS}: 고정본 밖 인자 ['--quiet', '-r', 'requirements.txt']",
-        f"{_CONTRACTS}: {_NOT_LOCK}",
+        f"{_CONTRACTS}: 고정본 밖 인자 […]",
+        f"{_CONTRACTS}: {NOT_LOCK}",
         f"{_CONTRACTS}: 뒤에 `pip check` 가 없다",
         "publish-contracts: 발행기를 돌리는데 고정본 설치가 없다",
     ],
@@ -272,15 +275,15 @@ UNPINNED_ALLOWLIST: dict[str, list[str]] = {
         f"{_MAC_DEPS}: --require-hashes 없음",
         f"{_MAC_DEPS}: --no-deps 없음",
         f"{_MAC_DEPS}: --only-binary :all: 없음",
-        f"{_MAC_DEPS}: 고정본 밖 인자 ['cdsapi==0.7.7', 'pandas==3.0.2', 'pyarrow==23.0.1']",
-        f"{_MAC_DEPS}: {_NOT_LOCK}",
+        f"{_MAC_DEPS}: 고정본 밖 인자 […]",
+        f"{_MAC_DEPS}: {NOT_LOCK}",
         f"{_MAC_DEPS}: 뒤에 `pip check` 가 없다",
         f"{_MAC_HUB}: --no-cache-dir 없음",
         f"{_MAC_HUB}: --require-hashes 없음",
         f"{_MAC_HUB}: --no-deps 없음",
         f"{_MAC_HUB}: --only-binary :all: 없음",
-        f"{_MAC_HUB}: 고정본 밖 인자 ['\"huggingface_hub>=0.34,<2\"']",
-        f"{_MAC_HUB}: {_NOT_LOCK}",
+        f"{_MAC_HUB}: 고정본 밖 인자 […]",
+        f"{_MAC_HUB}: {NOT_LOCK}",
         f"{_MAC_HUB}: 뒤에 `pip check` 가 없다",
         "collect-and-build: 발행기를 돌리는데 고정본 설치가 없다",
     ],
@@ -289,8 +292,8 @@ UNPINNED_ALLOWLIST: dict[str, list[str]] = {
         f"{_POLICY}: --require-hashes 없음",
         f"{_POLICY}: --no-deps 없음",
         f"{_POLICY}: --only-binary :all: 없음",
-        f"{_POLICY}: 고정본 밖 인자 ['--quiet', 'requests', 'pyarrow', 'pdfplumber', '\"huggingface_hub>=0.34,<2\"']",
-        f"{_POLICY}: {_NOT_LOCK}",
+        f"{_POLICY}: 고정본 밖 인자 […]",
+        f"{_POLICY}: {NOT_LOCK}",
         f"{_POLICY}: 뒤에 `pip check` 가 없다",
         "collect-policies: 발행기를 돌리는데 고정본 설치가 없다",
     ],
@@ -337,7 +340,7 @@ def test_allowlisted_workflow_has_exactly_its_known_violations(name):
     expected = UNPINNED_ALLOWLIST[name]
 
     # Act
-    actual = violations(load(path))
+    actual = [EXTRA_ARGS_RE.sub("고정본 밖 인자 […]", v) for v in violations(load(path))]
     new, gone = Counter(actual) - Counter(expected), Counter(expected) - Counter(actual)
 
     # Assert — 허용목록은 지금 있는 위반만 봐준다. 새 위반은 고치고, 사라진 위반은 목록에서 지운다
