@@ -1,0 +1,52 @@
+[Unit]
+Description=AirLens forecast-collect dispatch (E2 timer → GitHub workflow_dispatch)
+Documentation=https://github.com/AirLens-cloud/airlens-data
+After=network-online.target
+Wants=network-online.target
+# Starts only count toward StartLimitBurst when they fall inside StartLimitIntervalSec.
+# The default window is 10 s, shorter than RestartSec, so two starts 90 s apart would
+# never count together and a failing dispatch (an expired token, say) would be retried
+# every 90 s forever. With a 10 min window the second failure ends the retries.
+StartLimitIntervalSec=10min
+StartLimitBurst=2
+
+[Service]
+Type=oneshot
+# A dynamic user of its own instead of the VM's ubuntu account. While the script runs, the token sits in this unit's
+# credential directory, which only the unit's UID (and root) can read. Under ubuntu the hourly collectors would
+# share that UID and could read it during the run. The script keeps no state: its only write is a mktemp file
+# in the private /tmp.
+DynamicUser=yes
+ExecStart=/usr/local/bin/dispatch-forecast-collect.sh
+
+# Secrets as files, never as literals (systemd LoadCredential pattern).
+# One file holding the token alone. It must be a fine-grained personal access
+# token limited to the airlens-data repository, with Actions read & write and
+# Metadata read, and an expiry of one year at most. A broader token would let
+# this VM touch every repository the owner can.
+LoadCredential=gh_dispatch_pat:/etc/airlens/gh_dispatch_pat
+
+# 1GB box: keep any OOM inside this unit's cgroup (sshd must survive).
+# Far below the collectors' 400M — this job is one curl call.
+MemoryAccounting=yes
+MemoryHigh=40M
+MemoryMax=50M
+
+# One retry absorbs a transient blip. If it fails again the workflow's own
+# schedule is the backup (late, but it still runs).
+Restart=on-failure
+RestartSec=90s
+# The longest run is four requests (dispatch, workflow state, enable, dispatch), each cut off
+# by the script after 30 s, so the unit must not stop it before 4 x 30 s.
+TimeoutStartSec=3min
+
+# bash and curl hold the token in memory: a crash must not leave a core file with it.
+LimitCORE=0
+
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes

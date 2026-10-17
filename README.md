@@ -34,7 +34,7 @@ HF 초기 시드(hf-live-seed)는 모노레포 정적 데이터 의존이라 이
 | [`DATA_SOURCES.md`](DATA_SOURCES.md) | 외부 데이터 출처·라이선스·표기 |
 | [`contracts/README.md`](contracts/README.md) | 발행물 계약(스키마) 색인, `validate.py` 사용법, DQSS 정의 |
 | [`contracts/EVIDENCE_CONTRACT.md`](contracts/EVIDENCE_CONTRACT.md) | 사용자에게 보이는 값이 지켜야 할 증거 규칙 |
-| [`e2-sidecar/README.md`](e2-sidecar/README.md) | E2 사이드카(OpenAQ·Sensor.Community 시간별 수집, 채팅 로그 pull) |
+| [`e2-sidecar/README.md`](e2-sidecar/README.md) | E2 사이드카(OpenAQ·Sensor.Community 시간별 수집, 채팅 로그 pull, 예보 수집 정시 dispatch) |
 | [`scripts/etl/collect_policies/SOURCES.md`](scripts/etl/collect_policies/SOURCES.md) | 정책 레지스트리 수집원 |
 
 ## Secrets
