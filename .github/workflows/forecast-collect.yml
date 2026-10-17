@@ -10,11 +10,42 @@ name: Forecast Collection (Open-Meteo CAMS PM2.5)
 # Honest/Glass-box: CAMS is deterministic — the payload carries NO p10/p90 band.
 # The web renders a point forecast + "Open-Meteo CAMS" caveat, never a fabricated
 # uncertainty interval.
+#
+# ── 정시 수집과 중복 방지 ───────────────────────────────────────────────────────
+# 주 트리거는 E2 VM 의 systemd 타이머다. 6시간마다(UTC 00:50·06:50·12:50·18:50) `workflow_dispatch` API 로 이 워크플로를 시작시킨다
+# (`e2-sidecar/`). 아래 `schedule` 은 백업으로 남긴다. GitHub 스케줄은 몇 시간씩 늦게 오는데, 예보를 쓰는 band-forecast.yml 은 이
+# 워크플로가 성공한 뒤 `workflow_run` 으로 돌아서 수집이 늦으면 밴드도 같이 늦기 때문이다.
+#
+# 정시 dispatch 와 늦게 도착한 schedule 이 같은 예보를 두 번 수집하지 않도록 첫 잡 `guard` 가 건너뛸지 정한다
+# (`scripts/etl/forecast_slot_guard.py`, 공개 URL 만 읽는다).
+#   · 기준은 6시간 칸이다. 공개 `aq-data/forecast.json` 의 `generated_at` 이 지금과 같은 칸(UTC 00/06/12/18 시 경계)이고 그 칸의 forecast archive 도
+#     있으면 건너뛴다.
+#     "마지막 수집 뒤 N시간" 으로 정하지 않은 이유: 그 기준은 그 칸에 수집이 없어도 늦은 백업 run 직후의 다음 정시 dispatch 를 막는다.
+#     칸 기준은 같은 칸에 이미 수집이 있을 때만 건너뛴다 — 정시 dispatch 가 건너뛰는 때는 백업이 그 칸의 :50 전에 먼저 수집했고
+#     archive 까지 올라갔을 때뿐이다.
+#   · archive 까지 보는 이유: 수집 잡은 forecast.json 을 먼저 올리고 archive(`aq-data/forecast-archive/forecast_<STAMP>.json`)를 그다음에 올린다.
+#     archive 업로드가 실패한 run 은 실패로 끝나지만 forecast.json 의 시각은 이미 그 칸 안이라, 칸만 보면 늦게 오는 백업이 건너뛰어 그 칸의
+#     archive 가 영영 빠진다. 그래서 칸이 같을 때만 그 예보의 archive 를 HEAD 로 묻는다(STAMP 는 발행 시각의 UTC 시와 그다음 시).
+#     없으면 다시 수집해 메우고, 있는지 확인하지 못해도(오류·시간 초과) 수집한다. AIFS archive 는 보지 않는다 — AIFS 는 fail-soft 단계라
+#     산출물이 없어도 정상일 수 있어서, AIFS 업로드만 실패한 칸은 여전히 건너뛴다.
+#   · `force` 입력이 true 면 건너뛰지 않는다. 같은 칸을 수동으로 다시 수집할 때, 그리고 뒤 단계(guard 가 보지 않는 AIFS 업로드 포함)가 실패한
+#     칸을 메울 때 쓴다.
+#   · 판정을 못 하면(조회 실패·비정상 응답·읽을 수 없는 시각) 경고만 남기고 수집한다. 건너뛰기는 최적화일 뿐이라 수집을 놓치는 쪽이
+#     더 나쁘다. guard 잡 자체가 실패해도(체크아웃 오류, 스크립트 예외) 수집은 돈다(`collect-forecast` 의 `!cancelled()`). 그 run 은
+#     실패로 표시되고(`continue-on-error` 로 숨기지 않는다), band-forecast.yml 의 `workflow_run` 은 성공한 run 만 따르므로 그 run 뒤에는
+#     band 가 돌지 않고 band 자신의 schedule 백업을 기다린다.
+# 건너뛴 run 도 guard 잡이 성공해서 성공으로 끝나므로 band-forecast.yml 의 `workflow_run` 은 그 뒤에도 돈다. 거기서는 band 쪽 guard 가
+# 이미 처리한 예보 발행이면 건너뛴다.
 
 on:
   schedule:
     - cron: '15 */6 * * *'  # every 6h at :15 (forecast refresh; freshness window = 24h)
   workflow_dispatch:
+    inputs:
+      force:
+        description: '같은 6시간 칸에 이미 수집됐어도 다시 수집한다'
+        type: boolean
+        default: false
 
 concurrency:
   group: forecast-collect
@@ -24,8 +55,39 @@ permissions:
   contents: read
 
 jobs:
-  collect-forecast:
+  # 공개 URL 만 읽는다(토큰·시크릿·environment 없음). 같은 6시간 칸에 이미 수집됐고 그 칸의 archive 도 있으면 skip=true 를 낸다(머리 주석 「정시 수집과 중복 방지」).
+  guard:
+    name: Slot guard (public reads only)
     if: github.repository == 'AirLens-cloud/airlens-data'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    outputs:
+      skip: ${{ steps.guard.outputs.skip }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+
+      # setup-python 은 일부러 생략한다 — 가드는 표준 라이브러리만 쓰므로(의존성 0) 단계를 하나 덜어 단계·공급망 표면을 최소로 둔다.
+      # 대신 러너의 python3 에 기댄다. `generated_at` 끝의 `Z` 를 `datetime.fromisoformat` 이 읽으려면 3.11 이상이어야 한다(ubuntu-24.04 의
+      # python3 는 3.12). 3.10 이하가 되면 그 값을 못 읽어 판정 실패 경고와 함께 늘 수집한다(fail-open) — 수집은 돌고 중복 수집만 늘어난다.
+      - name: Skip if this 6-hour slot is already collected
+        id: guard
+        env:
+          FORCE: ${{ inputs.force || false }}
+        run: |
+          set -euo pipefail
+          python3 scripts/etl/forecast_slot_guard.py --force "$FORCE"
+
+  collect-forecast:
+    needs: guard
+    # guard 가 실패해도(체크아웃 오류, 스크립트 예외) 수집은 돈다 — 건너뛰기는 최적화일 뿐이다. 조건 끝의 `!cancelled()` 가 기본 조건
+    # (`success()`)을 대신한다: guard 의 결과를 묻지 않고, run 이 취소되면 돌지 않는다. guard 가 판정을 못 내면 skip 출력이 비어 있어
+    # `!= 'true'` 를 통과한다. 표현식을 `!` 로 시작하면 YAML 태그로 읽히므로 `!cancelled()` 는 끝에 둔다.
+    if: github.repository == 'AirLens-cloud/airlens-data' && needs.guard.outputs.skip != 'true' && !cancelled()
     # 2026-10-10 public 전환 → hosted 복귀 (public repo 의 hosted 분은 무료, self-hosted 러너는 fork 노출 위험).
     runs-on: ubuntu-latest
     # HF 쓰기 토큰은 environment `hf-write` 의 secret 이다(보호 조건은 README 「Secrets」)
@@ -220,6 +282,9 @@ jobs:
       # issuance alignment): forecast.json above is overwrite-only, so without a
       # dated copy no CAMS evaluation window can ever accumulate. ~4 files/day,
       # a few hundred KB each. Idempotent per issue hour (upload upsert).
+      #
+      # guard 잡의 forecast_slot_guard.py 가 이 파일 이름(STAMP 형식 포함)으로 그 칸의 archive 가 있는지 확인한다 — 이름을 바꾸면 같이 바꾼다
+      # (test_forecast_slot_guard.py 가 둘을 묶어 둔다).
       #
       # Retention: 파일명이 forecast_<STAMP>.json (STAMP=%Y%m%dT%H, 예: 20260903T14)
       # 이라 hf_publish.py 의 일반화된 TS_NAME_RE([-_](\d{10})\.json(\.gz)?$, W5

@@ -1,0 +1,21 @@
+[Unit]
+Description=AirLens forecast-collect dispatch timer (every 6 hours at :50 UTC)
+Documentation=https://github.com/AirLens-cloud/airlens-data
+
+[Timer]
+# 00:50 / 06:50 / 12:50 / 18:50 UTC. The "UTC" suffix pins the slots to the
+# workflow's 6-hour slots whatever timezone the VM runs in.
+# Why :50 — the hourly collectors own :05 / :15 / :35, so this call never lands
+# on their memory peaks. It also sits 50 minutes after the slot boundary the
+# workflow's guard uses, 35 minutes after the :15 scheduled backup of the same
+# slot, so the dispatch normally opens a new slot and a late backup for the same
+# slot is the one that gets skipped. (Only a backup that already collected in the
+# slot before :50 makes the dispatch skip.) A forecast issued at H:5x leaves the
+# band job about 25 minutes to wait for the next observation slot (H+1 :16-:19).
+OnCalendar=*-*-* 00/6:50:00 UTC
+RandomizedDelaySec=0
+AccuracySec=1min
+Persistent=true
+
+[Install]
+WantedBy=timers.target
