@@ -11,6 +11,8 @@ import summarize_predict_log as spl
 
 # predict 가 실제로 찍는 형태 (이모지 + 건수 + 대시 설명)
 REAL_LINE = "⚠️ met 실시간 조회 실패 7건 — 해당 지점 기상은 상수 fallback"
+# wheel 0.3.1 부터는 건수 뒤에 이번 실행의 원인별 수가 괄호로 붙는다
+REASONS_LINE = "⚠️ met 실시간 조회 실패 177건 (ReadTimeout 150, HTTP 503 27) — 해당 지점 기상은 상수 fallback"
 
 
 def test_met_failures_reads_the_count_from_the_real_log_line():
@@ -19,6 +21,14 @@ def test_met_failures_reads_the_count_from_the_real_log_line():
 
     # Act / Assert
     assert spl.met_failures(log) == 7
+
+
+def test_met_failures_reads_only_the_count_when_reasons_follow():
+    # Arrange — 괄호 안 원인별 수(150·503·27)는 건수가 아니다
+    log = "loading model\n" + REASONS_LINE + "\ndone 496 stations\n"
+
+    # Act / Assert
+    assert spl.met_failures(log) == 177
 
 
 def test_met_failures_is_zero_when_the_line_is_absent():
