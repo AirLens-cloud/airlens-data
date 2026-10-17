@@ -33,6 +33,25 @@ def test_pick_latest_cams_cycle_accepts_cycle_exactly_at_latency_boundary():
     assert (date_str, time_str) == ("2026-07-16", "00:00")
 
 
+def test_pick_latest_cams_cycle_skips_12z_before_its_2200z_guarantee():
+    # Arrange — 21:59Z: 오늘 12z 는 9h59m 전 → 스킵, 오늘 00z 로. 2026-10-16 21:27Z run 이
+    #   7h 기준으로 12z 를 골라 400 이 났던 구간이다.
+    now = datetime(2026, 10, 16, 21, 59, tzinfo=UTC)
+    # Act
+    date_str, time_str = m.pick_latest_cams_cycle(now)
+    # Assert
+    assert (date_str, time_str) == ("2026-10-16", "00:00")
+
+
+def test_pick_latest_cams_cycle_accepts_12z_at_2200z():
+    # Arrange — 22:00Z: 오늘 12z 는 정확히 10h 전 → 포함
+    now = datetime(2026, 10, 16, 22, 0, tzinfo=UTC)
+    # Act
+    date_str, time_str = m.pick_latest_cams_cycle(now)
+    # Assert
+    assert (date_str, time_str) == ("2026-10-16", "12:00")
+
+
 def test_two_requests_together_cover_every_declared_variable_exactly_once():
     """요청 분리(single/multi)가 변수를 흘리지도, 중복 요청하지도 않는지.
 
