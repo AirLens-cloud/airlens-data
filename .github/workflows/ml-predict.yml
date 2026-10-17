@@ -55,8 +55,8 @@ env:
   MODEL_PKL_SHA256: '4c59657841ce03e4eebb503c8dd87d9a9bc8c178057bb3e27bbd4e97ef4eca58'  # 위 버전 가중치 파일별 sha256 핀
   MODEL_GTWR_SHA256: '3578afb2f2ed0f436381dea7fcb06ae1625eefb105e3baa74b21a3cfd773ed82'
   MODEL_METADATA_SHA256: '1a0428b7b7d58d491a5bcdcfbdbae198ee8e6ce70557ae290b4d6a057a5cdc4b'
-  INFERENCE_VERSION: '0.3.1'  # wheel 버전 핀
-  INFERENCE_WHEEL_SHA256: '228a9864160a57d3ca1244e6ae9cc810b88b60d863df05ed8df909b6eabe17da'  # 위 버전 wheel 의 sha256 핀
+  INFERENCE_VERSION: '0.3.2'  # wheel 버전 핀
+  INFERENCE_WHEEL_SHA256: '5a42a6baab5b4ca40478517d13fdbe9ac78ff48fad3d151c3b24ddd3eb7a18bf'  # 위 버전 wheel 의 sha256 핀
 
 defaults:
   run:

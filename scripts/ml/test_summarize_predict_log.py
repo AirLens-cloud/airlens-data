@@ -13,6 +13,9 @@ import summarize_predict_log as spl
 REAL_LINE = "⚠️ met 실시간 조회 실패 7건 — 해당 지점 기상은 상수 fallback"
 # wheel 0.3.1 부터는 건수 뒤에 이번 실행의 원인별 수가 괄호로 붙는다
 REASONS_LINE = "⚠️ met 실시간 조회 실패 177건 (ReadTimeout 150, HTTP 503 27) — 해당 지점 기상은 상수 fallback"
+# wheel 0.3.2 부터는 지점별 조회 예산을 다 써서 묻지 않은 지점도 건수에 들고, 원인에 `시간 예산 초과 N` 으로 붙는다
+BUDGET_LINE = "⚠️ met 실시간 조회 실패 312건 (시간 예산 초과 192, ReadTimeout 120) — 해당 지점 기상은 상수 fallback"
+BUDGET_NOTE = "⏳ met 지점별 조회 예산 900초를 다 써서 남은 지점은 조회하지 않았다"
 
 
 def test_met_failures_reads_the_count_from_the_real_log_line():
@@ -29,6 +32,14 @@ def test_met_failures_reads_only_the_count_when_reasons_follow():
 
     # Act / Assert
     assert spl.met_failures(log) == 177
+
+
+def test_met_failures_counts_budget_skipped_stations_once():
+    # Arrange — 예산 초과분(192)은 건수(312)에 이미 들어 있다. 예산 안내 줄은 건수가 아니다
+    log = "loading model\n" + BUDGET_NOTE + "\n" + BUDGET_LINE + "\ndone 496 stations\n"
+
+    # Act / Assert
+    assert spl.met_failures(log) == 312
 
 
 def test_met_failures_is_zero_when_the_line_is_absent():
