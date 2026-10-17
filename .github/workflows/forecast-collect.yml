@@ -18,10 +18,18 @@ name: Forecast Collection (Open-Meteo CAMS PM2.5)
 #
 # 정시 dispatch 와 늦게 도착한 schedule 이 같은 예보를 두 번 수집하지 않도록 첫 잡 `guard` 가 건너뛸지 정한다
 # (`scripts/etl/forecast_slot_guard.py`, 공개 URL 만 읽는다).
-#   · 기준은 6시간 칸이다. 공개 `aq-data/forecast.json` 의 `generated_at` 이 지금과 같은 칸(UTC 00/06/12/18 시 경계)이면 건너뛴다.
+#   · 기준은 6시간 칸이다. 공개 `aq-data/forecast.json` 의 `generated_at` 이 지금과 같은 칸(UTC 00/06/12/18 시 경계)이고 그 칸의 forecast archive 도
+#     있으면 건너뛴다.
 #     "마지막 수집 뒤 N시간" 으로 정하지 않은 이유: 그 기준은 그 칸에 수집이 없어도 늦은 백업 run 직후의 다음 정시 dispatch 를 막는다.
-#     칸 기준은 같은 칸에 이미 수집이 있을 때만 건너뛴다 — 정시 dispatch 가 건너뛰는 때는 백업이 그 칸의 :50 전에 먼저 수집했을 때뿐이다.
-#   · `force` 입력이 true 면 건너뛰지 않는다(같은 칸을 수동으로 다시 수집할 때).
+#     칸 기준은 같은 칸에 이미 수집이 있을 때만 건너뛴다 — 정시 dispatch 가 건너뛰는 때는 백업이 그 칸의 :50 전에 먼저 수집했고
+#     archive 까지 올라갔을 때뿐이다.
+#   · archive 까지 보는 이유: 수집 잡은 forecast.json 을 먼저 올리고 archive(`aq-data/forecast-archive/forecast_<STAMP>.json`)를 그다음에 올린다.
+#     archive 업로드가 실패한 run 은 실패로 끝나지만 forecast.json 의 시각은 이미 그 칸 안이라, 칸만 보면 늦게 오는 백업이 건너뛰어 그 칸의
+#     archive 가 영영 빠진다. 그래서 칸이 같을 때만 그 예보의 archive 를 HEAD 로 묻는다(STAMP 는 발행 시각의 UTC 시와 그다음 시).
+#     없으면 다시 수집해 메우고, 있는지 확인하지 못해도(오류·시간 초과) 수집한다. AIFS archive 는 보지 않는다 — AIFS 는 fail-soft 단계라
+#     산출물이 없어도 정상일 수 있어서, AIFS 업로드만 실패한 칸은 여전히 건너뛴다.
+#   · `force` 입력이 true 면 건너뛰지 않는다. 같은 칸을 수동으로 다시 수집할 때, 그리고 뒤 단계(guard 가 보지 않는 AIFS 업로드 포함)가 실패한
+#     칸을 메울 때 쓴다.
 #   · 판정을 못 하면(조회 실패·비정상 응답·읽을 수 없는 시각) 경고만 남기고 수집한다. 건너뛰기는 최적화일 뿐이라 수집을 놓치는 쪽이
 #     더 나쁘다. guard 잡 자체가 실패해도(체크아웃 오류, 스크립트 예외) 수집은 돈다(`collect-forecast` 의 `!cancelled()`). 그 run 은
 #     실패로 표시되고(`continue-on-error` 로 숨기지 않는다), band-forecast.yml 의 `workflow_run` 은 성공한 run 만 따르므로 그 run 뒤에는
@@ -47,7 +55,7 @@ permissions:
   contents: read
 
 jobs:
-  # 공개 URL 만 읽는다(토큰·시크릿·environment 없음). 같은 6시간 칸에 이미 수집됐으면 skip=true 를 낸다(머리 주석 「정시 수집과 중복 방지」).
+  # 공개 URL 만 읽는다(토큰·시크릿·environment 없음). 같은 6시간 칸에 이미 수집됐고 그 칸의 archive 도 있으면 skip=true 를 낸다(머리 주석 「정시 수집과 중복 방지」).
   guard:
     name: Slot guard (public reads only)
     if: github.repository == 'AirLens-cloud/airlens-data'
@@ -274,6 +282,9 @@ jobs:
       # issuance alignment): forecast.json above is overwrite-only, so without a
       # dated copy no CAMS evaluation window can ever accumulate. ~4 files/day,
       # a few hundred KB each. Idempotent per issue hour (upload upsert).
+      #
+      # guard 잡의 forecast_slot_guard.py 가 이 파일 이름(STAMP 형식 포함)으로 그 칸의 archive 가 있는지 확인한다 — 이름을 바꾸면 같이 바꾼다
+      # (test_forecast_slot_guard.py 가 둘을 묶어 둔다).
       #
       # Retention: 파일명이 forecast_<STAMP>.json (STAMP=%Y%m%dT%H, 예: 20260903T14)
       # 이라 hf_publish.py 의 일반화된 TS_NAME_RE([-_](\d{10})\.json(\.gz)?$, W5

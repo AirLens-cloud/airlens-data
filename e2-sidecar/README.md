@@ -55,16 +55,24 @@ Tailscale 접속, 주소는 private 런북)의 systemd 타이머가 매시 HF da
   `schedule`은 백업으로 남겼다.
 - **중복 방지는 워크플로 쪽이다.** `forecast-collect.yml`의 첫 잡 `guard`
   (`scripts/etl/forecast_slot_guard.py`)가 같은 6시간 칸(UTC 00/06/12/18시 경계)에
-  이미 수집 결과가 있으면 건너뛴다. 정시 dispatch가 먼저 수집했으면 뒤늦게 온 백업이
-  건너뛰고, 판정을 못 하면 수집한다(fail-open). VM은 입력 없이 호출하므로 가드가
-  적용된다. 같은 칸을 일부러 다시 수집하려면 수동 실행에서 `force`를 켠다.
+  이미 수집 결과가 있으면 건너뛴다. 단, 그 칸의 forecast archive
+  (`aq-data/forecast-archive/forecast_<STAMP>.json`)도 있어야 건너뛴다. 수집 잡이
+  forecast.json을 먼저 올리고 archive를 그다음에 올려서, archive 업로드가 실패한 칸은
+  예보 시각만 보면 이미 수집된 것처럼 보이기 때문이다. archive가 없으면 뒤늦게 온
+  백업이 다시 수집해 그 칸을 메우고, 있는지 확인하지 못해도(오류·시간 초과) 수집한다.
+  정시 dispatch가 먼저 수집해 archive까지 올렸으면 뒤늦게 온 백업이 건너뛰고, 판정을
+  못 하면 수집한다(fail-open). AIFS archive는 보지 않으므로 AIFS 업로드만 실패한
+  칸은 여전히 건너뛴다. VM은 입력 없이 호출하므로 가드가 적용된다. 같은 칸을 일부러
+  다시 수집하거나, 뒤 단계(가드가 보지 않는 AIFS 업로드 포함)가 실패한 칸을 메우려면
+  수동 실행에서 `force`를 켠다.
 - **왜 :50인가.** 시간별 수집기가 :05/:15/:35를 쓰니 겹치지 않는다. :50은 칸 경계
   50분 뒤이고 같은 칸의 :15 백업보다 35분 뒤다. 그 칸에 먼저 수집이 없으면 정시
   dispatch가 새 칸을 열고, 예보가 H:5x에 나오면 band가 다음 관측 슬롯
   (H+1시 16~19분)까지 약 25분만 기다린다. 백업(:15)이 그 칸의 :50 전에 먼저 수집하면
   (같은 칸 백업이 35분 미만 늦었거나, 앞 칸 백업이 5시간 45분~6시간 35분 늦어 이 칸
-  앞부분에 떨어진 경우) 정시 dispatch는 건너뛴다. 이미 수집된 칸이라 규칙상 맞지만
-  수집이 :50보다 이르니 band가 그만큼 더 기다린다(H+1시 마감 안).
+  앞부분에 떨어진 경우) 그 archive까지 올라갔다면 정시 dispatch는 건너뛴다. 이미
+  수집된 칸이라 규칙상 맞지만 수집이 :50보다 이르니 band가 그만큼 더 기다린다(H+1시
+  마감 안).
 - **이 타이머가 죽으면** 예보 수집은 `schedule`로만 돈다. 늦을 뿐 멈추지 않는다.
 - **실패 처리.** 토큰이 없거나 모양이 틀리면 curl을 부르기 전에 실패한다. dispatch가
   거절되면 상태 코드와 문구에 상관없이 워크플로의 `state`를 읽는다(GET) — 꺼진 워크플로에
@@ -132,7 +140,7 @@ ssh -i "$E2_SSH_KEY" "$E2_HOST" \
 # event 가 workflow_dispatch 인 run 의 createdAt 이 UTC 00:50·06:50·12:50·18:50 근처여야 한다.
 gh run list -R AirLens-cloud/airlens-data -w forecast-collect.yml --limit 8 \
   --json event,createdAt,status,conclusion --jq '.[] | [.event, .createdAt, .status, .conclusion] | @tsv'
-# guard 가 건너뛴 run 은 success 로 끝나지만 collect-forecast 잡이 skipped 로 보인다(같은 칸에 이미 수집됨).
+# guard 가 건너뛴 run 은 success 로 끝나지만 collect-forecast 잡이 skipped 로 보인다(같은 칸에 이미 수집됐고 그 archive 도 있음).
 # 예보가 실제로 갱신됐는지는 run 이 아니라 산출물로 본다: aq-data/forecast.json 의 generated_at.
 curl -sL https://huggingface.co/datasets/Robeedau/airlens-live/resolve/main/aq-data/forecast.json \
   | python3 -c 'import json,sys; print(json.load(sys.stdin)["generated_at"])'
