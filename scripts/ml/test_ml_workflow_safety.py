@@ -15,6 +15,7 @@
   E. 공개 위생 (로컬 경로·운영 환경 이름·내부 문서 번호·토큰 모양·IP 가 새 파일에 없고, 저장소 id 는 허용목록 안에 있다)
      + 그 검사기 자체의 시험
   F. 감시 워크플로 / keepalive
+  G. 후보 정리 워크플로 (수동 실행만·기본 dry-run, 접두는 publish_targets 가 내고, 모드 판독이 YAML 판독과 같다)
 """
 from __future__ import annotations
 
@@ -1699,6 +1700,7 @@ def public_files() -> list[Path]:
         WORKFLOW_DIR / "ml-predict.yml",
         WORKFLOW_DIR / BAND_WORKFLOW,
         WORKFLOW_DIR / "predictions-freshness-healthcheck.yml",
+        WORKFLOW_DIR / "candidate-prune.yml",
         ROOT / "scripts" / "etl" / "probe_predictions_freshness.py",
         ROOT / "scripts" / "etl" / "test_probe_predictions_freshness.py",
         PUBLISH_LOCK,
@@ -1724,7 +1726,7 @@ def test_the_hygiene_scan_covers_the_expected_files():
     names = {p.name for p in public_files()}
 
     # Act / Assert — 글롭이 비면 위 parametrize 가 무음 통과한다
-    assert {"ml-predict.yml", "predictions-freshness-healthcheck.yml", "probe_predictions_freshness.py",
+    assert {"ml-predict.yml", "predictions-freshness-healthcheck.yml", "candidate-prune.yml", "probe_predictions_freshness.py",
             "fetch_inference_wheel.py", "run_entry.py", "publish_targets.py", "compare_candidate.py",
             "summarize_predict_log.py", "constraints-predict.txt", "requirements-predict.lock.txt",
             "requirements-publish.lock.txt", "test_ml_workflow_safety.py",
@@ -1973,3 +1975,85 @@ def test_keepalive_enumerates_workflows_through_the_api_instead_of_a_hardcoded_l
     # Act / Assert — 새 워크플로를 추가해도 keepalive 를 고칠 필요가 없다(전체 목록을 API 로 순회하고 파일명을 적지 않는다)
     assert 'gh api --paginate "repos/${REPO}/actions/workflows"' in script
     assert not re.search(r"[A-Za-z0-9_-]+\.ya?ml\b", script)
+
+
+# ── G. 후보 정리 워크플로 ─────────────────────────────────────────────────────
+PRUNE_WORKFLOW = "candidate-prune.yml"
+
+
+@pytest.fixture(scope="module")
+def prune_workflow() -> dict:
+    return load(WORKFLOW_DIR / PRUNE_WORKFLOW)
+
+
+def test_candidate_prune_runs_only_by_hand_and_defaults_to_dry_run(prune_workflow):
+    # Arrange / Act
+    trig = triggers(prune_workflow)
+    inputs = trig["workflow_dispatch"]["inputs"]
+
+    # Assert — 스스로 돌지 않는다(스케줄·push·workflow_run 없음). 눌러도 먼저 목록만 본다
+    assert list(trig) == ["workflow_dispatch"]
+    assert (inputs["dry_run"]["type"], inputs["dry_run"]["default"]) == ("boolean", True)
+    assert (inputs["product"]["type"], inputs["product"]["options"]) == ("choice", list(publish_targets.PRODUCTS))
+    assert prune_workflow["permissions"] == {"contents": "read"}
+
+
+def _prune_step(doc: dict) -> tuple[dict, dict]:
+    (job,) = jobs(doc).values()
+    return job, next(s for s in steps(job) if s.get("name") == "Prune candidate files")
+
+
+def test_candidate_prune_takes_its_prefixes_only_from_publish_targets_and_empties_them(prune_workflow):
+    # Arrange
+    job, step = _prune_step(prune_workflow)
+
+    # Act
+    lines = logical_lines(step["run"])
+
+    # Assert — 접두를 손으로 적지 않는다. publish_targets 가 그 제품이 production 일 때만 내고, 빈 출력이면 멈춘다.
+    # 지우는 명령은 접두마다 `--keep-days 0`(지금보다 이른 타임스탬프 파일 전부) 한 줄뿐이다
+    assert job["if"] == REPO_GUARD
+    assert step["env"]["PRODUCT"] == "${{ inputs.product }}"
+    assert lines == [
+        "set -euo pipefail",
+        "DRY_RUN_FLAG=--dry-run",
+        'if [ "$PRUNE_LIVE" = yes ]; then DRY_RUN_FLAG=""; fi',
+        'echo "product=$PRODUCT dry_run=${DRY_RUN_FLAG:-off}"',
+        'OUT=$(python3 scripts/ml/publish_targets.py candidates --product "$PRODUCT")',
+        '[ -n "$OUT" ] || { echo "::error::후보 접두가 없다"; exit 1; }',
+        "while read -r prefix; do",
+        'python3 scripts/etl/hf_publish.py prune --prefix "$prefix" --keep-days 0 ${DRY_RUN_FLAG:+"$DRY_RUN_FLAG"}',
+        'done <<< "$OUT"',
+    ]
+
+
+def test_candidate_prune_deletes_only_when_dry_run_is_exactly_false_and_keeps_the_token_in_that_step(prune_workflow):
+    # Arrange
+    job, step = _prune_step(prune_workflow)
+    checkout = next(s for s in steps(job) if str(s.get("uses", "")).startswith("actions/checkout"))
+
+    # Act
+    holders = [step_name(s, i) for i, s in enumerate(steps(job)) if secrets_in(s)]
+
+    # Assert — 입력값이 어긋나면(문자열·빈 값) 지우지 않는 쪽으로 넘어진다. 쓰기 토큰은 정리 스텝에만 있고 checkout 은
+    # 자격증명을 남기지 않는다
+    assert step["env"]["PRUNE_LIVE"] == "${{ inputs.dry_run == false && 'yes' || 'no' }}"
+    assert holders == ["Prune candidate files"]
+    assert secrets_in(job.get("env") or {}) == set()
+    assert checkout["with"]["persist-credentials"] is False
+
+
+def test_product_workflows_named_by_publish_targets_are_the_real_ones():
+    # Act / Assert — 기본 워크플로 폴더와 제품 → 워크플로 이름이 실제 파일을 가리킨다
+    assert publish_targets.WORKFLOW_DIR == WORKFLOW_DIR
+    assert set(publish_targets.PRODUCT_WORKFLOWS) == set(publish_targets.PRODUCTS)
+    assert sorted(publish_targets.PRODUCT_WORKFLOWS.values()) == sorted(ML_WORKFLOW_NAMES)
+
+
+@ml_params
+def test_mode_line_reading_agrees_with_the_yaml_parser(name):
+    # Arrange
+    path = WORKFLOW_DIR / name
+
+    # Act / Assert — 정규식 한 줄 판독이 YAML 판독과 같다(모양이 바뀌면 판독이 거부하고 이 시험이 알린다)
+    assert publish_targets.workflow_mode(path) == load(path)["env"]["PUBLISH_MODE"]

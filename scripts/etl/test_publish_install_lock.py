@@ -290,7 +290,7 @@ def violations(doc: dict, root: Path = ROOT) -> list[str]:
 # ── 실제 워크플로 ────────────────────────────────────────────────────────────
 # 해시 고정본으로 바꾼 워크플로 — 토큰 범위 판정이 이 목록을 놓치면 아래 시험이 무음 통과하므로 따로 못박는다.
 HASH_LOCKED_WORKFLOWS = (
-    "data-collect-hourly.yml", "firms-collect.yml", "forecast-collect.yml", "hf-live-squash.yml",
+    "candidate-prune.yml", "data-collect-hourly.yml", "firms-collect.yml", "forecast-collect.yml", "hf-live-squash.yml",
     "news-collect.yml", "openaq-bulk-collect.yml", "shadow-retention.yml", "timeline-collect.yml",
 )
 
@@ -360,7 +360,7 @@ def test_the_scan_sees_the_token_in_every_placement_the_workflows_use():
     holders = {p.name for p in ALL_WORKFLOWS if token_jobs(load(p))}
 
     # Assert — 글롭·범위 판정이 깨져 대상이 빠지면 아래 parametrize 가 무음 통과한다.
-    # 잡 env(data-collect-hourly) · 스텝 env(openaq-bulk-collect) · 잡 분리(ml-predict) + 고정본으로 바꾼 8개 + 허용목록
+    # 잡 env(data-collect-hourly) · 스텝 env(openaq-bulk-collect) · 잡 분리(ml-predict) + 고정본을 쓰는 9개 + 허용목록
     assert {*HASH_LOCKED_WORKFLOWS, "ml-predict.yml", *UNPINNED_ALLOWLIST} <= holders
 
 

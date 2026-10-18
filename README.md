@@ -19,6 +19,7 @@ Hugging Face 데이터셋 [`Robeedau/airlens-live`](https://huggingface.co/datas
 | `policy-collect` | 주간(일 04:00 UTC) | 대기질 정책 레지스트리 → `insights-data/policy/` |
 | `contracts-publish` | 3h | 산출물 계약 manifest/registry/health 생성 → `meta/` (`product_manifest.json`·`source_registry.json`·`product_health.json`) |
 | `shadow-retention` | 일간(02:40 UTC) | E2 사이드카 shadow 슬롯 14일 초과분 정리 → `openaq-shadow/`, `sensor-community-shadow/` |
+| `candidate-prune` | 수동 | 컷오버 뒤 후보 파일 정리(기본 dry-run, 그 제품 워크플로가 production 일 때만) → `aq-data/_candidate/` |
 | `mac-snapshot-healthcheck` | 1h(:35) | 발행된 mac 스냅샷 신선도 프로브 (발행 없음, advisory) |
 | `e2-shadow-freshness` | 6h(:25) | `openaq-shadow/`·`sensor-community-shadow/` 최신 슬롯 프로브 (발행 없음) |
 | `keepalive` | 월 2회(1·15일) | public 레포 60일 비활동 자동 비활성화 방지 (워크플로 재활성화, 발행 없음) |
