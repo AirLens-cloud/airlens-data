@@ -24,7 +24,8 @@ permissions:
 
 jobs:
   prune-candidate:
-    if: github.repository == 'AirLens-cloud/airlens-data'
+    # main 에서만 돈다 — 모드 판독은 체크아웃한 ref 의 워크플로 파일을 읽으므로 브랜치 사본으로는 게이트를 열 수 없게
+    if: github.repository == 'AirLens-cloud/airlens-data' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     # HF 쓰기 토큰은 environment `hf-write` 의 secret 이다(보호 조건은 README 「Secrets」)
     environment:
