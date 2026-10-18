@@ -2010,9 +2010,9 @@ def test_candidate_prune_takes_its_prefixes_only_from_publish_targets_and_emptie
     # Act
     lines = logical_lines(step["run"])
 
-    # Assert — 접두를 손으로 적지 않는다. publish_targets 가 그 제품이 production 일 때만 내고, 빈 출력이면 멈춘다.
-    # 지우는 명령은 접두마다 `--keep-days 0`(지금보다 이른 타임스탬프 파일 전부) 한 줄뿐이다
-    assert job["if"] == REPO_GUARD
+    # Assert — main 에서만 돈다. 접두를 손으로 적지 않는다. publish_targets 가 그 제품이 production 일 때만 내고, 빈 출력이면
+    # 멈춘다. 지우는 명령은 접두마다 `--keep-days 0`(지금보다 이른 타임스탬프 파일 전부) 한 줄뿐이다
+    assert job["if"] == f"{REPO_GUARD} && {MAIN_REF_GUARD}"
     assert step["env"]["PRODUCT"] == "${{ inputs.product }}"
     assert lines == [
         "set -euo pipefail",
