@@ -16,8 +16,8 @@ UTC = timezone.utc
 # ────────────────────────── pure helpers ──────────────────────────
 
 def test_pick_latest_cams_cycle_skips_cycle_younger_than_publish_latency():
-    # Arrange — 06:59Z: 오늘 00z 는 6h59m 전(< 7h latency) → 스킵, 어제 12z(18h59m)로
-    now = datetime(2026, 7, 16, 6, 59, tzinfo=UTC)
+    # Arrange — 09:59Z: 오늘 00z 는 9h59m 전(< 10h latency) → 스킵, 어제 12z(21h59m)로
+    now = datetime(2026, 7, 16, 9, 59, tzinfo=UTC)
     # Act
     date_str, time_str = m.pick_latest_cams_cycle(now)
     # Assert
@@ -25,12 +25,31 @@ def test_pick_latest_cams_cycle_skips_cycle_younger_than_publish_latency():
 
 
 def test_pick_latest_cams_cycle_accepts_cycle_exactly_at_latency_boundary():
-    # Arrange — 07:00Z: 오늘 00z 는 정확히 7h 전 → 경계값 포함(>=)
-    now = datetime(2026, 7, 16, 7, 0, tzinfo=UTC)
+    # Arrange — 10:00Z: 오늘 00z 는 정확히 10h 전 → 경계값 포함(>=)
+    now = datetime(2026, 7, 16, 10, 0, tzinfo=UTC)
     # Act
     date_str, time_str = m.pick_latest_cams_cycle(now)
     # Assert
     assert (date_str, time_str) == ("2026-07-16", "00:00")
+
+
+def test_pick_latest_cams_cycle_skips_12z_before_its_2200z_guarantee():
+    # Arrange — 21:59Z: 오늘 12z 는 9h59m 전 → 스킵, 오늘 00z 로. 2026-10-16 21:27Z run 이
+    #   7h 기준으로 12z 를 골라 400 이 났던 구간이다.
+    now = datetime(2026, 10, 16, 21, 59, tzinfo=UTC)
+    # Act
+    date_str, time_str = m.pick_latest_cams_cycle(now)
+    # Assert
+    assert (date_str, time_str) == ("2026-10-16", "00:00")
+
+
+def test_pick_latest_cams_cycle_accepts_12z_at_2200z():
+    # Arrange — 22:00Z: 오늘 12z 는 정확히 10h 전 → 포함
+    now = datetime(2026, 10, 16, 22, 0, tzinfo=UTC)
+    # Act
+    date_str, time_str = m.pick_latest_cams_cycle(now)
+    # Assert
+    assert (date_str, time_str) == ("2026-10-16", "12:00")
 
 
 def test_two_requests_together_cover_every_declared_variable_exactly_once():

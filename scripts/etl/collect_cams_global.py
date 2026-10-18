@@ -55,7 +55,11 @@ OUTPUT_PATH = os.environ.get("MAC_CAMS_OUTPUT_PATH", "cams-global-snapshot.json"
 ATTRIBUTION = "Contains modified Copernicus Atmosphere Monitoring Service information"
 
 CYCLE_HOURS = (12, 0)  # design SOT §"스케줄": 하루 2회 00/12 UTC
-PUBLISH_LATENCY_HOURS = 7  # ADS 는 cycle 후 수 시간 지나야 결과가 올라온다(보수적 컷오프)
+# ECMWF 가 보장하는 가용 시각은 00z→10:00Z, 12z→22:00Z 다(Copernicus Knowledge Base
+# "CAMS: Global atmospheric composition forecast data documentation"). 7h 로 두었을 땐
+# 2026-10-09~17 run 38개 중 9개가 아직 안 올라온 cycle 을 요청해 400("Request has not
+# produced a valid combination of values")으로 실패했다 — 실패는 모두 7.4~9.6h, 성공은 10h 이상.
+PUBLISH_LATENCY_HOURS = 10
 FRESHNESS_CUTOFF_HOURS = 12  # CAMS global 은 12시간 주기(design SOT §"스케줄")
 
 # pollutant_key -> (ADS variable name, GRIB short name, kind)
@@ -98,8 +102,8 @@ SURFACE_MODEL_LEVEL = "137"
 def pick_latest_cams_cycle(now: datetime) -> tuple[str, str]:
     """00/12 UTC cycle 중 발행 지연(PUBLISH_LATENCY_HOURS)을 감안해 가장 최근 것.
 
-    예: 07:00Z 시점엔 어제 12z(19h 전, 발행 완료 확실)를 고른다 — 오늘 00z(7h 전) 는
-    아직 ADS 에 없을 수 있어 보수적으로 건너뛴다.
+    예: 09:59Z 시점엔 어제 12z(21h59m 전, 발행 완료 확실)를 고른다 — 오늘 00z(9h59m 전) 는
+    보장 시각(10:00Z) 전이라 아직 ADS 에 없을 수 있어 건너뛴다.
     """
     for day_offset in range(0, 3):
         d = now - timedelta(days=day_offset)
