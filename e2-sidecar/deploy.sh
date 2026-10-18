@@ -7,7 +7,7 @@
 # editing surface. Edit here, deploy with this script — never the reverse.
 # (Recovered from the live VM with per-file sha256 parity; see README.md.)
 #
-# Secrets are NOT deployed: /etc/airlens/{hf_token,openaq_api_key,cf_r2_chatlog}
+# Secrets are NOT deployed: /etc/airlens/{hf_token,openaq_api_key,cf_r2_chatlog,gh_dispatch_pat}
 # live only on the VM (systemd LoadCredential reads them). This script never
 # touches them.
 #
@@ -53,7 +53,13 @@ trap '"${SSH[@]}" "rm -rf $STAGE" || true' EXIT
   else
     echo 'NOTE: /etc/airlens/cf_r2_chatlog absent — chatlog-pull timer not enabled.'
   fi
-  systemctl list-timers airlens-openaq-shadow.timer airlens-sc-shadow.timer airlens-chatlog-pull.timer --no-pager
+  # Same for the forecast-collect dispatch timer: without its token every run would just fail.
+  if sudo test -r /etc/airlens/gh_dispatch_pat; then
+    sudo systemctl enable --now airlens-forecast-dispatch.timer
+  else
+    echo 'NOTE: /etc/airlens/gh_dispatch_pat absent — forecast-dispatch timer not enabled.'
+  fi
+  systemctl list-timers airlens-openaq-shadow.timer airlens-sc-shadow.timer airlens-chatlog-pull.timer airlens-forecast-dispatch.timer --no-pager
 "
 
-echo "deployed. next slots: sc :05 / openaq :15 / chatlog :35 hourly — e2-shadow-freshness.yml keeps watching."
+echo "deployed. next slots: sc :05 / openaq :15 / chatlog :35 hourly, forecast dispatch :50 every 6h (UTC 00/06/12/18) — e2-shadow-freshness.yml keeps watching the collectors."
