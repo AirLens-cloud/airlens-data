@@ -91,7 +91,7 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  PUBLISH_MODE: candidate  # candidate | production — 컷오버는 이 줄을 바꾸는 PR
+  PUBLISH_MODE: production  # candidate | production — 컷오버는 이 줄을 바꾸는 PR
   INFERENCE_VERSION: '0.3.2'  # wheel 버전 핀
   INFERENCE_WHEEL_SHA256: '5a42a6baab5b4ca40478517d13fdbe9ac78ff48fad3d151c3b24ddd3eb7a18bf'  # 위 버전 wheel 의 sha256 핀
   BAND_SKIPPED_BASE_DEPS: 'joblib,lightgbm,python-dotenv,scikit-learn,scipy,xgboost'  # wheel 기본 의존성 중 일부러 깔지 않는 것(pip check 가 정확히 이 줄들만 낸다)
