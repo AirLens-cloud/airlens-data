@@ -5,7 +5,8 @@
 
   candidate   `aq-data/_candidate/` 아래 **타임스탬프 파일만** 쓴다. 운영 경로(latest 포함)는 건드리지 않는다.
               이름이 `<접두>_<10자리>.json` 이라 기존 `hf_publish.py prune` 의 정규식에 걸린다 — 정리에
-              새 코드가 필요 없다. 자동 prune 은 하지 않는다(컷오버 뒤 `--keep-days 0` 으로 한 번에 비운다).
+              새 코드가 필요 없다. 자동 prune 은 하지 않는다(컷오버 뒤 `candidate-prune` 워크플로가 `--keep-days 0`
+              으로 한 번에 비운다).
   production  운영 경로: latest + history 스냅샷, 30일 prune. 기존 운영 워크플로의 의미를 그대로 옮긴 것이다.
 
 STAMP 는 예측 내부 timestamp(정각)의 `%Y%m%d%H` 다. 같은 실행의 grid·DQSS·shadow 를 파일명 시각으로
@@ -20,6 +21,9 @@ CLI (워크플로의 발행 job 이 쓴다 — 출력은 줄 단위라 `mapfile`
     publish_targets.py maps  --mode M --dir DIR --group G [--prod-snapshot FILE]
                                                              → `SRC=DEST` 줄들 (G: grid | dqss | shadow | band)
     publish_targets.py prune --mode M                        → `PREFIX KEEP_DAYS` 줄들 (candidate 는 없음)
+    publish_targets.py candidates --product P [--workflow-dir D]
+                                                             → 컷오버 뒤 비울 후보 접두 줄들 (P: predictions | band).
+                                                               그 제품의 워크플로가 production 이 아니면 종료 코드 1
 """
 from __future__ import annotations
 
@@ -36,6 +40,11 @@ GROUPS = ("grid", "dqss", "shadow", "band")
 CANDIDATE_ROOT = "aq-data/_candidate"
 HISTORY_KEEP_DAYS = 30
 STAMP_RE = re.compile(r"\d{10}")
+PRODUCTS = ("predictions", "band")  # compare_candidate.py --product 와 같은 이름
+PRODUCT_WORKFLOWS = {"predictions": "ml-predict.yml", "band": "band-forecast.yml"}
+WORKFLOW_DIR = Path(__file__).resolve().parents[2] / ".github" / "workflows"
+# 워크플로 최상위 env 의 `PUBLISH_MODE: <값>  # 주석` 한 줄. 따옴표·식 등 다른 모양은 읽지 않는다(줄 수 0 → 거부).
+MODE_LINE_RE = re.compile(r"^[ \t]*PUBLISH_MODE:[ \t]*([A-Za-z]+)[ \t]*(?:#.*)?$", re.MULTILINE)
 
 # 산출물 파일명 (artifact 디렉터리 기준)
 GRID_FILE = "grid_latest.json"
@@ -164,6 +173,26 @@ def prune_prefixes(mode: str) -> list[tuple[str, int]]:
     ]
 
 
+def candidate_prefixes(product: str) -> list[str]:
+    """컷오버 뒤 한 번에 비울 후보 접두. 후보 발행 경로의 폴더를 뽑으므로 운영 경로가 섞일 수 없다."""
+    if product not in PRODUCTS:
+        raise ValueError(f"product 는 {PRODUCTS} 중 하나여야 한다: {product!r}")
+    stamp = "2000010100"  # 경로 모양만 쓴다
+    if product == "predictions":
+        targets = predictions_targets("candidate", stamp)
+    else:
+        targets = band_targets("candidate", stamp, stamp)
+    return sorted({t.dest.rsplit("/", 1)[0] for t in targets})
+
+
+def workflow_mode(path: Path) -> str:
+    """워크플로의 `PUBLISH_MODE` 값. 그 줄이 정확히 하나가 아니면 ValueError — 어느 모드로도 추측하지 않는다."""
+    modes = MODE_LINE_RE.findall(path.read_text(encoding="utf-8"))
+    if len(modes) != 1:
+        raise ValueError(f"{path.name}: PUBLISH_MODE 줄이 {len(modes)}개다")
+    return modes[0]
+
+
 def _load_stamp(directory: Path) -> str:
     grid = json.loads((directory / GRID_FILE).read_text(encoding="utf-8"))
     return stamp_from_grid(grid)
@@ -187,6 +216,10 @@ def main(argv: list[str] | None = None) -> int:
     p_prune = sub.add_parser("prune", help="`PREFIX KEEP_DAYS` 줄을 낸다")
     p_prune.add_argument("--mode", required=True, choices=MODES)
 
+    p_cand = sub.add_parser("candidates", help="컷오버 뒤 비울 후보 접두 줄을 낸다(그 제품 워크플로가 production 일 때만)")
+    p_cand.add_argument("--product", required=True, choices=PRODUCTS)
+    p_cand.add_argument("--workflow-dir", type=Path, default=WORKFLOW_DIR)
+
     args = parser.parse_args(argv)
 
     try:
@@ -209,9 +242,18 @@ def main(argv: list[str] | None = None) -> int:
                         return 1
                     continue
                 print(f"{src}={target.dest}")
-        else:
+        elif args.cmd == "prune":
             for prefix, keep_days in prune_prefixes(args.mode):
                 print(f"{prefix} {keep_days}")
+        else:
+            # 후보 모드에서 지우면 컷오버 판단의 비교 근거가 사라진다 — dry-run 도 같은 조건이다
+            workflow = args.workflow_dir / PRODUCT_WORKFLOWS[args.product]
+            mode = workflow_mode(workflow)
+            if mode != "production":
+                print(f"{workflow.name} 가 아직 {mode} 모드다 — 컷오버 뒤에만 후보를 비운다", file=sys.stderr)
+                return 1
+            for prefix in candidate_prefixes(args.product):
+                print(prefix)
     except (OSError, ValueError, KeyError, TypeError, AttributeError) as exc:  # 깨진 grid(모양 다름 포함)는 traceback 대신 한 줄
         print(f"publish_targets: {type(exc).__name__}: {exc}", file=sys.stderr)
         return 1

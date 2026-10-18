@@ -1,0 +1,70 @@
+name: Candidate Prune (컷오버 뒤 후보 파일 정리)
+
+# 후보 모드(`PUBLISH_MODE: candidate`)가 aq-data/_candidate/ 아래 남긴 타임스탬프 파일을 컷오버 뒤 한 번에 비운다.
+# 후보는 자동 정리가 없다(scripts/ml/publish_targets.py 머리 주석). 수동 실행만 있고 기본은 dry-run 이다 —
+# dry-run 으로 대상 목록을 본 뒤 dry_run=false 로 다시 실행한다. 컷오버 PR 머지 전에 시작된 후보 run 이 끝난 뒤에
+# 돌린다(그 run 이 정리 뒤에 후보 파일을 다시 쓸 수 있다).
+# 접두는 `publish_targets.py candidates` 가 후보 발행 경로에서 뽑는다. 그 제품의 워크플로가 아직 candidate 면
+# 접두를 내지 않고 실패한다(dry-run 도 같다) — 컷오버 전에 비교 근거가 사라지지 않게.
+
+on:
+  workflow_dispatch:
+    inputs:
+      product:
+        description: '비울 후보 — predictions: ml-predict 의 grid·DQSS·shadow, band: band-forecast 의 후보 파일과 비교용 운영 사본 (둘 다 _candidate/ 안이다. 운영 파일은 건드리지 않는다)'
+        type: choice
+        options: [predictions, band]
+      dry_run:
+        description: '삭제 없이 대상 목록만 출력'
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+jobs:
+  prune-candidate:
+    if: github.repository == 'AirLens-cloud/airlens-data'
+    runs-on: ubuntu-latest
+    # HF 쓰기 토큰은 environment `hf-write` 의 secret 이다(보호 조건은 README 「Secrets」)
+    environment:
+      name: hf-write
+      deployment: false
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
+        with:
+          python-version: '3.11'
+
+      # HF 쓰기 토큰이 있는 잡 — 해시 고정본만 깐다(scripts/etl/test_publish_install_lock.py 가 지킨다).
+      - name: Install huggingface_hub (hash-locked)
+        run: |
+          python3 -m pip install --no-cache-dir --require-hashes --no-deps --only-binary :all: \
+            -r scripts/etl/requirements-publish.lock.txt
+          python3 -m pip check
+
+      # 쓰기 토큰은 이 스텝에만 준다.
+      - name: Prune candidate files
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          PRODUCT: ${{ inputs.product }}
+          # 정확히 false 일 때만 지운다 — 값이 어긋나면(문자열·빈 값) dry-run 쪽으로 넘어진다
+          PRUNE_LIVE: ${{ inputs.dry_run == false && 'yes' || 'no' }}
+        run: |
+          set -euo pipefail
+          DRY_RUN_FLAG=--dry-run
+          if [ "$PRUNE_LIVE" = yes ]; then DRY_RUN_FLAG=""; fi
+          echo "product=$PRODUCT dry_run=${DRY_RUN_FLAG:-off}"
+          OUT=$(python3 scripts/ml/publish_targets.py candidates --product "$PRODUCT")
+          [ -n "$OUT" ] || { echo "::error::후보 접두가 없다"; exit 1; }
+          # 한 접두가 실패하면 멈춘다 — 다시 실행하면 남은 파일부터 지운다
+          while read -r prefix; do
+            python3 scripts/etl/hf_publish.py prune --prefix "$prefix" --keep-days 0 ${DRY_RUN_FLAG:+"$DRY_RUN_FLAG"}
+          done <<< "$OUT"

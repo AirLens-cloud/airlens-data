@@ -586,3 +586,93 @@ def test_band_path_helpers_reject_stamps_that_are_not_real_ten_digit_hours(helpe
     # Act / Assert
     with pytest.raises(ValueError):
         getattr(pt, helper)(bad)
+
+
+# ── 컷오버 뒤 후보 정리 (candidate-prune 워크플로가 쓴다) ────────────────────
+def test_candidate_prefixes_are_the_folders_of_each_products_candidate_destinations():
+    # Act / Assert — 후보 발행 경로에서 뽑는다. 다른 제품의 후보 폴더가 섞이지 않는다
+    assert pt.candidate_prefixes("predictions") == ["aq-data/_candidate/predictions/history", "aq-data/_candidate/quality-history"]
+    assert pt.candidate_prefixes("band") == ["aq-data/_candidate/forecast-band/history", "aq-data/_candidate/forecast-band/prod"]
+
+
+@pytest.mark.parametrize("product", pt.PRODUCTS)
+def test_pruning_the_product_prefixes_removes_exactly_that_products_candidate_files(product):
+    # Arrange — 두 제품의 후보 파일과 운영 경로 전부를 한 목록에 섞는다
+    candidate = {
+        "predictions": [t.dest for t in pt.predictions_targets("candidate", STAMP)],
+        "band": [t.dest for t in pt.band_targets("candidate", STAMP, PROD_STAMP)],
+    }
+    production = [dest for _g, _s, dest in _tuples("production")] + [t.dest for t in pt.band_targets("production", STAMP)]
+    everything = candidate["predictions"] + candidate["band"] + production
+    far_future = datetime(2100, 1, 1, tzinfo=timezone.utc)
+
+    # Act — hf_publish.prune 은 접두에 "/" 를 붙여 판정한다(`--keep-days 0` 이면 지금보다 이른 파일 전부)
+    stale = [f for prefix in pt.candidate_prefixes(product) for f in hf_publish._stale_files(everything, prefix + "/", far_future)[0]]
+
+    # Assert
+    assert sorted(stale) == sorted(candidate[product])
+
+
+def test_candidate_prefixes_reject_an_unknown_product():
+    # Act / Assert — `ml` 같은 다른 이름이 조용히 어느 한 제품으로 해석되면 안 된다
+    with pytest.raises(ValueError, match="product"):
+        pt.candidate_prefixes("ml")
+
+
+def _workflows(directory: Path, predictions: str, band: str) -> Path:
+    for name, mode in (("ml-predict.yml", predictions), ("band-forecast.yml", band)):
+        (directory / name).write_text(f"env:\n  PUBLISH_MODE: {mode}  # candidate | production\n", encoding="utf-8")
+    return directory
+
+
+@pytest.mark.parametrize("product", pt.PRODUCTS)
+def test_cli_candidates_prints_the_prefixes_once_the_product_is_in_production(product, tmp_path, capsys):
+    # Arrange
+    directory = _workflows(tmp_path, "production", "production")
+
+    # Act
+    code, out, err = _run(capsys, "candidates", "--product", product, "--workflow-dir", str(directory))
+
+    # Assert — 워크플로가 `while read -r prefix` 로 받는다(한 줄에 하나)
+    assert (code, err) == (0, "")
+    assert out.splitlines() == pt.candidate_prefixes(product)
+
+
+@pytest.mark.parametrize("band_mode", ["candidate", "staging"])
+def test_cli_candidates_refuses_unless_the_product_is_in_production(band_mode, tmp_path, capsys):
+    # Arrange — predictions 만 컷오버했다(모르는 값도 production 이 아니다)
+    directory = _workflows(tmp_path, "production", band_mode)
+
+    # Act
+    code, out, err = _run(capsys, "candidates", "--product", "band", "--workflow-dir", str(directory))
+
+    # Assert — 접두를 하나도 내지 않고 종료 코드 1 이다(워크플로가 `set -e` 로 prune 전에 멈춘다)
+    assert (code, out) == (1, "")
+    assert "band-forecast.yml" in err and band_mode in err
+
+
+@pytest.mark.parametrize(
+    "text",
+    ["env: {}\n", "env:\n  PUBLISH_MODE: production\n  PUBLISH_MODE: candidate\n", "env:\n  PUBLISH_MODE: 'production'\n",
+     "env:\n  # PUBLISH_MODE: production\n"],
+    ids=["missing", "twice", "quoted", "commented-out"],
+)
+def test_cli_candidates_refuses_when_the_mode_line_is_missing_or_ambiguous(text, tmp_path, capsys):
+    # Arrange
+    (tmp_path / "ml-predict.yml").write_text(text, encoding="utf-8")
+
+    # Act
+    code, out, err = _run(capsys, "candidates", "--product", "predictions", "--workflow-dir", str(tmp_path))
+
+    # Assert — 모드를 추측하지 않는다. 메시지는 한 줄이다
+    assert (code, out) == (1, "")
+    assert err.startswith("publish_targets: ValueError") and len(err.splitlines()) == 1
+
+
+def test_cli_candidates_without_the_workflow_file_fails_with_one_line(tmp_path, capsys):
+    # Act
+    code, out, err = _run(capsys, "candidates", "--product", "predictions", "--workflow-dir", str(tmp_path))
+
+    # Assert
+    assert (code, out) == (1, "")
+    assert err.startswith("publish_targets: FileNotFoundError") and len(err.splitlines()) == 1
