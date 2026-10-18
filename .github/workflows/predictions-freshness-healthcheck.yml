@@ -19,8 +19,9 @@ name: Predictions Freshness Healthcheck
 # 실효 프로브 간격보다 이미 촘촘하다 — 더 줄여도 탐지가 빨라지지 않고 Actions 분만 쓴다.
 #
 # 허용 나이 8h: 발행 주기는 3h 지만 GitHub 스케줄 지연으로 실제 발행 간격이 중앙값 5~6.5h(2주 실측)다. 4h 면 지연만으로
-# 시간의 25~39% 동안 경보가 열리고, 8h 면 0~3% 다. 정시 호출이 ml 예측까지 오면 4h 로 되돌린다. 값은 세 곳(아래
-# dispatch 기본값, 스케줄 run 의 대체값, 프로브 스크립트의 `DEFAULT_MAX_AGE_HOURS`)이 같아야 한다.
+# 시간의 25~39% 동안 경보가 열리고, 8h 면 약 3% 다(history 슬롯 판정은 관측 지연 여유 1h 를 더해 9h). 정시 호출이 ml
+# 예측까지 오면 4h 로 되돌린다. 값은 세 곳(아래 dispatch 기본값, 스케줄 run 의 대체값, 프로브 스크립트의
+# `DEFAULT_MAX_AGE_HOURS`)이 같아야 한다.
 #
 # 발행 워크플로를 일부러 끄는 작업(롤백 등)을 하면 `workflow_inactive` 경보가 켜진다. 그때는 아래
 # `WATCHED_WORKFLOWS` 에서 그 파일을 같은 PR 에서 뺀다.

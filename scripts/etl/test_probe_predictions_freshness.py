@@ -21,7 +21,7 @@ import probe_predictions_freshness as m
 
 UTC = timezone.utc
 NOW = datetime(2026, 9, 3, 12, 0, tzinfo=UTC)
-MAX_AGE = timedelta(hours=4)
+MAX_AGE = timedelta(hours=4)  # 판정 규칙을 4h 경계로 시험한다. 운영 기본값은 `m.DEFAULT_MAX_AGE_HOURS`(8h)
 CADENCE = timedelta(hours=3)
 REPO = "example-org/example-repo"
 TOKEN = "unit-test-token-value"
@@ -119,19 +119,20 @@ def test_gap_of_exactly_two_cadences_is_tolerated_and_beyond_it_is_flagged():
     assert [p.split(" ")[0] for p in over["problems"]] == ["history_gap"]
 
 
-def test_history_gap_waits_for_the_latest_age_limit_when_it_is_longer_than_two_cadences():
-    # Arrange — 허용 나이(8h)가 2×주기(6h)보다 길면 슬롯 판정도 그 값을 따른다. 한 run 이 latest 와 history 를 함께
-    # 쓰므로 스케줄 지연은 둘을 같이 늦춘다 — 슬롯만 먼저 경보를 열면 지연을 결손으로 읽는다. 경계값(8h)은 정상.
+def test_history_gap_waits_for_the_age_limit_plus_slot_lag_when_it_is_longer_than_two_cadences():
+    # Arrange — 허용 나이(8h) + 관측 지연 여유(1h) = 9h 가 2×주기(6h)보다 길면 슬롯 판정도 그 값을 따른다. 한 run 이
+    # latest 와 history 를 함께 쓰므로 스케줄 지연은 둘을 같이 늦춘다 — 슬롯만 먼저 경보를 열면 지연을 결손으로 읽는다.
+    # 경계값(9h)은 정상.
     max_age = timedelta(hours=8)
 
     # Act
-    at_limit = m.classify(_latest(), _slots(8), NOW, max_age, CADENCE)
-    over = m.classify(_latest(), _slots(8.1), NOW, max_age, CADENCE)
+    at_limit = m.classify(_latest(), _slots(9), NOW, max_age, CADENCE)
+    over = m.classify(_latest(), _slots(9.1), NOW, max_age, CADENCE)
 
     # Assert
     assert at_limit["problems"] == []
     assert [p.split(" ")[0] for p in over["problems"]] == ["history_gap"]
-    assert "허용 8h" in over["problems"][0]
+    assert "허용 9h" in over["problems"][0]
 
 
 def test_empty_history_is_flagged():
@@ -565,6 +566,24 @@ def test_main_staleness_alone_exits_zero_because_the_issue_is_the_alert_channel(
     assert code == 0
     assert "healthy=false" in paths["output"].read_text(encoding="utf-8")
     assert "stale_band" in paths["report"].read_text(encoding="utf-8")
+    capsys.readouterr()
+
+
+@pytest.mark.parametrize(("offset_h", "stale"), [(-0.5, False), (0.5, True)])
+def test_main_without_the_env_uses_the_default_age_limit(main_env, monkeypatch, capsys, offset_h, stale):
+    # Arrange — env 가 없을 때(로컬 실행) main() 은 DEFAULT_MAX_AGE_HOURS 를 쓴다(워크플로 기본값과의 일치는
+    # test_ml_workflow_safety 가 본다). 기본값 경계 양쪽으로 본다.
+    paths, _ = main_env
+    age_h = float(m.DEFAULT_MAX_AGE_HOURS) + offset_h
+    latest = _latest((NOW - timedelta(hours=age_h)).isoformat())
+    monkeypatch.setattr(m, "fetch_latest", lambda url, timeout: (latest, None))
+    monkeypatch.setattr(m, "fetch_slots", lambda url, timeout: (_slots(age_h), None))
+
+    # Act
+    m.main()
+
+    # Assert
+    assert ("stale_latest" in paths["report"].read_text(encoding="utf-8")) is stale
     capsys.readouterr()
 
 
