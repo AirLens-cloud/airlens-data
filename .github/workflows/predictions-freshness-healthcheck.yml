@@ -14,23 +14,26 @@ name: Predictions Freshness Healthcheck
 # 그건 경보 피로로 직행한다. 대신 열린 이슈 하나의 **본문을 덮어써서** 항상 현재 상태를 들고 있게 하고,
 # 복구되면 자동으로 닫는다.
 #
-# 탐지 지연(설계값): 발행이 멈춘 뒤 `grid_latest` 나이가 4h 를 넘는 시점(직전 발행 기준 최대 4h) → 다음 프로브까지
-# 최대 2h. 앞단 4h 는 임계값 자체이므로 프로브 주기로는 줄일 수 없다. 2h 주기는 GitHub 스케줄 지연을 감안한
+# 탐지 지연(설계값): 발행이 멈춘 뒤 `grid_latest` 나이가 8h 를 넘는 시점(직전 발행 기준 최대 8h) → 다음 프로브까지
+# 최대 2h. 앞단 8h 는 임계값 자체이므로 프로브 주기로는 줄일 수 없다. 2h 주기는 GitHub 스케줄 지연을 감안한
 # 실효 프로브 간격보다 이미 촘촘하다 — 더 줄여도 탐지가 빨라지지 않고 Actions 분만 쓴다.
+#
+# 허용 나이 8h: 발행 주기는 3h 지만 GitHub 스케줄 지연으로 실제 발행 간격이 중앙값 5~6.5h(2주 실측)다. 4h 면 지연만으로
+# 시간의 25~39% 동안 경보가 열리고, 8h 면 0~3% 다. 정시 호출이 ml 예측까지 오면 4h 로 되돌린다. 값은 세 곳(아래
+# dispatch 기본값, 스케줄 run 의 대체값, 프로브 스크립트의 `DEFAULT_MAX_AGE_HOURS`)이 같아야 한다.
 #
 # 발행 워크플로를 일부러 끄는 작업(롤백 등)을 하면 `workflow_inactive` 경보가 켜진다. 그때는 아래
 # `WATCHED_WORKFLOWS` 에서 그 파일을 같은 PR 에서 뺀다.
 
 # 스케줄은 ml 컷오버 PR 에서 켰다(발행 :45 이 끝난 뒤, 2h 주기). 비공개 ML 레포의 같은 감시는 컷오버 때 끈다 —
-# 둘 다 켜 두면 경보 이슈가 중복된다. GitHub 스케줄 지연으로 grid_latest 가 4h 를 넘으면 이 레포에 공개 이슈가
-# 열리고, 다음 발행 뒤 프로브에서 닫힌다.
+# 둘 다 켜 두면 경보 이슈가 중복된다.
 on:
   workflow_dispatch:
     inputs:
       max_age_hours:
         description: 'grid_latest.generated_at 허용 나이 (시간)'
         required: false
-        default: '4'
+        default: '8'
       fail_on_stale:
         description: 'true = 신선도 이상도 job 을 red 로 (기본 false — 이슈가 경보 채널)'
         required: false
@@ -64,7 +67,7 @@ jobs:
       - name: Probe
         id: probe
         env:
-          PREDICTIONS_MAX_AGE_HOURS: ${{ github.event.inputs.max_age_hours || '4' }}
+          PREDICTIONS_MAX_AGE_HOURS: ${{ github.event.inputs.max_age_hours || '8' }}
           PREDICTIONS_CADENCE_HOURS: '3'   # 발행 주기 (ml-predict.yml 의 cron 과 맞춘다)
           BAND_MAX_AGE_HOURS: '12'         # 웹이 예측 밴드에 오래됨 배지를 다는 기준과 같은 값
           WATCHED_WORKFLOWS: 'ml-predict.yml,band-forecast.yml'

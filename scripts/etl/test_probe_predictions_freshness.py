@@ -119,6 +119,21 @@ def test_gap_of_exactly_two_cadences_is_tolerated_and_beyond_it_is_flagged():
     assert [p.split(" ")[0] for p in over["problems"]] == ["history_gap"]
 
 
+def test_history_gap_waits_for_the_latest_age_limit_when_it_is_longer_than_two_cadences():
+    # Arrange — 허용 나이(8h)가 2×주기(6h)보다 길면 슬롯 판정도 그 값을 따른다. 한 run 이 latest 와 history 를 함께
+    # 쓰므로 스케줄 지연은 둘을 같이 늦춘다 — 슬롯만 먼저 경보를 열면 지연을 결손으로 읽는다. 경계값(8h)은 정상.
+    max_age = timedelta(hours=8)
+
+    # Act
+    at_limit = m.classify(_latest(), _slots(8), NOW, max_age, CADENCE)
+    over = m.classify(_latest(), _slots(8.1), NOW, max_age, CADENCE)
+
+    # Assert
+    assert at_limit["problems"] == []
+    assert [p.split(" ")[0] for p in over["problems"]] == ["history_gap"]
+    assert "허용 8h" in over["problems"][0]
+
+
 def test_empty_history_is_flagged():
     # Arrange / Act
     verdict = m.classify(_latest(), [], NOW, MAX_AGE, CADENCE)
