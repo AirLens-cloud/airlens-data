@@ -18,7 +18,8 @@
 #   uv pip compile band-pins.in --no-deps --python-version 3.12 --python-platform x86_64-manylinux_2_28 \
 #     --only-binary :all: --exclude-newer <오늘-7일>T00:00:00Z --generate-hashes --no-annotate --no-header \
 #     -o scripts/ml/requirements-band.lock.txt
-# (이 주석 블록은 재생성 뒤 다시 붙인다. 이번 생성: 2026-10-16, --exclude-newer 2026-10-09T00:00:00Z.)
+# (이 주석 블록은 재생성 뒤 다시 붙인다. 이번 생성: 2026-10-16, --exclude-newer 2026-10-09T00:00:00Z.
+#  2026-10-19 urllib3 2.8.0 으로 다시 생성 — --exclude-newer 2026-10-12T00:00:00Z, urllib3 말고는 같다.)
 anyio==4.14.2 \
     --hash=sha256:9f505dda5ac9f0c8309b5e8bd445a8c2bf7246f3ce950121e45ea15bc41d1494 \
     --hash=sha256:cfa139f3ed1a23ee8f88a145ddb5ac7605b8bbfd8592baacd7ce3d8bb4313c7f
@@ -518,6 +519,6 @@ tqdm==4.70.0 \
 typing-extensions==4.16.0 \
     --hash=sha256:481caa481374e813c1b176ada14e97f1f67a4539ce9cfeb3f350d78d6370c2e8 \
     --hash=sha256:dc983d19a509c94dba722ee6abd33940f7c05a89e243c47e907eb4db6f1a43e5
-urllib3==2.7.0 \
-    --hash=sha256:231e0ec3b63ceb14667c67be60f2f2c40a518cb38b03af60abc813da26505f4c \
-    --hash=sha256:9fb4c81ebbb1ce9531cce37674bbc6f1360472bc18ca9a553ede278ef7276897
+urllib3==2.8.0 \
+    --hash=sha256:0cf3cae568d36aa9576b28dfb35f11328f1cb974ca7647d9475ebb86c75ac6e3 \
+    --hash=sha256:63bf2ead4c879426ebf22ef2a781eeb4aa3b4ae798a0435506f8687fd5bb9b63
