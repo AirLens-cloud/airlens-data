@@ -18,9 +18,12 @@ Hugging Face 데이터셋 [`Robeedau/airlens-live`](https://huggingface.co/datas
 | `openaq-bulk-collect` | 일간(01:45 UTC) | OpenAQ 파라미터별 벌크 수집 → `insights-data/openaq-bulk/{YYYY-MM}/` (+ `manifest.json`) |
 | `policy-collect` | 주간(일 04:00 UTC) | 대기질 정책 레지스트리 → `insights-data/policy/` |
 | `contracts-publish` | 3h | 산출물 계약 manifest/registry/health 생성 → `meta/` (`product_manifest.json`·`source_registry.json`·`product_health.json`) |
+| `ml-predict` | 3h(:45) | 비공개 추론 wheel 로 PM2.5 격자 예측 + DQSS → `aq-data/predictions/` (`grid_latest.json`·`history/`), `aq-data/data_quality.json`, `aq-data/quality-history/`. 후보 모드면 `aq-data/_candidate/` (`PUBLISH_MODE`) |
+| `band-forecast` | 예보 수집 직후 + 6h(:50) 백업 | 비공개 추론 wheel 로 도시별 PM2.5 예측 밴드(p10·p50·p90) → `aq-data/forecast-band/latest.json`. 후보 모드면 `aq-data/_candidate/forecast-band/` (`PUBLISH_MODE`) |
 | `shadow-retention` | 일간(02:40 UTC) | E2 사이드카 shadow 슬롯 14일 초과분 정리 → `openaq-shadow/`, `sensor-community-shadow/` |
 | `candidate-prune` | 수동 | 컷오버 뒤 후보 파일 정리(기본 dry-run, 그 제품 워크플로가 production 일 때만) → `aq-data/_candidate/` |
 | `mac-snapshot-healthcheck` | 1h(:35) | 발행된 mac 스냅샷 신선도 프로브 (발행 없음, advisory) |
+| `predictions-freshness-healthcheck` | 2h(:17) | `grid_latest.json` 나이(8h)·history 슬롯 결손·예측 밴드 나이(12h)·`ml-predict`·`band-forecast` 활성 상태 프로브, 경보 이슈를 열고 닫는다 (발행 없음) |
 | `e2-shadow-freshness` | 6h(:25) | `openaq-shadow/`·`sensor-community-shadow/` 최신 슬롯 프로브 (발행 없음) |
 | `keepalive` | 월 2회(1·15일) | public 레포 60일 비활동 자동 비활성화 방지 (워크플로 재활성화, 발행 없음) |
 | `pr-check` | PR/push | 테스트·린트 (발행 없음) |

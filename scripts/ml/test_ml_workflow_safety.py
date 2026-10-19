@@ -1890,6 +1890,32 @@ def test_probe_default_watched_list_matches_the_workflow_env(probe_workflow):
     assert probe.DEFAULT_WATCHED.split(",") == _watched_names(probe_workflow)
 
 
+def test_probe_trigger_is_the_documented_schedule_plus_manual_dispatch(probe_workflow):
+    # Arrange / Act
+    trig = triggers(probe_workflow)
+
+    # Assert — 스케줄은 ml 발행(:45)이 끝난 뒤 2h 주기다. 수동 입력은 허용 나이와 red 전환 둘뿐이다.
+    assert set(trig) == {"schedule", "workflow_dispatch"}
+    assert trig["schedule"] == [{"cron": "17 */2 * * *"}]
+    assert set((trig["workflow_dispatch"] or {}).get("inputs") or {}) == {"max_age_hours", "fail_on_stale"}
+
+
+def test_grid_age_limit_is_the_same_for_dispatch_schedule_and_local_runs(probe_workflow):
+    # Arrange — 허용 나이는 세 곳에 적힌다: dispatch 입력 기본값, 스케줄 run 의 대체값, 프로브 스크립트 기본값(로컬 실행).
+    # 하나만 바꾸면 실행 방식마다 판정이 갈린다.
+    default = triggers(probe_workflow)["workflow_dispatch"]["inputs"]["max_age_hours"]["default"]
+    step = next(s for _j, _i, s in all_steps(probe_workflow) if s.get("id") == "probe")
+    path = ROOT / "scripts" / "etl" / "probe_predictions_freshness.py"
+    spec = importlib.util.spec_from_file_location("_probe_for_age_guard", path)
+    assert spec is not None and spec.loader is not None
+    probe = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(probe)
+
+    # Act / Assert
+    assert step["env"]["PREDICTIONS_MAX_AGE_HOURS"] == "${{ github.event.inputs.max_age_hours || '" + default + "' }}"
+    assert probe.DEFAULT_MAX_AGE_HOURS == default
+
+
 def test_alert_issue_title_names_both_signals_and_lookup_and_create_share_it(probe_workflow):
     # Arrange
     step = next(s for _j, _i, s in all_steps(probe_workflow) if s.get("name") == "Open, refresh, or close the alert issue")

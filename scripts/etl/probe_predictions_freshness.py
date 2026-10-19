@@ -10,9 +10,10 @@
 
 판정:
 - **stale_latest** — `grid_latest.json.generated_at` 이 허용 나이를 넘음
-- **history_gap** — 최신 history 슬롯이 발행 주기의 2배를 넘게 오래됨
-  (= 예상 슬롯 2개 이상 연속 결손). `grid_latest` 만 보면 놓치는 경로다:
-  latest 는 갱신됐는데 history 적재만 죽은 상태가 있을 수 있다.
+- **history_gap** — 최신 history 슬롯이 발행 주기의 2배(= 예상 슬롯 2개 이상 연속 결손)와 "허용 나이 +
+  관측 지연 여유(`SLOT_LAG_HOURS`)" 중 긴 쪽을 넘게 오래됨. `grid_latest` 만 보면 놓치는 경로다: latest 는
+  갱신됐는데 history 적재만 죽은 상태가 있을 수 있다. 한 run 이 둘을 함께 쓰므로 스케줄 지연은 둘을 같이
+  늦추는데, 슬롯 시각은 관측 정각이라 발행 시각보다 이르다 — 여유가 없으면 같은 지연에 슬롯 판정이 먼저 열린다.
 - **history_empty** — history 에 슬롯 파일이 하나도 없음
 - **malformed** — 발행물에 읽을 수 있는 `generated_at` 이 없음
 - **stale_band** — 예측 밴드(`forecast-band/latest.json`)가 12시간을 넘게 오래됨. 웹이 같은 값(12시간,
@@ -27,7 +28,7 @@
 넣어서 "지금 막 죽었나, 원래 이 정도로 새고 있었나" 를 한 줄로 구분시킨다.
 
 환경변수(전부 선택):
-  PREDICTIONS_MAX_AGE_HOURS   grid_latest 허용 나이 (기본 4)
+  PREDICTIONS_MAX_AGE_HOURS   grid_latest 허용 나이 (기본 8 — `DEFAULT_MAX_AGE_HOURS`)
   PREDICTIONS_CADENCE_HOURS   발행 주기 (기본 3)
   BAND_MAX_AGE_HOURS          예측 밴드 허용 나이 (기본 12 — 웹의 오래됨 기준과 같다)
   WATCHED_WORKFLOWS           상태를 볼 워크플로 파일명, 쉼표 구분 (기본 `ml-predict.yml,band-forecast.yml`).
@@ -58,6 +59,11 @@ GITHUB_API = "https://api.github.com"
 
 BAND_MAX_AGE = timedelta(hours=12)  # airlens-web 의 오래됨 기준(12h)과 같다
 DEFAULT_WATCHED = "ml-predict.yml,band-forecast.yml"
+# grid_latest 허용 나이(시간). 발행 주기는 3h 지만 GitHub 스케줄 지연으로 실제 간격이 중앙값 5~6.5h 라 4h 면 지연만으로
+# 경보가 열린다. 정시 호출이 ml 예측까지 오면 4h 로 되돌린다. 워크플로의 dispatch 기본값·스케줄 대체값과 같아야 한다.
+DEFAULT_MAX_AGE_HOURS = "8"
+# history 슬롯 시각(관측 정각)이 발행 시각보다 이른 정도. 2주 실측 중앙값 0.6h, 최대 약 1h.
+SLOT_LAG_HOURS = 1.0
 
 # `grid_YYYYMMDDHH.json` — 슬롯 시각은 관측 슬롯에서 오므로 고정 격자(0/3/6/9…)에
 # 정렬되지 않는다. 실측 슬롯: 08,14,18,23 / 05,11,16,21,23 / 05,11. 따라서 "격자상의
@@ -165,10 +171,12 @@ def classify(
         metrics["newest_slot"] = newest.strftime("%Y-%m-%dT%HZ")
         # 간격 / 주기 - 1 = 건너뛴 슬롯 수. 정시 발행이면 0.
         metrics["consecutive_missed"] = max(0, int(gap_h // cadence_h) - 1)
-        if gap_h > 2 * cadence_h:
+        # 하한 = 허용 나이 + 관측 지연 여유 — 같은 스케줄 지연에 슬롯 판정이 latest 판정보다 먼저 열리지 않게 한다
+        gap_limit_h = max(2 * cadence_h, max_age.total_seconds() / 3600 + SLOT_LAG_HOURS)
+        if gap_h > gap_limit_h:
             problems.append(
                 f"history_gap — 최신 슬롯이 {gap_h:.1f}h 전 "
-                f"(발행 주기 {cadence_h:.0f}h 기준 {metrics['consecutive_missed']}슬롯 연속 결손)"
+                f"(허용 {gap_limit_h:.0f}h, 발행 주기 {cadence_h:.0f}h 기준 {metrics['consecutive_missed']}슬롯 연속 결손)"
             )
     elif not fetch_errors:
         problems.append("history_empty — `predictions/history/` 에 슬롯 파일이 하나도 없다")
@@ -343,7 +351,7 @@ def fetch_workflow_states(
 
 
 def main() -> int:
-    max_age = timedelta(hours=float(os.environ.get("PREDICTIONS_MAX_AGE_HOURS", "4")))
+    max_age = timedelta(hours=float(os.environ.get("PREDICTIONS_MAX_AGE_HOURS", DEFAULT_MAX_AGE_HOURS)))
     cadence = timedelta(hours=float(os.environ.get("PREDICTIONS_CADENCE_HOURS", "3")))
     band_max_age = timedelta(hours=float(os.environ.get("BAND_MAX_AGE_HOURS", "12")))
     timeout = int(os.environ.get("PREDICTIONS_PROBE_TIMEOUT", "30"))

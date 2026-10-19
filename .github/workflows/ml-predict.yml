@@ -50,7 +50,7 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  PUBLISH_MODE: candidate  # candidate | production — 컷오버는 이 줄을 바꾸는 PR
+  PUBLISH_MODE: production  # candidate | production — 컷오버는 이 줄을 바꾸는 PR
   MODEL_VERSION: v2  # 공개 HF 의 가중치 버전
   MODEL_PKL_SHA256: '4c59657841ce03e4eebb503c8dd87d9a9bc8c178057bb3e27bbd4e97ef4eca58'  # 위 버전 가중치 파일별 sha256 핀
   MODEL_GTWR_SHA256: '3578afb2f2ed0f436381dea7fcb06ae1625eefb105e3baa74b21a3cfd773ed82'
