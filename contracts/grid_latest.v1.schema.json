@@ -70,7 +70,12 @@
             "description": "폴백(±20% 합성 밴드)은 신뢰도 개념 자체가 부적용 → null."
           },
           "aod_source": { "type": ["string", "null"] },
-          "feature_regime": { "type": ["string", "null"] }
+          "feature_regime": { "type": ["string", "null"] },
+          "met_source": {
+            "type": ["string", "null"],
+            "enum": ["live", "fallback", null],
+            "description": "이 행의 기상 피처 출처. live = 실시간 조회값, fallback = 조회 실패나 시간 예산 초과로 넣은 상수 기상, null = 출처를 모름(met_provenance 의 n_source_unknown 으로 센다). 필드가 없는 발행물(옛 버전)은 미측정이다."
+          }
         }
       }
     },
@@ -106,6 +111,23 @@
               "minimum": 0,
               "maximum": 1,
               "description": "출처를 아는 행이 0이면 null(미측정)이지 0.0(위성 없음)이 아니다."
+            }
+          }
+        },
+        "met_provenance": {
+          "type": "object",
+          "description": "이 발행물에 실시간 기상이 실제로 얼마나 들어갔는가. 행별 met_source 의 전수 집계. 옛 발행물에는 없어서 required 가 아니다. 집계가 없으면 null 을 싣지 말고 키를 뺀다.",
+          "required": ["counts", "n_rows", "n_source_known", "n_source_unknown", "live_share"],
+          "properties": {
+            "counts": { "type": "object" },
+            "n_rows": { "type": "integer", "minimum": 0 },
+            "n_source_known": { "type": "integer", "minimum": 0 },
+            "n_source_unknown": { "type": "integer", "minimum": 0 },
+            "live_share": {
+              "type": ["number", "null"],
+              "minimum": 0,
+              "maximum": 1,
+              "description": "출처를 아는 행이 0이면 null(미측정)이지 0.0(전부 상수 기상)이 아니다."
             }
           }
         },
