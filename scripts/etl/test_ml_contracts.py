@@ -16,6 +16,9 @@
    객체 형태로도 통과하고, 그 안의 required 를 하나 지우면 실패한다.
 7. 발행기가 쓰는 경로 `hf_publish.check_contract(<파일>, "auto")` 가 계약마다 최소
    페이로드는 통과시키고, 값 제약을 깬 페이로드는 `SystemExit(1)` 로 막는다.
+8. `grid_latest.v1` 의 행별 `met_source` 와 `metadata.met_provenance` 는 선택 필드다(옛
+   발행물에는 없다). 실으면 통과하고, 집계 객체의 required 를 하나 지우거나 값 제약을 깨면
+   실패한다.
 """
 from __future__ import annotations
 
@@ -231,6 +234,13 @@ VALUE_VIOLATIONS = [
         "Z",
         "$.predictions[0].confidence_grade: enum",
     ),
+    # met_source 도 선택 필드다.
+    (
+        "grid_latest.v1",
+        ("predictions", 0, "met_source"),
+        "maybe",
+        "$.predictions[0].met_source: enum",
+    ),
     ("grid_latest.v1", ("metadata", "quantiles"), [], "$.metadata.quantiles: 항목 0개 < minItems 1"),
     ("grid_latest.v1", ("generated_at",), "not-a-date", "$.generated_at: date-time 파싱 실패"),
     # data_quality.v1
@@ -296,6 +306,22 @@ GRID_WITH_STALENESS = _with(MINIMAL["grid_latest.v1"], STALENESS_PATH, STALENESS
 STALENESS_CASES = [
     pytest.param(path, id=".".join(map(str, path)))
     for path in _field_paths(STALENESS, STALENESS_PATH)
+]
+
+# `metadata.met_provenance` 는 선택 필드라 최소 페이로드에 없다. 객체 변형은 required 만 채우고
+# counts 는 비워 둔다 — STALENESS 와 같은 이유로 실린 필드가 전부 required 여야 한다.
+MET_PATH = ("metadata", "met_provenance")
+MET_PROVENANCE = {
+    "counts": {},
+    "n_rows": 1,
+    "n_source_known": 0,
+    "n_source_unknown": 1,
+    "live_share": None,
+}
+GRID_WITH_MET = _with(MINIMAL["grid_latest.v1"], MET_PATH, MET_PROVENANCE)
+MET_CASES = [
+    pytest.param(path, id=".".join(map(str, path)))
+    for path in _field_paths(MET_PROVENANCE, MET_PATH)
 ]
 
 
@@ -364,6 +390,50 @@ def test_removing_a_required_observation_staleness_field_fails(path):
     missing = re.escape(f"필수 필드 '{path[-1]}' 누락")
     with pytest.raises(validator.ContractError, match=missing):
         validator.validate_payload(_without(GRID_WITH_STALENESS, path), schema)
+
+
+@pytest.mark.parametrize("met_source", ["live", "fallback", None])
+def test_met_source_and_provenance_pass_through_auto_resolution(met_source):
+    # 계약이 두 필드를 실제로 선언하는지부터 본다. additionalProperties 가 열려 있어
+    # 선언이 없어도 아래 검증은 통과하기 때문이다.
+    schema = validator.load_schema(_schema_path("grid_latest.v1"))
+    assert schema["properties"]["predictions"]["items"]["properties"]["met_source"]["enum"] == [
+        "live",
+        "fallback",
+        None,
+    ]
+    assert "met_provenance" in schema["properties"]["metadata"]["properties"]
+    # 행 1건짜리 발행물: 행에 met_source, metadata 에 그 집계.
+    known = met_source is not None
+    payload = _with(GRID_WITH_MET, ("predictions", 0, "met_source"), met_source)
+    payload = _with(
+        payload,
+        MET_PATH,
+        {
+            "counts": {met_source: 1} if known else {},
+            "n_rows": 1,
+            "n_source_known": 1 if known else 0,
+            "n_source_unknown": 0 if known else 1,
+            "live_share": (1.0 if met_source == "live" else 0.0) if known else None,
+        },
+    )
+    validator.validate_payload(payload, validator.resolve_schema(payload))
+
+
+@pytest.mark.parametrize("path", MET_CASES)
+def test_removing_a_required_met_provenance_field_fails(path):
+    schema = validator.load_schema(_schema_path("grid_latest.v1"))
+    missing = re.escape(f"필수 필드 '{path[-1]}' 누락")
+    with pytest.raises(validator.ContractError, match=missing):
+        validator.validate_payload(_without(GRID_WITH_MET, path), schema)
+
+
+def test_met_provenance_live_share_above_one_fails():
+    schema = validator.load_schema(_schema_path("grid_latest.v1"))
+    payload = _with(GRID_WITH_MET, MET_PATH + ("live_share",), 1.5)
+    message = "$.metadata.met_provenance.live_share: 1.5 > maximum 1"
+    with pytest.raises(validator.ContractError, match=re.escape(message)):
+        validator.validate_payload(payload, schema)
 
 
 # ── 발행기 경로: hf_publish.check_contract(<파일>, "auto") ───────────────────
