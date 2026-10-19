@@ -1043,7 +1043,7 @@ BAND_CLI_FLAGS = {
     "airlens-band-engine": {"--series-path": "OUT_DIR", "--cities-path": "OUT_DIR", "--cache-dir": "CACHE_DIR", "--out-dir": "OUT_DIR"},
     "airlens-band-publish": {"--band-predictions-path": "OUT_DIR", "--out": "STAGE"},
 }
-PIP_EXPECTED_MISSING = {"joblib", "lightgbm", "python-dotenv", "scikit-learn", "scipy", "xgboost"}  # 0.3.0 wheel 에서 실측한 6개(0.3.1·0.3.2 는 의존성 메타데이터가 같다)
+PIP_EXPECTED_MISSING = {"joblib", "lightgbm", "python-dotenv", "scikit-learn", "scipy", "xgboost"}  # 0.3.0 wheel 에서 실측한 6개(0.3.1·0.3.2·0.3.3 은 의존성 메타데이터가 같다)
 _REAL_PARSE_ARGS = argparse.ArgumentParser.parse_args
 
 
@@ -1584,7 +1584,7 @@ def test_band_pip_check_expected_list_is_exactly_the_base_dependencies_the_closu
     # Arrange
     expected = set(band["env"]["BAND_SKIPPED_BASE_DEPS"].split(","))
 
-    # Act / Assert — 0.3.0 wheel 을 실측한 6개다(wheel 핀을 올리면 다시 잰다. 0.3.1·0.3.2 는 의존성 메타데이터가 0.3.0 과 같다). 설치되는 패키지는 pip check 에 "미설치" 로 나오지 않으므로
+    # Act / Assert — 0.3.0 wheel 을 실측한 6개다(wheel 핀을 올리면 다시 잰다. 0.3.1·0.3.2·0.3.3 은 의존성 메타데이터가 0.3.0 과 같다). 설치되는 패키지는 pip check 에 "미설치" 로 나오지 않으므로
     # 고정본에 있는 이름은 기대 목록에 없어야 한다. 목록이 실측과 다르면 check_band_env 가 실패한다(넓으면 없는 줄, 좁으면 예상 밖 줄)
     assert expected == PIP_EXPECTED_MISSING
     assert not expected & set(_constraint_pins(BAND_CONSTRAINTS))
