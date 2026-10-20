@@ -68,6 +68,8 @@ MAX_TIMEOUT_MIN = 45
 BAND_WAIT_TIMEOUT_MIN = 100
 PUBLISH_MODES = {"candidate", "production"}
 WHEEL_SECRET_PREFIX = "HF_MODELS_"
+# 모델 읽기 토큰이 든 environment. 배포 브랜치 규칙과 secret 등록은 GitHub 설정이라 시험이 못 본다(README 「Secrets」).
+READ_ENVIRONMENT = {"name": "hf-read", "deployment": False}
 WRITE_SECRET = "HF_TOKEN"
 CONSOLE_SCRIPTS = ("airlens-fetch-model", "airlens-predict-grid", "airlens-dqss-check", "airlens-drift-monitor")
 BAND_CONSOLE_SCRIPTS = ("airlens-band-fresh-openaq", "airlens-band-engine", "airlens-band-publish")  # 실행 순서
@@ -346,6 +348,27 @@ def test_every_ml_job_has_the_repository_guard_and_runs_only_on_main(name):
         clauses = guard_clauses(job)
         assert REPO_GUARD in clauses, f"{name}:{job_id} repo 가드 없음"
         assert MAIN_REF_GUARD in clauses, f"{name}:{job_id} main 가드 없음(dispatch 로 브랜치 사본이 돈다)"
+
+
+@ml_params
+def test_only_the_jobs_with_the_model_read_token_use_the_read_environment(name):
+    # Arrange
+    doc = load(WORKFLOW_DIR / name)
+
+    # Act
+    holders = {job_id for job_id, job in jobs(doc).items() if any(n.startswith(WHEEL_SECRET_PREFIX) for n in secrets_in(job))}
+    declared = {job_id: job.get("environment") for job_id, job in jobs(doc).items()}
+    in_read = {
+        job_id for job_id, env in declared.items()
+        if str(env.get("name") if isinstance(env, dict) else env).lower() == READ_ENVIRONMENT["name"]
+    }
+
+    # Assert — 토큰 잡은 정확히 그 선언을 하고(`0 == False` 라 `deployment` 는 `is False` 로 따로 본다), 토큰 없는 잡은
+    #          그 environment 에 들지 않는다. 레포 secret 은 브랜치와 상관없이 잡에 전달되므로 환경 규칙만이 브랜치 사본을 막는다
+    assert holders == {"infer"}
+    for job_id in holders:
+        assert declared[job_id] == READ_ENVIRONMENT and declared[job_id]["deployment"] is False, f"{name}:{job_id} {declared[job_id]!r}"
+    assert in_read == holders
 
 
 @pytest.mark.parametrize(
