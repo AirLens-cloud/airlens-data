@@ -8,7 +8,7 @@ Server-Collect: GitHub Actions runner → HF dataset `Robeedau/airlens-live` (`i
 
 | # | Source | Module | Tier | Cost | Auth | Coverage |
 |---|--------|--------|------|------|------|----------|
-| 1 | Climate Policy Radar / CCLW (HuggingFace `ClimatePolicyRadar/all-document-text-data`, CC-BY-4.0) | `collect_cpr.py` | 1 — global | Free | `HF_TOKEN` (free) | ~200 AQ policies, global |
+| 1 | Climate Policy Radar / CCLW (HuggingFace `ClimatePolicyRadar/all-document-text-data`, CC-BY-4.0) | `collect_cpr.py` | 1 — global | Free | HF token with gated read (not in Actions, see below) | ~200 AQ policies, global |
 | 2 | WHO Air Quality Standards DB / national regulations | `collect_who_standards.py` | 1 — global | Free | none | 88 countries' AQ standards |
 | 3 | Government official / UNEP / CCAC major policies | `collect_major_policies.py` | 2 — major countries | Free | none | curated major-emitter policies |
 | 4 | US Federal Register (federalregister.gov API v1, keyless) | `collect_federal_register.py` | 2 — major country | Free | none | EPA air-quality RULEs, US |
@@ -24,9 +24,14 @@ Merged via `merge_policies.py` (dedup by country+normalized-name) →
   since it's a ~3.59GB HF download — it doesn't change daily.
 - **Write** = `hf_publish.py upload` of `policy_registry.json` and the frontend exports to
   `insights-data/policy/` (replaces the earlier database upsert). Each run rebuilds the
-  registry from the sources that ran and overwrites the published files, so CPR rows appear
-  only after a run with `run_cpr`.
-- **Secrets** — `HF_TOKEN` (publish, CPR download). `OPENAI_API_KEY` only for the opt-in LLM
+  registry from the sources that ran and overwrites the published files, so the published
+  registry has CPR rows only after a run in which the CPR step succeeded — none in Actions today.
+- **CPR in Actions fails on purpose** — the runner does not install `datasets` and the write token
+  has no gated-read permission (2026-10-17 decision), so `collect_cpr.py` collects 0 policies.
+  It then exits 1 without writing `cpr.json` (a local re-run keeps the previous file), so a
+  `run_cpr` run fails before publishing instead of publishing a registry without CPR.
+  Refreshing CPR needs a run with gated access.
+- **Secrets** — `HF_TOKEN` (publish; no gated read). `OPENAI_API_KEY` only for the opt-in LLM
   extraction below.
 
 ## Candidate structured sources (next, not in this PR)

@@ -276,10 +276,19 @@ def main() -> None:
     if args.skip_download and output_path.exists():
         with open(output_path) as f:
             data = json.load(f)
+        if not data:
+            logger.error(f"Cached CPR data at {output_path} is empty")
+            sys.exit(1)
         logger.info(f"Using cached CPR data: {len(data)} policies")
         return
 
     policies = collect_from_huggingface(skip_download=args.skip_download)
+
+    # Zero policies means the collection failed (no `datasets` library or no gated access, which is
+    # the Actions run_cpr path). Writing [] would let merge publish without CPR and report success.
+    if not policies:
+        logger.error(f"CPR collection returned 0 policies; leaving {output_path} unchanged")
+        sys.exit(1)
 
     BY_SOURCE_DIR.mkdir(parents=True, exist_ok=True)
     with open(output_path, "w") as f:
