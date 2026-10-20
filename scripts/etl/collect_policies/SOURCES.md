@@ -26,7 +26,11 @@ Merged via `merge_policies.py` (dedup by country+normalized-name) →
   `insights-data/policy/` (replaces the earlier database upsert). Each run rebuilds the
   registry from the sources that ran and overwrites the published files, so CPR rows appear
   only after a run with `run_cpr`.
-- **Secrets** — `HF_TOKEN` (publish, CPR download). `OPENAI_API_KEY` only for the opt-in LLM
+- **CPR in Actions fails on purpose** — the runner does not install `datasets` and the write token
+  has no gated-read permission (2026-10-17 decision), so `collect_cpr.py` collects 0 policies.
+  It then exits 1 and keeps `cpr.json` unchanged, so a `run_cpr` run fails before publishing
+  instead of publishing a registry without CPR. Refreshing CPR needs a run with gated access.
+- **Secrets** — `HF_TOKEN` (publish; no gated read). `OPENAI_API_KEY` only for the opt-in LLM
   extraction below.
 
 ## Candidate structured sources (next, not in this PR)
