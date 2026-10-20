@@ -66,7 +66,7 @@ HF 초기 시드(hf-live-seed)는 모노레포 정적 데이터 의존이라 이
 | `HF_MODELS_REPO` | 그 모델 저장소 id |
 
 - 이 두 값을 쓰는 잡은 `environment: {name: hf-read, deployment: false}` 를 선언하고, 토큰 없는 잡은 넣지 않는다. `scripts/ml/test_ml_workflow_safety.py` 가 둘 다 확인한다.
-- 보호 조건은 `hf-write` 와 같다: (가) 배포 브랜치 규칙이 `main` 하나, (나) 레포 secret 에 같은 이름이 없음.
+- 보호 조건은 `hf-write` 와 같다: (가) 배포 브랜치 규칙이 `main` 하나, (나) 레포 secret 에 같은 이름이 없음. 없는 environment 를 참조하면 규칙 없는 것이 새로 생기는 점, GitHub Free 에서는 공개 레포에서만 동작하는 점도 `hf-write` 와 같다.
 - 등록: Settings → Environments → `hf-read` → Environment secrets
 
 ### repo-level

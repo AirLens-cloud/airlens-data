@@ -358,13 +358,13 @@ def test_only_the_jobs_with_the_model_read_token_use_the_read_environment(name):
     # Act
     holders = {job_id for job_id, job in jobs(doc).items() if any(n.startswith(WHEEL_SECRET_PREFIX) for n in secrets_in(job))}
     declared = {job_id: job.get("environment") for job_id, job in jobs(doc).items()}
-    in_read = {
-        job_id for job_id, env in declared.items()
-        if str(env.get("name") if isinstance(env, dict) else env).lower() == READ_ENVIRONMENT["name"]
-    }
+    names = {job_id: env.get("name") if isinstance(env, dict) else env for job_id, env in declared.items() if env is not None}
+    in_read = {job_id for job_id, env_name in names.items() if str(env_name).lower() == READ_ENVIRONMENT["name"]}
 
     # Assert — 토큰 잡은 정확히 그 선언을 하고(`0 == False` 라 `deployment` 는 `is False` 로 따로 본다), 토큰 없는 잡은
-    #          그 environment 에 들지 않는다. 레포 secret 은 브랜치와 상관없이 잡에 전달되므로 환경 규칙만이 브랜치 사본을 막는다
+    #          그 environment 에 들지 않는다. 레포 secret 은 브랜치와 상관없이 잡에 전달되므로 환경 규칙만이 브랜치 사본을 막는다.
+    #          이름이 식(`${{ }}`)이면 무엇을 가리키는지 못 보므로 글자 그대로의 이름만 허용한다
+    assert all(isinstance(n, str) and "${{" not in n for n in names.values()), names
     assert holders == {"infer"}
     for job_id in holders:
         assert declared[job_id] == READ_ENVIRONMENT and declared[job_id]["deployment"] is False, f"{name}:{job_id} {declared[job_id]!r}"
