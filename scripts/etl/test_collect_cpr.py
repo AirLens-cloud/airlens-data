@@ -35,7 +35,9 @@ def test_zero_policies_fail_and_keep_the_previous_file(monkeypatch, tmp_path):
 
 def test_missing_datasets_library_fails_without_writing(monkeypatch, tmp_path):
     # Arrange — Actions 와 같은 상태: `datasets` 가 없다. None 이면 import 가 ImportError 를 낸다(다운로드 0)
+    fallback_calls = []
     monkeypatch.setitem(sys.modules, "datasets", None)
+    monkeypatch.setattr(m, "collect_from_api_fallback", lambda: fallback_calls.append(1) or [])
     monkeypatch.setattr(m, "BY_SOURCE_DIR", tmp_path)
     monkeypatch.setattr(sys, "argv", ["collect_cpr.py"])
 
@@ -43,9 +45,24 @@ def test_missing_datasets_library_fails_without_writing(monkeypatch, tmp_path):
     with pytest.raises(SystemExit) as exit_info:
         m.main()
 
-    # Assert
+    # Assert — pyarrow 를 지나 datasets import 에서 예비 경로로 갔다(pyarrow 가 없어 일찍 끝난 것이 아니다)
+    assert fallback_calls == [1]
     assert exit_info.value.code == 1
     assert not (tmp_path / "cpr.json").exists()
+
+
+def test_empty_cached_file_fails_with_skip_download(monkeypatch, tmp_path):
+    # Arrange — 예전 코드가 써 둔 빈 캐시
+    (tmp_path / "cpr.json").write_text("[]", encoding="utf-8")
+    monkeypatch.setattr(m, "BY_SOURCE_DIR", tmp_path)
+    monkeypatch.setattr(sys, "argv", ["collect_cpr.py", "--skip-download"])
+
+    # Act
+    with pytest.raises(SystemExit) as exit_info:
+        m.main()
+
+    # Assert
+    assert exit_info.value.code == 1
 
 
 def test_collected_policies_are_written(monkeypatch, tmp_path):

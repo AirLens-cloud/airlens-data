@@ -276,6 +276,9 @@ def main() -> None:
     if args.skip_download and output_path.exists():
         with open(output_path) as f:
             data = json.load(f)
+        if not data:
+            logger.error(f"Cached CPR data at {output_path} is empty")
+            sys.exit(1)
         logger.info(f"Using cached CPR data: {len(data)} policies")
         return
 
