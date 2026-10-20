@@ -137,6 +137,10 @@ jobs:
     needs: wait
     if: github.repository == 'AirLens-cloud/airlens-data' && github.ref == 'refs/heads/main' && (github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success') && !cancelled()
     runs-on: ubuntu-latest
+    # 모델 읽기 토큰·저장소 id 는 environment `hf-read` 의 secret 이다(보호 조건은 README 「Secrets」)
+    environment:
+      name: hf-read
+      deployment: false
     timeout-minutes: 45
     permissions:
       contents: read
