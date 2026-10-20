@@ -1,6 +1,6 @@
 [Unit]
 Description=AirLens OpenAQ global observation shadow (Wave 1 sidecar, global pivot)
-Documentation=https://github.com/AirLens-cloud/AirLens
+Documentation=https://github.com/AirLens-cloud/airlens-data/tree/main/e2-sidecar
 After=network-online.target
 Wants=network-online.target
 
