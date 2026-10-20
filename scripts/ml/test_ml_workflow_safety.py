@@ -350,25 +350,94 @@ def test_every_ml_job_has_the_repository_guard_and_runs_only_on_main(name):
         assert MAIN_REF_GUARD in clauses, f"{name}:{job_id} main 가드 없음(dispatch 로 브랜치 사본이 돈다)"
 
 
+# `secrets.X` · `secrets['X']` · `secrets["X"]`(이름 대소문자 무시)와 `toJSON(secrets)` — secrets_in 보다 넓게 읽는다.
+# json.dumps 를 거친 글이라 큰따옴표 앞에 `\` 가 붙는다.
+READ_SECRET_RE = re.compile(r"\bsecrets\s*(?:\.\s*|\[\s*\\?['\"])" + WHEEL_SECRET_PREFIX, re.I)
+ALL_SECRETS_RE = re.compile(r"\btoJSON\s*\(\s*secrets\s*\)", re.I)
+
+
+def read_token_jobs(doc: dict) -> set[str]:
+    """모델 읽기 토큰이 범위 안에 있는 잡. 워크플로 env 에 있으면 모든 잡, `secrets: inherit` 도 토큰 잡이다."""
+    def holds(value: object) -> bool:
+        text = json.dumps(value, ensure_ascii=False, default=str)
+        return bool(READ_SECRET_RE.search(text) or ALL_SECRETS_RE.search(text))
+
+    workflow_wide = holds(doc.get("env"))
+    return {job_id for job_id, job in jobs(doc).items() if workflow_wide or holds(job) or job.get("secrets") == "inherit"}
+
+
+def read_environment_problems(doc: dict) -> list[str]:
+    """토큰 잡은 정확히 `READ_ENVIRONMENT` 를 선언하고, 토큰 없는 잡은 그 environment 에 들지 않는다. 문제마다 한 문장."""
+    holders = read_token_jobs(doc)
+    problems: list[str] = []
+    for job_id, job in jobs(doc).items():
+        env = job.get("environment")
+        env_name = env.get("name") if isinstance(env, dict) else env
+        if env is not None and not (isinstance(env_name, str) and "${{" not in env_name):
+            problems.append(f"{job_id}: environment 이름이 글자 그대로가 아니다(식은 무엇을 가리키는지 못 본다) — {env!r}")
+        elif job_id in holders and not (env == READ_ENVIRONMENT and env["deployment"] is False):
+            problems.append(f"{job_id}: 읽기 토큰 잡의 environment 는 정확히 {READ_ENVIRONMENT} 여야 한다 — 지금: {env!r}")
+        elif job_id not in holders and env_name is not None and env_name.lower() == READ_ENVIRONMENT["name"]:
+            problems.append(f"{job_id}: 읽기 토큰이 없는 잡이 environment `{env_name}` 에 들어 있다")
+    return problems
+
+
 @ml_params
 def test_only_the_jobs_with_the_model_read_token_use_the_read_environment(name):
     # Arrange
     doc = load(WORKFLOW_DIR / name)
 
     # Act
-    holders = {job_id for job_id, job in jobs(doc).items() if any(n.startswith(WHEEL_SECRET_PREFIX) for n in secrets_in(job))}
-    declared = {job_id: job.get("environment") for job_id, job in jobs(doc).items()}
-    names = {job_id: env.get("name") if isinstance(env, dict) else env for job_id, env in declared.items() if env is not None}
-    in_read = {job_id for job_id, env_name in names.items() if str(env_name).lower() == READ_ENVIRONMENT["name"]}
+    holders, problems = read_token_jobs(doc), read_environment_problems(doc)
 
-    # Assert — 토큰 잡은 정확히 그 선언을 하고(`0 == False` 라 `deployment` 는 `is False` 로 따로 본다), 토큰 없는 잡은
-    #          그 environment 에 들지 않는다. 레포 secret 은 브랜치와 상관없이 잡에 전달되므로 환경 규칙만이 브랜치 사본을 막는다.
-    #          이름이 식(`${{ }}`)이면 무엇을 가리키는지 못 보므로 글자 그대로의 이름만 허용한다
-    assert all(isinstance(n, str) and "${{" not in n for n in names.values()), names
+    # Assert — 레포 secret 은 브랜치와 상관없이 잡에 전달되므로 environment 의 배포 브랜치 규칙만이 브랜치 사본을 막는다
     assert holders == {"infer"}
-    for job_id in holders:
-        assert declared[job_id] == READ_ENVIRONMENT and declared[job_id]["deployment"] is False, f"{name}:{job_id} {declared[job_id]!r}"
-    assert in_read == holders
+    assert problems == []
+
+
+READ_ENVIRONMENT_DEVIATIONS = {
+    "missing": None,
+    "string form": "hf-read",
+    "no deployment": {"name": "hf-read"},
+    "deployment 0": {"name": "hf-read", "deployment": 0},  # 0 == False 라 사전 비교만으로는 통과한다
+    "deployment string": {"name": "hf-read", "deployment": "false"},
+    "other environment": {"name": "hf-write", "deployment": False},
+    "expression name": {"name": "${{ 'hf-read' }}", "deployment": False},
+}
+
+
+@pytest.mark.parametrize("environment", list(READ_ENVIRONMENT_DEVIATIONS.values()), ids=list(READ_ENVIRONMENT_DEVIATIONS))
+def test_a_read_token_job_without_exactly_the_read_environment_is_reported(environment):
+    # Arrange
+    job = {"steps": [{"env": {"HF_MODELS_READ": "${{ secrets.HF_MODELS_READ }}"}}]}
+    if environment is not None:
+        job["environment"] = environment
+
+    # Act
+    problems = read_environment_problems({"jobs": {"infer": job}})
+
+    # Assert
+    assert len(problems) == 1, problems
+
+
+@pytest.mark.parametrize("reference", ["secrets.HF_MODELS_READ", "secrets['HF_MODELS_READ']", 'secrets["hf_models_repo"]', "secrets.hf_models_read", "toJSON(secrets)"])
+def test_every_form_of_the_read_token_reference_is_seen(reference):
+    # Arrange
+    doc = {"jobs": {"infer": {"steps": [{"env": {"X": "${{ " + reference + " }}"}}]}}}
+
+    # Act / Assert
+    assert read_token_jobs(doc) == {"infer"}
+
+
+def test_a_tokenless_job_in_the_read_environment_is_reported():
+    # Arrange — GitHub 는 environment 이름의 대소문자를 가리지 않는다
+    doc = {"jobs": {"publish": {"environment": {"name": "HF-Read", "deployment": False}, "steps": []}}}
+
+    # Act
+    problems = read_environment_problems(doc)
+
+    # Assert
+    assert len(problems) == 1, problems
 
 
 @pytest.mark.parametrize(
