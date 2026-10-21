@@ -1,6 +1,6 @@
 [Unit]
 Description=AirLens OpenAQ global observation shadow timer (hourly)
-Documentation=https://github.com/AirLens-cloud/AirLens
+Documentation=https://github.com/AirLens-cloud/airlens-data/tree/main/e2-sidecar
 
 [Timer]
 # Hourly slice. Slots are staggered (:05 sc / :15 openaq) so the two collectors
