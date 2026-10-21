@@ -9,7 +9,7 @@ Supabase Free Storage 용량 402 차단(2026-08-20)을 계기로, 파이프라�
 기계적으로 치환되도록.
 
 이 파일이 유일본이다 (2026-10 조직 재편). 모노레포 `AirLens-cloud/airlens-ml`(2026-10-21까지 `AirLens`) 에
-있던 사본은 추론 job 이 이 레포로 옮겨온 뒤 삭제됐다(AirLens#1481, 2026-10-21) — 고칠 곳은 여기 하나다.
+있던 사본은 추론 job 이 이 레포로 옮겨온 뒤 삭제됐다(airlens-ml#1481, 2026-10-21) — 고칠 곳은 여기 하나다.
 
 Subcommands:
   ensure-repo                          repo 생성(존재 시 no-op) + dataset card

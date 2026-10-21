@@ -20,7 +20,7 @@
  * import time, so it cannot be imported at all.
  *
  * Layout (both on E2 and locally):
- *   <root>/repo/      git clone of AirLens-cloud/airlens-ml (2026-10-21까지 AirLens)
+ *   <root>/repo/      git clone of AirLens-cloud/airlens-ml (named AirLens until 2026-10-21)
  *   <root>/sidecar/   this file
  *
  * Run:
