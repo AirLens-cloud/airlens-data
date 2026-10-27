@@ -8,7 +8,9 @@
 #
 # 해시 고정본은 requirements-predict.lock.txt 다(이 파일에서 생성). 버전이 서로 어긋나지 않는지는
 # test_ml_workflow_safety.py 가 대조한다. 올릴 때는 이 파일 → lock 재생성 순서로 고친다.
-certifi==2026.7.22
+# 갱신(2026-10-27): certifi 2026.7.22 → 2026.10.19 — 보안 공지 GHSA-6q48-6c7w-9gw2(emSign 중간 인증서 키 유출).
+# 출시 2026-10-20T02:24Z 라 7일이 지난 뒤 올렸다. 운영 설치 목록(2026-10-15)과 다른 줄은 이 한 줄이다(인증서 묶음이라 계산에는 쓰이지 않는다).
+certifi==2026.10.19
 charset-normalizer==3.4.9
 idna==3.18
 joblib==1.5.3
