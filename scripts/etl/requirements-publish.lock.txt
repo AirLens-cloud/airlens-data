@@ -14,13 +14,14 @@
 #   uv pip compile publish.in --python-version 3.11 --python-platform x86_64-manylinux_2_28 \
 #     --only-binary :all: --exclude-newer <오늘-7일>T00:00:00Z --generate-hashes --no-annotate --no-header \
 #     -o scripts/etl/requirements-publish.lock.txt
-# (이 주석 블록은 재생성 뒤 다시 붙인다. 이번 생성: 2026-10-16, --exclude-newer 2026-10-09T00:00:00Z.)
+# (이 주석 블록은 재생성 뒤 다시 붙인다. 이번 생성: 2026-10-16, --exclude-newer 2026-10-09T00:00:00Z.
+#  2026-10-27 certifi 2026.10.19 로 다시 생성(보안 공지 GHSA-6q48-6c7w-9gw2) — --exclude-newer 2026-10-20T02:25:00Z 에 --upgrade-package certifi, certifi 말고는 같다.)
 anyio==4.15.1 \
     --hash=sha256:6152fdbbf9a77fdec97731721bebf7c4c44f7c29b424b0065826173efc7ed101 \
     --hash=sha256:9f28306018cbd6d329e64a36d58256edff76dd996fe423bc957326e578b82a94
-certifi==2026.7.22 \
-    --hash=sha256:62f22742b58a1a33014a2b6b706588a8d7e2a88ae7bd1a6ebe8c992928483775 \
-    --hash=sha256:741e2c3b351ddf169a738da9f2c048608ff7f2c5cc02f1ebc6b118bb090d5d55
+certifi==2026.10.19 \
+    --hash=sha256:035c1e85572b141bf1c3a3eff0e33a8eb74917522f2559075ff8d2fea780a1ae \
+    --hash=sha256:42d35340cc5b9ba78e818ddbff0c5b1c2b779de448a340fd1b989f5fa8670e1b
 click==8.5.0 \
     --hash=sha256:255bc9599cf7748b4b1a446ccc735421bd08a2ae529a8b88597d3de5664ee360 \
     --hash=sha256:ba0d2089de75ea0310e2dde03160e6ca10009947fb95a182f9b54021bb272e34

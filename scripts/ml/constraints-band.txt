@@ -13,8 +13,11 @@
 #   requirements-band-torch.lock.txt  torch 한 줄 — PyTorch CPU 인덱스에서만 받는다(`--index-url` 은 설치 명령에 둔다)
 #   requirements-band.lock.txt        나머지 31개 — PyPI
 # 올릴 때는 이 파일 → 두 lock 재생성 순서로 고친다(재생성 명령은 각 lock 의 머리 주석).
+# 갱신(2026-10-27): certifi 2026.7.22 → 2026.10.19 — 보안 공지 GHSA-6q48-6c7w-9gw2(emSign 중간 인증서 키 유출).
+# 출시 2026-10-20T02:24Z 라 7일이 지난 뒤 올렸다. 운영 설치 목록(2026-10-15)과 다른 줄은 torch 와 이 줄이다.
+# 위 폐포 점검을 `--exclude-newer 2026-10-20T02:25:00Z` 로 다시 돌려 32줄이 이 파일과 같음을 확인했다.
 anyio==4.14.2
-certifi==2026.7.22
+certifi==2026.10.19
 charset-normalizer==3.4.9
 click==8.4.2
 filelock==3.32.2
